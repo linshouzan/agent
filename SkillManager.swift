@@ -1339,7 +1339,6 @@ public class SkillManager {
     
     // MARK: - 🚀 现代安全执行引擎核心 (带评分熔断机制与统一调度)
     func executeTool(skill: AgentSkill, args: [String: Any], skipConfirmation: Bool = false) async -> String {
-        // 1. 扁平化参数提取
         var flatArgs = args
         if let cmdArgsStr = args["raw_command"] as? String,
            let data = cmdArgsStr.data(using: .utf8),
@@ -1347,58 +1346,25 @@ public class SkillManager {
             for (k, v) in jsonDict { flatArgs[k] = v }
         }
 
-        // 2. [Plan A] 全量 Schema 强类型校验与本地前置防御拦截
-        var validationErrors: [String] = []
-        var coercedArgs: [String: Any] = [:]
-
-        for param in skill.parameters {
-            if let rawValue = flatArgs[param.name] {
-                let (isValid, coercedValue) = validateAndCoerceType(value: rawValue, expectedType: param.type)
-                if isValid, let safeVal = coercedValue {
-                    coercedArgs[param.name] = safeVal
-                } else {
-                    validationErrors.append("参数 [\(param.name)] 类型不匹配 (预期: \(param.type.rawValue), 实际值: \(rawValue))")
-                }
-            } else if param.isRequired {
-                validationErrors.append("缺少必填参数 [\(param.name)] (\(param.description))")
-            }
+        var missingParams: [String] = []
+        for param in skill.parameters where param.isRequired {
+            if flatArgs[param.name] == nil { missingParams.append(param.name) }
         }
-
-        // 保留未在 parameters 中显式定义但在执行中需要的系统透传参数 (如 raw_args, raw_command, url 等)
-        for (k, v) in flatArgs where coercedArgs[k] == nil {
-            coercedArgs[k] = v
-        }
-
-        // 若校验不通过，在进入物理系统前直接在本地生成结构化诊断拦截回执
-        if !validationErrors.isEmpty {
-            return """
-            ❌ 参数 Schema 校验失败:
-            \(validationErrors.map { "- \($0)" }.joined(separator: "\n"))
-            💡 请根据该工具的参数定义修正入参后重新调用。
-            """
-        }
-
-        flatArgs = coercedArgs
-
-        // 3. 人类在环 (HITL) 授权拦截
+        if !missingParams.isEmpty { return "❌ 参数校验失败：缺少必填参数 [\(missingParams.joined(separator: ", "))]" }
+        
         if skill.requiresConfirmation && !skipConfirmation {
-            let isAuthorized = await SystemAuthUI.requestUserPermission(
-                title: "⚠️ AI 请求执行高危指令",
-                message: "工具: \(skill.displayName)\n参数: \(flatArgs)",
-                dangerLevel: .high
-            )
+            let isAuthorized = await SystemAuthUI.requestUserPermission(title: "⚠️ AI 请求执行高危指令", message: "工具: \(skill.displayName)\n参数: \(args)", dangerLevel: .high)
             if !isAuthorized { return "❌ 拒绝执行：用户取消了系统授权。" }
         }
-
-        // 4. 安全防护与危险指令过滤
+        
         if let rawCommand = flatArgs["raw_command"] as? String {
-            if !SecurityScanner.isSafe(command: rawCommand) { return "❌ 安全警告：指令触碰了系统核心敏感目录，已实施安全拦截。" }
+            if !SecurityScanner.isSafe(command: rawCommand) { return "❌ 安全警告：指令触碰了系统核心敏感目录，强制阻断。" }
         }
         if skill.type == .shell || skill.type == .python || skill.type == .applescript || skill.type == .cli {
-            if !SecurityScanner.isSafe(command: skill.executionBody) { return "❌ 安全警告：脚本或命令包含高危操作代码，已实施安全拦截。" }
+            if !SecurityScanner.isSafe(command: skill.executionBody) { return "❌ 安全警告：脚本或命令包含高危操作代码，防毒拦截。" }
         }
-
-        // 5. 底层执行分发
+        
+        // 1. 获取底层引擎执行结果
         var executionResult: String = ""
         switch skill.type {
         case .cli:
@@ -1410,104 +1376,91 @@ public class SkillManager {
                 skillParameters: skill.parameters
             )
         case .shell:
-            executionResult = await executeSecureShell(
-                scriptSource: skill.executionBody,
-                args: flatArgs,
-                sharedContext: self.sharedContext,
-                workingDirectory: skill.workingDirectory,
-                entryPoint: skill.entryPoint
-            )
+            executionResult = await executeSecureShell(scriptSource: skill.executionBody, args: flatArgs, sharedContext: self.sharedContext, workingDirectory: skill.workingDirectory, entryPoint: skill.entryPoint)
         case .applescript:
-            executionResult = await executeAppleScript(
-                scriptSource: skill.executionBody,
-                args: flatArgs,
-                sharedContext: self.sharedContext,
-                workingDirectory: skill.workingDirectory,
-                entryPoint: skill.entryPoint
-            )
+            executionResult = await executeAppleScript(scriptSource: skill.executionBody, args: flatArgs, sharedContext: self.sharedContext, workingDirectory: skill.workingDirectory, entryPoint: skill.entryPoint)
         case .python:
-            executionResult = await executePython(
-                scriptSource: skill.executionBody,
-                args: flatArgs,
-                sharedContext: self.sharedContext,
-                workingDirectory: skill.workingDirectory,
-                entryPoint: skill.entryPoint
-            )
+            executionResult = await executePython(scriptSource: skill.executionBody, args: flatArgs, sharedContext: self.sharedContext, workingDirectory: skill.workingDirectory, entryPoint: skill.entryPoint)
         case .api:
-            executionResult = await executeAdvancedAPI(
-                apiSource: skill.executionBody,
-                args: flatArgs,
-                sharedContext: self.sharedContext
-            )
+            executionResult = await executeAdvancedAPI(apiSource: skill.executionBody, args: flatArgs, sharedContext: self.sharedContext)
         case .mcp:
-            executionResult = await executeMCPProxy(
-                serverId: skill.executionBody,
-                method: skill.entryPoint ?? "",
-                args: flatArgs
-            )
+            executionResult = await executeMCPProxy(serverId: skill.executionBody, method: skill.entryPoint ?? "", args: flatArgs)
         case .builtin:
-            if skill.executionBody == "builtin_evolve" {
-                executionResult = await executeEvolveSkill(args: flatArgs)
-            } else if skill.executionBody == "builtin_memory" {
+            if skill.executionBody == "builtin_evolve" { executionResult = await executeEvolveSkill(args: flatArgs) }
+            else if skill.executionBody == "builtin_memory" {
                 let action = flatArgs["action"] as? String ?? ""
                 let content = flatArgs["content"] as? String ?? ""
-
+                
                 if action == "save" {
                     let cat = flatArgs["category"] as? String ?? "项目环境"
                     let imp = flatArgs["importance"] as? Int ?? 5
                     executionResult = await MemoryManager.shared.addMemory(content: content, category: cat, importance: imp)
                 } else if action == "search" {
                     let searchRes = await MemoryManager.shared.searchContext(for: content, topK: 3)
-                    executionResult = searchRes.isEmpty ? "记忆库中未找到关于「\(content)」的强关联线索。" : searchRes
+                    if searchRes.isEmpty {
+                        executionResult = "当前记忆库中未找到关于「\(content)」的强关联线索。"
+                    } else {
+                        executionResult = searchRes
+                    }
                 } else {
-                    executionResult = "❌ 操作类型无效，请指定 action 为 save 或 search。"
+                    executionResult = "❌ 未知的 action，必须为 save 或 search"
                 }
-            } else if skill.executionBody == "builtin_finish" {
-                return "[AGENT_PIPELINE_TERMINATE]:\((flatArgs["final_answer"] as? String) ?? "任务已完成。")"
-            } else if skill.executionBody == "builtin_planner" {
+            }
+            else if skill.executionBody == "builtin_finish" {
+                return "[AGENT_PIPELINE_TERMINATE]:\((flatArgs["final_answer"] as? String) ?? "结束")"
+            }
+            else if skill.executionBody == "builtin_planner" {
                 let action = flatArgs["action"] as? String ?? ""
-
+                
                 if let memo = flatArgs["memo"] as? String, !memo.trimmingCharacters(in: .whitespaces).isEmpty {
                     self.sharedContext["AGENT_GLOBAL_MEMO"] = (self.sharedContext["AGENT_GLOBAL_MEMO"] ?? "") + "\n- " + memo
                 }
-
+                
                 switch action {
                 case "create", "replan":
+                    // 🌟 核心升级：调用弹性清洗引擎，自动兼容任意多态入参并补齐缺损字段
                     guard let sanitizedPlan = TaskBlackboardManager.shared.sanitizeAndEncodeTasks(from: flatArgs["tasks"]) else {
                         return "【任务初始化指引】: 请提供任务步骤描述以挂载黑板，格式如 tasks: [{\"text\": \"第一步...\"}]"
                     }
+                    
                     self.sharedContext["AGENT_BLACKBOARD_PLAN"] = sanitizedPlan
                     let currentPlanSummary = TaskBlackboardManager.shared.generateExecutionPrompt(planString: sanitizedPlan)
+                    
                     return """
                     ✅ 任务规划已成功挂载黑板！
                     \(currentPlanSummary)
-                    【执行指引】：请依据当前活动节点下发对应工具执行。
+                    【下一步指导】：请直接调用目标物理工具推进【等待中】的活动节点。
                     """
-
+                
                 case "append_sub":
                     guard let targetId = flatArgs["target_task_id"] as? String else {
-                        return "【追加子任务指引】: 请提供 target_task_id 以指定目标父节点 ID。"
+                        return "【追加子任务提示】: 请提供 target_task_id 以指定目标父节点 ID。"
                     }
+                    
                     guard let subPlanString = TaskBlackboardManager.shared.sanitizeAndEncodeTasks(from: flatArgs["tasks"]) else {
-                        return "【追加子任务指引】: 请在 tasks 中提供子步骤描述。"
+                        return "【追加子任务提示】: 请在 tasks 中提供子步骤描述。"
                     }
+                    
                     let newSubtasks = TaskBlackboardManager.shared.parsePlan(subPlanString)
                     let currentPlan = self.sharedContext["AGENT_BLACKBOARD_PLAN"]
+                    
                     if let updatedPlan = TaskBlackboardManager.shared.appendSubtasks(planString: currentPlan, parentTaskId: targetId, newSubtasks: newSubtasks) {
                         self.sharedContext["AGENT_BLACKBOARD_PLAN"] = updatedPlan
                         let currentPlanSummary = TaskBlackboardManager.shared.generateExecutionPrompt(planString: updatedPlan)
                         return """
                         ✅ 子任务已成功挂载到节点 [\(targetId)] 下！
                         \(currentPlanSummary)
+                        【下一步指导】：请直接下发指令执行第一个子任务。
                         """
                     } else {
-                        return "【节点未找到】: 在黑板中未检索到 ID 为 [\(targetId)] 的节点。"
+                        return "【节点未找到】: 在黑板中未检索到 ID 为 [\(targetId)] 的节点，请核对后重试。"
                     }
-
+                
                 case "update_status":
                     guard let targetId = flatArgs["target_task_id"] as? String else {
-                        return "❌ 更新状态失败：请提供 target_task_id。"
+                        return "❌ 更新状态失败：必须提供 target_task_id。"
                     }
+                    
                     let rawStatus = (flatArgs["status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "成功"
                     let normalizedStatus: String
                     if ["成功", "success", "完成", "已完成", "done", "completed"].contains(rawStatus) {
@@ -1519,8 +1472,9 @@ public class SkillManager {
                     } else {
                         normalizedStatus = (flatArgs["status"] as? String) ?? "成功"
                     }
-
+                    
                     let resultMemo = flatArgs["result_memo"] as? String
+                    
                     var parsedArtifacts: [AgentArtifact]? = nil
                     if let rawArray = flatArgs["artifacts"] as? [Any] {
                         var list: [AgentArtifact] = []
@@ -1536,11 +1490,18 @@ public class SkillManager {
                             }
                         }
                         if !list.isEmpty { parsedArtifacts = list }
+                    } else if let jsonStr = flatArgs["artifacts"] as? String,
+                              let data = jsonStr.data(using: .utf8) {
+                        if let decodedArts = try? JSONDecoder().decode([AgentArtifact].self, from: data) {
+                            parsedArtifacts = decodedArts
+                        } else if let decodedStrs = try? JSONDecoder().decode([String].self, from: data) {
+                            parsedArtifacts = decodedStrs.map { AgentArtifact(name: $0, type: .text, content: $0) }
+                        }
                     }
-
+                    
                     let currentPlan = self.sharedContext["AGENT_BLACKBOARD_PLAN"]
                     let hasContextError = (self.sharedContext["LAST_TOOL_HAS_ERROR"] == "true")
-
+                    
                     if let updatedPlan = TaskBlackboardManager.shared.updateTaskStatus(
                         planString: currentPlan,
                         taskId: targetId,
@@ -1554,33 +1515,45 @@ public class SkillManager {
                         return """
                         ✅ 任务 [\(targetId)] 状态已更新为 [\(normalizedStatus)]！
                         \(currentPlanSummary)
+                        【下一步指导】：请继续推进下一个【等待中】的任务。
                         """
                     } else {
-                        return "❌ 更新失败：在黑板中未检索到 ID 为 [\(targetId)] 的任务节点。"
+                        return "❌ 更新失败：在黑板中找不到 ID 为 [\(targetId)] 的任务节点。"
                     }
-
+                    
                 case "clear":
                     self.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
                     return "✅ 任务黑板已清空。"
-
+                    
                 default:
-                    return "❌ 操作类型无效: \(action)"
+                    return "❌ 未知的 action 操作: \(action)"
                 }
             } else if skill.executionBody == "builtin_read_manual" {
                 let rawTarget = (flatArgs["target_skill_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if rawTarget.isEmpty {
                     return "❌ 参数错误：请传入有效的 target_skill_name"
                 }
-                let baseName = rawTarget.lowercased().replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression)
+                
+                // 1. 生成所有可能的命名变体 (剥离/补充 skill- 前缀，兼容中划线与下划线)
+                let baseName = rawTarget.lowercased()
+                    .replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression)
+                
                 var candidateNames: Set<String> = [
-                    rawTarget, baseName, "skill-\(baseName)", "skill_\(baseName)",
+                    rawTarget,
+                    baseName,
+                    "skill-\(baseName)",
+                    "skill_\(baseName)",
                     baseName.replacingOccurrences(of: "_", with: "-"),
-                    baseName.replacingOccurrences(of: "-", with: "_")
+                    baseName.replacingOccurrences(of: "-", with: "_"),
+                    "skill-\(baseName.replacingOccurrences(of: "_", with: "-"))",
+                    "skill_\(baseName.replacingOccurrences(of: "-", with: "_"))"
                 ]
+                
                 let skillsBasePath = skill.workingDirectory ?? ConfigManager.shared.skillsPath?.path ?? ""
                 let fileManager = FileManager.default
                 var fileContent: String? = nil
-
+                
+                // 2. 物理路径直接探测
                 for name in candidateNames {
                     let docPath = "\(skillsBasePath)/\(name)/SKILL.md"
                     if fileManager.fileExists(atPath: docPath),
@@ -1590,30 +1563,57 @@ public class SkillManager {
                         break
                     }
                 }
-
+                
+                // 3. 物理目录遍历兜底探测 (扫描各子文件夹 SKILL.md Frontmatter)
+                if fileContent == nil, let subDirs = try? fileManager.contentsOfDirectory(atPath: skillsBasePath) {
+                    for dir in subDirs {
+                        let candidateFile = "\(skillsBasePath)/\(dir)/SKILL.md"
+                        if fileManager.fileExists(atPath: candidateFile),
+                           let content = try? String(contentsOfFile: candidateFile, encoding: .utf8) {
+                            let lowerContent = content.lowercased()
+                            if candidateNames.contains(dir.lowercased()) ||
+                               candidateNames.contains(where: { lowerContent.contains("name: \($0)") }) {
+                                fileContent = content
+                                break
+                            }
+                        }
+                    }
+                }
+                
+                // 4. 交付解析内容或正向引导 (无负面词汇，避免模型反复试探假工具)
                 if let content = fileContent {
                     executionResult = content
                 } else {
+                    // 归一化内存比对
                     let matchedSkill = self.skills.first(where: { s in
                         let sBase = s.name.lowercased().replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression)
-                        return candidateNames.contains(s.name.lowercased()) || sBase == baseName
+                        return candidateNames.contains(s.name.lowercased()) ||
+                               candidateNames.contains(s.displayName.lowercased()) ||
+                               sBase == baseName
                     })
+                    
                     if let matched = matchedSkill {
                         let instruction = matched.detailedInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !instruction.isEmpty {
                             executionResult = instruction
                         } else {
                             let paramList = matched.parameters.map { "\($0.name)(\($0.type.rawValue))" }.joined(separator: ", ")
-                            executionResult = "【工具: \(matched.displayName)】说明: \(matched.description)\n参数定义: [\(paramList)]"
+                            executionResult = """
+                            【工具: \(matched.displayName)】
+                            - 唯一标识: \(matched.name)
+                            - 核心功能: \(matched.description)
+                            - 参数定义: [\(paramList)]
+                            💡 该工具已在当前环境装载就绪，请直接通过原生 Tool Call 接口传入参数执行。
+                            """
                         }
                     } else {
-                        executionResult = "💡 当前工具已加载就绪，可直接依据上下文要求下发 Tool Call 执行。"
+                        executionResult = "💡 未检索到 [\(rawTarget)] 的独立文档。请直接根据当前已启用的工具列表下发 Tool Call 执行任务。"
                     }
                 }
             } else if skill.executionBody == "builtin_knowledge_search" {
                 let searchQuery = (flatArgs["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 var searchCategory = (flatArgs["category"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
+                
                 if searchQuery.isEmpty {
                     executionResult = "❌ 检索失败：query 参数不能为空。"
                 } else {
@@ -1623,75 +1623,48 @@ public class SkillManager {
                         searchCategory = currentAgent?.bindKnowledgeCategory ?? "全部"
                     }
                     let currentModel = currentAgent?.baseModel ?? "gemini-2.0-flash"
+                    
                     let knowledgeVM = KnowledgeViewModel()
                     let ragResult = await knowledgeVM.injectedRag(query: searchQuery, category: searchCategory, currentModel: currentModel)
-                    executionResult = ragResult.context.isEmpty ? "⚠️ 在分类 [\(searchCategory.isEmpty ? "全局" : searchCategory)] 中未检索到与「\(searchQuery)」相关的有效切片。" : ragResult.context
+                    
+                    if ragResult.context.isEmpty {
+                        executionResult = "⚠️ 在分类 [\(searchCategory.isEmpty ? "全局" : searchCategory)] 中未找到与「\(searchQuery)」相关的有效切片。"
+                    } else {
+                        executionResult = ragResult.context
+                    }
                 }
             } else {
-                executionResult = "系统原生方法执行完毕。"
+                executionResult = "系统原生方法暂未对接具体的路由"
             }
         }
-
-        // 6. 进化类技能自愈与健康积分管理
+        
+        // 2. 进化技能动态评分与熔断机制
         if skill.category == "进化" {
             let lowerResult = executionResult.lowercased()
-            let isFailure = executionResult.contains("❌") || executionResult.contains("⚠️") || lowerResult.contains("error") || lowerResult.contains("exception")
+            let isFailure = executionResult.contains("❌") || executionResult.contains("⚠️") || lowerResult.contains("error") || lowerResult.contains("exception") || lowerResult.contains("traceback")
+            
             if let idx = self.skills.firstIndex(where: { $0.id == skill.id }) {
                 if isFailure {
                     self.skills[idx].score -= 15
                 } else {
                     self.skills[idx].score = min(100, self.skills[idx].score + 5)
                 }
+                
                 if self.skills[idx].score < 60 {
                     self.skills[idx].isEnabled = false
                     self.saveSkills()
-                    return executionResult + "\n\n⚠️ 技能 [\(skill.name)] 连续执行异常，已自动保护性停用。"
+                    print("🛑 [熔断机制] 进化技能 [\(skill.name)] 评分跌破及格线(\(self.skills[idx].score)分)，已被系统自动停用。")
+                    
+                    return executionResult + "\n\n[SYSTEM ALERT]: 警告！您所调用的技能 [\(skill.name)] 因连续执行抛错，健康评分已跌至 \(self.skills[idx].score) 分。触发系统底层熔断安全机制，系统已强制将其永久停用！请立刻停止调用此技能，换用其他方案！"
                 }
                 self.saveSkills()
             }
         }
-
+        
         return executionResult
     }
 
-    // MARK: - Schema 强类型安全校验与转换辅助函数
-    private func validateAndCoerceType(value: Any, expectedType: ParameterType) -> (isValid: Bool, coerced: Any?) {
-        switch expectedType {
-        case .string:
-            if let str = value as? String { return (true, str) }
-            return (true, String(describing: value))
-        case .number:
-            if let num = value as? NSNumber { return (true, num) }
-            if let str = value as? String, let d = Double(str) { return (true, d) }
-            return (false, nil)
-        case .boolean:
-            if let b = value as? Bool { return (true, b) }
-            if let str = value as? String {
-                let lower = str.lowercased().trimmingCharacters(in: .whitespaces)
-                if lower == "true" || lower == "1" { return (true, true) }
-                if lower == "false" || lower == "0" { return (true, false) }
-            }
-            return (false, nil)
-        case .array:
-            if let arr = value as? [Any] { return (true, arr) }
-            if let str = value as? String, let data = str.data(using: .utf8),
-               let arr = try? JSONSerialization.jsonObject(with: data) as? [Any] {
-                return (true, arr)
-            }
-            return (false, nil)
-        case .object:
-            if let dict = value as? [String: Any] { return (true, dict) }
-            if let str = value as? String, let data = str.data(using: .utf8),
-               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                return (true, dict)
-            }
-            return (false, nil)
-        case .enum:
-            return (true, String(describing: value))
-        }
-    }
-
-    // MARK: - CLI 原生命令行执行引擎 (非阻塞实时流式捕获 + 真实 PATH 寻址)
+    // MARK: - 🚀 [Optimized] CLI 原生命令行执行引擎 (非阻塞实时流式捕获 + 真实 PATH 寻址)
     private func executeCLI(
         executableTarget: String,
         args: [String: Any],
