@@ -50,6 +50,51 @@ public struct PhysicalTruthVerifier: Sendable {
         
         return false
     }
+    
+    // MARK: - 统一入口：结合工具语义与只读防误杀机制
+    /// 综合判别工具执行状态 (彻底避免手册文档/只读正文中出现 "error" 等词汇造成的误杀)
+    public static func isExecutionFailed(toolName: String, output: String, exitCode: Int? = nil) -> Bool {
+        if let code = exitCode, code != 0 { return true }
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return false }
+        
+        // 1. 显式以错误标识前缀开头
+        if trimmed.hasPrefix("❌") || trimmed.hasPrefix("Fatal:") || trimmed.hasPrefix("FATAL:") || trimmed.hasPrefix("panic:") || trimmed.hasPrefix("Traceback (most recent call last):") {
+            return true
+        }
+        
+        // 2. 结构化 JSON 错误字段探查 (排查 {"error": null} 或 {"status": "success"} 的假阳性)
+        if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")),
+           let data = trimmed.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in errorJsonKeys {
+                if let val = dict[key] {
+                    if let str = val as? String, !str.isEmpty && str.lowercased() != "null" && str.lowercased() != "ok" {
+                        return true
+                    }
+                    if let boolVal = val as? Bool, boolVal {
+                        return true
+                    }
+                    if let intVal = val as? Int, intVal != 0 {
+                        return true
+                    }
+                }
+            }
+            if let status = dict["status"] as? String, status.lowercased() == "failed" || status.lowercased() == "error" {
+                return true
+            }
+        }
+        
+        // 3. 只读/查阅文档/知识库检索类工具防误杀判定
+        let lowerName = toolName.lowercased()
+        let isDocOrQueryTool = lowerName.contains("manual") || lowerName.contains("read") || lowerName.contains("search") || lowerName.contains("knowledge") || lowerName.contains("fetch") || lowerName.contains("list") || lowerName.contains("doc")
+        if isDocOrQueryTool {
+            return trimmed.hasPrefix("❌") || trimmed.hasPrefix("⚠️ 未找到") || trimmed.hasPrefix("找不到")
+        }
+        
+        // 4. 通用 CLI / 物理变异写入类指令判定
+        return hasPhysicalError(output: output, exitCode: exitCode)
+    }
 }
 
 // MARK: - 2. 调度推进与意图看门狗 (Continuance Intent Watchdog)
@@ -109,102 +154,88 @@ public struct BlackboardGrammar: Sendable {
         "纯文本回复", "直接回答", "总结归纳", "口头说明", "解答疑问", "提供建议", "解释原理", "阐述方案",
         "reply", "answer", "explain", "summarize", "analyze"
     ]
-    
-    /// 推断节点类型
-    public static func inferNodeType(from text: String) -> GraphNodeType {
-        let lower = text.lowercased()
-        if strictActionKeywords.contains(where: { lower.contains($0) }) {
-            return .tool
-        }
-        if reasoningKeywords.contains(where: { lower.contains($0) }) {
-            return .reasoning
-        }
-        return .tool // 默认保持保守策略，分配给物理操作
-    }
-    
-    /// 弹性解析任务状态
-    public static func parseStatus(from text: String) -> GraphNodeStatus {
-        let s = text.lowercased()
-        
-        // 1. 最高优先级：判定失败、阻断、异常、中止语素
-        if s.contains("失败") || s.contains("failed") || s.contains("error") ||
-           s.contains("阻断") || s.contains("中止") || s.contains("取消") || s.contains("异常") ||
-           s.contains("未通过") || s.contains("无法") {
-            return .failed
-        }
-        
-        // 2. 次优先级：判定明确成功语素
-        if s.contains("成功") || s.contains("success") || s.contains("ok") ||
-           (s.contains("完成") && !s.contains("未完成")) ||
-           (s.contains("done") && !s.contains("not done")) {
-            return .success
-        }
-        
-        // 3. 判定执行中语素
-        if s.contains("执行中") || s.contains("进行中") || s.contains("running") || s.contains("in_progress") {
-            return .running
-        }
-        
-        // 4. 其余态默认回退为等待态
-        return .pending
-    }
 }
 
 // MARK: - 4. 诊断自愈与引导语法收敛器 (Diagnostic Grammar)
 public enum ToolExecutionDiagnostic: Sendable {
     case commandNotFound
-    case parameterValidationFailed
+    case parameterValidationFailed(usageDetail: String?)
     case resourceNotFound           // 业务资源不存在 (如 应用ID/表单ID 不存在)
     case pathNotFound               // 本地文件系统物理路径不存在
     case permissionDenied           // 系统级沙盒或文件权限受限
     case generic(String)
     
-    /// 结构化分析错误类型 (优化优先级：优先匹配业务资源与参数错误)
+    /// 结构化分析错误类型 (全面兼容中英文 CLI 用法提示与参数缺失)
     public static func analyze(errorMessage: String) -> ToolExecutionDiagnostic {
         let lower = errorMessage.lowercased()
         
         // 1. 命令/二进制未就绪
-        if lower.contains("未找到命令") || lower.contains("command not found") || lower.contains("找不到可执行") {
+        if lower.contains("未找到命令")
+            || lower.contains("command not found")
+            || lower.contains("找不到可执行")
+            || lower.contains("找不到已挂载的技能")
+            || (lower.contains("no such file") && lower.contains("/bin/")) {
             return .commandNotFound
         }
         
-        // 2. 参数语法/必填项对齐
-        if lower.contains("参数校验失败") || lower.contains("缺少必填参数") || lower.contains("usage:") || lower.contains("invalid argument") {
-            return .parameterValidationFailed
+        // 2. 参数语法/必填项/用法示例对齐 (提取 CLI 返回的 Usage 证据)
+        if lower.contains("用法:")
+            || lower.contains("用法：")
+            || lower.contains("usage:")
+            || lower.contains("参数校验失败")
+            || lower.contains("缺少必填")
+            || lower.contains("缺少必选")
+            || lower.contains("invalid argument")
+            || lower.contains("missing required")
+            || lower.contains("syntaxerror") {
+            return .parameterValidationFailed(usageDetail: errorMessage.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         
-        // 3. 业务资源与物理路径区分判断
-        if lower.contains("不存在") || lower.contains("not found") || lower.contains("找不到") || lower.contains("404") || lower.contains("无此") || lower.contains("unknown") {
-            if lower.contains("文件") || lower.contains("目录") || lower.contains("path") || lower.contains("file") || lower.contains("directory") {
-                return .pathNotFound
-            }
+        // 3. 业务资源不存在
+        if lower.contains("404") || lower.contains("无此") || lower.contains("unknown") {
             return .resourceNotFound
         }
         
-        // 4. 权限与沙盒保护 (排除非权限引起的报错)
-        if (lower.contains("权限") || lower.contains("denied") || lower.contains("permission") || lower.contains("eacces")) && !lower.contains("不存在") {
+        // 4. 本地物理路径不存在
+        if (lower.contains("不存在") || lower.contains("not found") || lower.contains("找不到"))
+            && (lower.contains("no such file or directory") || lower.contains("文件不存在") || lower.contains("目录不存在") || lower.contains("路径不存在")) {
+            return .pathNotFound
+        }
+        
+        // 5. 通用业务未找到
+        if lower.contains("不存在") || lower.contains("not found") || lower.contains("找不到") {
+            return .resourceNotFound
+        }
+        
+        // 6. 权限与沙盒保护
+        if (lower.contains("权限") || lower.contains("denied") || lower.contains("permission") || lower.contains("eacces")) {
             return .permissionDenied
         }
         
         return .generic(errorMessage)
     }
     
-    /// 正向自愈指引
+    /// 正向自愈指引 (保真融合底层物理报错实况)
     public var structuredHealingPrompt: String {
         switch self {
         case .commandNotFound:
             return "● 执行诊断：目标指令未就绪。\n● 推荐动作：核对工具确切名称，或调用系统 Shell/Python 脚本直接执行。"
-        case .parameterValidationFailed:
-            return "● 执行诊断：参数结构需要对齐。\n● 推荐动作：核对必填字段的类型格式（如 JSON 结构），直接发起修正后的 Tool Call。"
+        case .parameterValidationFailed(let usageDetail):
+            var prompt = "● 执行诊断：命令参数结构需要对齐。"
+            if let detail = usageDetail, !detail.isEmpty {
+                prompt += "\n● 控制台实况：\n\(detail)"
+            }
+            prompt += "\n● 推荐动作：若缺少目标 ID/标识符参数，请优先调用对应的 list/search 指令先检索有效 ID，或传入手册规范的必选参数。"
+            return prompt
         case .resourceNotFound:
-            return "● 执行诊断：目标业务资源未找到 (如目标应用 ID / 表单 ID 不存在)。\n● 推荐动作：优先调用 list/search 等探针指令检索当前环境有效资源列表，校准目标 ID。"
+            return "● 执行诊断：目标业务资源未找到 (如目标应用 ID / 表单 ID / 工作流 ID 不存在)。\n● 推荐动作：优先调用 list/search 等探针指令检索当前环境有效资源列表，校准目标 ID 后再执行操作。"
         case .pathNotFound:
             return "● 执行诊断：目标物理路径未找到。\n● 推荐动作：优先调用目录读取或文件检索工具获取有效物理路径。"
         case .permissionDenied:
             return "● 执行诊断：触发沙盒访问保护。\n● 推荐动作：将操作限定在应用沙盒允许范围或用户 Downloads 目录下执行。"
         case .generic(let msg):
             let summary = msg.count > 160 ? String(msg.prefix(160)) + "..." : msg
-            return "● 执行反馈：\(summary)\n● 推荐动作：结合上下文调整参数配置后继续推进。"
+            return "● 执行反馈：\(summary)\n● 推荐动作：结合上下文与报错详情调整参数配置后继续推进。"
         }
     }
 }

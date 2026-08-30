@@ -1,12 +1,13 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：MemoryManager.swift
-// 文件说明：适用于 macOS 14+ 的长效记忆 (LTM) 管理器与视图面板
-// 代码要求：请保证代码的逻辑和完整性，保留代码中的所有注释内容
-// 核心架构：
-// 1. 🌟 现实与虚构硬隔离：升级反思 Prompt，建立严格的认知边界。严禁将小说叙写（虚构人物关系）、知识库检索（客观技术概念）灌入“用户画像”！
-// 2. 🌟 智能流转：虚构小说的角色设定降准划归为「短期备忘」；知识库参数/路径划归为「项目环境」；唯有关于“现实用户本人”的事实才准进入「用户画像」。
-// 3. 🌟 三重解析护盾：Decoder -> JSONSerialization -> Regex 盲拆引擎。100% 免疫未转义引号、脏数据，彻底根治格式解析错误！
-// 4. Swift 6 Concurrency Safe: 全量确保多Actor隔离边界的数据流 100% 线程安全。
+// 文件说明：适用于 macOS 14+ 的长效记忆 (LTM) 管理器与神经元反思中枢 (Swift 6 Ready)
+//
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. MemoryModels              : 记忆分类枚举、持久化实体与反思数据传输对象 (Sendable)
+// ├── 2. MemoryManager (Core)      : LTM 存储、300维向量检索、去重更新与置顶管理 (@Observable @MainActor)
+// ├── 3. MemoryReflectionEngine    : 全景会话反思、RLHF 点赞/点踩双轨提炼与三重自愈解析护盾
+// ├── 4. MemoryDreamConsolidation  : 梦境反思机制 (工具专属高保真避坑融合与通用画像浓缩)
+// └── 5. MemoryUI Components       : 拟物化毛玻璃记忆大盘 (ManagementPanel)、卡片视图与人工注入抽屉
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -14,13 +15,13 @@ import AppKit
 import Accelerate
 import NaturalLanguage
 
-// MARK: - ==================== 1. 底层持久化数据模型 ====================
+// MARK: - ==================== 1. MemoryModels (数据模型与反思实体) ====================
 
-enum MemoryCategory: String, CaseIterable, Codable {
-    case persona = "用户画像" // 偏好、习惯、现实本人的专属称呼
-    case project = "项目环境" // 路径、版本号、架构上下文、外部客观背景知识
-    case lesson = "避坑指南" // 历史报错、解决经验
-    case tickler = "短期备忘" // 临时提醒、小说剧本虚构角色背景、可过期备忘
+enum MemoryCategory: String, CaseIterable, Codable, Sendable {
+    case persona = "用户画像"
+    case project = "项目环境"
+    case lesson = "避坑指南"
+    case tickler = "短期备忘"
     
     var icon: String {
         switch self {
@@ -41,7 +42,7 @@ enum MemoryCategory: String, CaseIterable, Codable {
     }
 }
 
-struct MemoryItem: Identifiable, Codable, Equatable {
+struct MemoryItem: Identifiable, Codable, Equatable, Sendable {
     var id = UUID()
     var content: String
     var category: MemoryCategory
@@ -71,10 +72,28 @@ struct MemoryItem: Identifiable, Codable, Equatable {
         self.triggers = try container.decodeIfPresent([String].self, forKey: .triggers) ?? []
     }
     
-    init(id: UUID = UUID(), content: String, category: MemoryCategory, importance: Int, createdAt: Date = Date(), embedding: [Float]? = nil, isPinned: Bool = false, dimension: String = "通用", toolName: String? = nil, triggers: [String] = []) {
-        self.id = id; self.content = content; self.category = category; self.importance = importance
-        self.createdAt = createdAt; self.embedding = embedding; self.isPinned = isPinned; self.dimension = dimension
-        self.toolName = toolName; self.triggers = triggers
+    init(
+        id: UUID = UUID(),
+        content: String,
+        category: MemoryCategory,
+        importance: Int,
+        createdAt: Date = Date(),
+        embedding: [Float]? = nil,
+        isPinned: Bool = false,
+        dimension: String = "通用",
+        toolName: String? = nil,
+        triggers: [String] = []
+    ) {
+        self.id = id
+        self.content = content
+        self.category = category
+        self.importance = importance
+        self.createdAt = createdAt
+        self.embedding = embedding
+        self.isPinned = isPinned
+        self.dimension = dimension
+        self.toolName = toolName
+        self.triggers = triggers
     }
     
     var relativeTimeString: String {
@@ -136,11 +155,11 @@ struct ExtractedMemory: Decodable, Sendable {
     }
 }
 
-// MARK: - ==================== 2. 长期记忆核心逻辑调度中心 ====================
+// MARK: - ==================== 2. MemoryManager (长期记忆核心逻辑调度中心) ====================
 
 @Observable
 @MainActor
-class MemoryManager {
+final class MemoryManager {
     static let shared = MemoryManager()
     
     var memories: [MemoryItem] = []
@@ -152,7 +171,9 @@ class MemoryManager {
         return baseURL.appendingPathComponent("agent_memory.json")
     }
     
-    private init() { loadMemories() }
+    private init() {
+        loadMemories()
+    }
     
     func loadMemories() {
         if let data = try? Data(contentsOf: fileURL),
@@ -194,45 +215,38 @@ class MemoryManager {
         let textToEmbed = embeddingText ?? (triggers.isEmpty ? content : "\(triggers.joined(separator: " ")) \(content)")
         let vector = await MicroVectorDB.shared.generateEmbedding(for: textToEmbed)
         
-        await MainActor.run {
-            var memoriesToKeep: [MemoryItem] = []
-            let cleanNewContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            for oldMem in self.memories {
-                // 仅在「同分类 + 同细分维度 + 同绑定工具」的严格作用域内进行去重校验
-                let isSameScope = oldMem.category == matchedCategory && oldMem.dimension == dimension && oldMem.toolName == toolName
-                
-                if isSameScope {
-                    // 1. 完全相同文本执行覆写更新
-                    if oldMem.content.trimmingCharacters(in: .whitespacesAndNewlines) == cleanNewContent {
+        var memoriesToKeep: [MemoryItem] = []
+        let cleanNewContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        for oldMem in self.memories {
+            let isSameScope = oldMem.category == matchedCategory && oldMem.dimension == dimension && oldMem.toolName == toolName
+            if isSameScope {
+                if oldMem.content.trimmingCharacters(in: .whitespacesAndNewlines) == cleanNewContent {
+                    continue
+                }
+                if let oldEmb = oldMem.embedding {
+                    let sim = MicroVectorDB.shared.cosineSimilarity(a: vector, b: oldEmb)
+                    if sim >= 0.96 {
                         continue
                     }
-                    
-                    // 2. 仅对余弦相似度极高 (>= 0.96) 的近乎完全重复事实进行合并，彻底解决 0.85 阈值误伤不同经验的问题
-                    if let oldEmb = oldMem.embedding {
-                        let sim = cosineSimilarity(a: vector, b: oldEmb)
-                        if sim >= 0.96 {
-                            continue
-                        }
-                    }
                 }
-                memoriesToKeep.append(oldMem)
             }
-            
-            self.memories = memoriesToKeep
-            let newMemory = MemoryItem(
-                content: content,
-                category: matchedCategory,
-                importance: safeImportance,
-                createdAt: Date(),
-                embedding: vector,
-                dimension: dimension,
-                toolName: toolName?.isEmpty == true ? nil : toolName,
-                triggers: triggers
-            )
-            self.memories.insert(newMemory, at: 0)
-            self.saveMemories()
+            memoriesToKeep.append(oldMem)
         }
+        
+        self.memories = memoriesToKeep
+        let newMemory = MemoryItem(
+            content: content,
+            category: matchedCategory,
+            importance: safeImportance,
+            createdAt: Date(),
+            embedding: vector,
+            dimension: dimension,
+            toolName: toolName?.isEmpty == true ? nil : toolName,
+            triggers: triggers
+        )
+        self.memories.insert(newMemory, at: 0)
+        self.saveMemories()
         return "✅ 长期存储网络落盘成功。"
     }
     
@@ -251,23 +265,20 @@ class MemoryManager {
     func searchContext(for query: String, topK: Int = 3, categoryFilter: String? = nil) async -> String {
         let queryVector = await MicroVectorDB.shared.generateEmbedding(for: query)
         let queryLower = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let queryTokens = tokenize(queryLower)
+        let queryTokens = SmartTokenizer.tokenize(queryLower)
         let isAskingIdentity = queryLower.contains("我是谁") || queryLower.contains("我叫") || queryLower.contains("我的名字") || queryLower.contains("怎么称呼")
         
-        let pinnedMemories = await MainActor.run {
-            memories.filter { mem in mem.isPinned && (categoryFilter == nil || mem.category.rawValue == categoryFilter) }
-        }
-        
+        let pinnedMemories = memories.filter { mem in mem.isPinned && (categoryFilter == nil || mem.category.rawValue == categoryFilter) }
         var scoredMemories: [(item: MemoryItem, score: Float)] = []
-        let currentMemories = await MainActor.run { self.memories }
         
-        for mem in currentMemories where !mem.isPinned {
+        for mem in self.memories where !mem.isPinned {
             if let filter = categoryFilter, mem.category.rawValue != filter { continue }
             var score: Float = 0
             let memLower = mem.content.lowercased()
             
             if let emb = mem.embedding {
-                let sim = cosineSimilarity(a: queryVector, b: emb)
+                // 直接调用 MicroVectorDB 统一余弦算子
+                let sim = MicroVectorDB.shared.cosineSimilarity(a: queryVector, b: emb)
                 if sim > 0.3 { score += sim * 2.0 }
                 if isAskingIdentity && mem.category == .persona && sim > 0.15 { score += 1.2 }
             }
@@ -296,35 +307,9 @@ class MemoryManager {
         }
         return resultText
     }
-    
-    private func tokenize(_ text: String) -> [String] {
-        let clean = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.isEmpty { return [] }
-        let tokenizer = NLTokenizer(unit: .word)
-        tokenizer.string = clean
-        if let lang = NLLanguageRecognizer.dominantLanguage(for: clean) { tokenizer.setLanguage(lang) }
-        let trimCharacterSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
-        var tokens: Set<String> = [clean]
-        tokenizer.enumerateTokens(in: clean.startIndex..<clean.endIndex) { range, _ in
-            let word = String(clean[range]).trimmingCharacters(in: trimCharacterSet)
-            if word.count > 1 || (word.count == 1 && word.rangeOfCharacter(from: .alphanumerics) != nil) { tokens.insert(word) }
-            return true
-        }
-        return Array(tokens)
-    }
-    
-    private func cosineSimilarity(a: [Float], b: [Float]) -> Float {
-        guard a.count == b.count else { return 0 }
-        let n = vDSP_Length(a.count); var dotProduct: Float = 0
-        vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
-        var aNorm: Float = 0; vDSP_svesq(a, 1, &aNorm, n)
-        var bNorm: Float = 0; vDSP_svesq(b, 1, &bNorm, n)
-        let denominator = sqrt(aNorm) * sqrt(bNorm)
-        return denominator == 0 ? 0 : dotProduct / denominator
-    }
 }
 
-// MARK: - ==================== 3. 🌌 长期记忆进化二期：全景重载提取引擎 ====================
+// MARK: - ==================== 3. 全景会话反思与 RLHF 双轨经验捕获 ====================
 
 extension MemoryManager {
     
@@ -356,14 +341,12 @@ extension MemoryManager {
         Task.detached(priority: .utility) { await self.reflectOnSessionTurns(turns, model: model) }
     }
     
-    /// 轨道 B 核心：根据当前激活的工具列表，精准拉取高价值避坑规则（无需经过用户输入词的模糊匹配）
+    /// 轨道 B 核心：根据当前激活的工具列表，精准拉取高价值避坑规则
     func getToolLessons(for toolNames: Set<String>, topKPerTool: Int = 3) async -> String {
         guard !toolNames.isEmpty else { return "" }
-        let currentMemories = await MainActor.run { self.memories }
-        
         var lessons: [String] = []
         for tool in toolNames {
-            let matched = currentMemories
+            let matched = self.memories
                 .filter { $0.category == .lesson && ($0.toolName == tool || $0.content.contains(tool)) }
                 .sorted { $0.importance > $1.importance }
                 .prefix(topKPerTool)
@@ -377,12 +360,7 @@ extension MemoryManager {
         return "\n\n<active_tool_lessons>\n" + lessons.joined(separator: "\n") + "\n</active_tool_lessons>"
     }
     
-    /// 捕获用户即时反馈并提炼长效经验规则
-    /// - Parameters:
-    ///   - recentMessages: 当前会话历史消息数组
-    ///   - targetMessageId: 被点赞/点踩的目标 AI 消息 ID
-    ///   - feedback: 反馈类型 (.liked / .disliked)
-    ///   - model: 用于反思的轻量模型名称
+    /// 捕获用户即时反馈并提炼长效经验规则 (RLHF)
     func harvestFeedbackExperience(
         recentMessages: [ChatMessage],
         targetMessageId: UUID,
@@ -394,7 +372,7 @@ extension MemoryManager {
         let feedbackLabel = isLike ? "满意 (点赞)" : "不满意 (点踩)"
         let logActionTitle = isLike ? "👍 [正向习惯捕获]" : "👎 [负向痛点归因]"
         
-        await MainActor.run { LogManager.shared.info("\(logActionTitle) 启动双轨特征反思...") }
+        LogManager.shared.info("\(logActionTitle) 启动双轨特征反思...")
         
         guard let targetIndex = recentMessages.firstIndex(where: { $0.id == targetMessageId }) else { return }
         let startIndex = max(0, targetIndex - 4)
@@ -467,34 +445,30 @@ extension MemoryManager {
         
         guard !contentStr.isEmpty else { return }
         
-        // 向量嵌入重点针对「触发短语 + 核心规则」，彻底避免长文本稀释特征
         let embedSource = (triggers.joined(separator: " ") + " " + contentStr)
         let vector = await MicroVectorDB.shared.generateEmbedding(for: embedSource)
-        
         let matchedCategory: MemoryCategory = categoryStr.contains("用户") ? .persona : .lesson
         
-        await MainActor.run {
-            let newMemory = MemoryItem(
-                content: contentStr,
-                category: matchedCategory,
-                importance: importance,
-                createdAt: Date(),
-                embedding: vector,
-                dimension: dimensionStr,
-                toolName: toolName?.isEmpty == true ? nil : toolName,
-                triggers: triggers
-            )
-            self.memories.insert(newMemory, at: 0)
-            self.saveMemories()
-            
-            LogManager.shared.success(
-                "🛡️ 双轨工具经验固化成功",
-                detail: "工具: \(toolName ?? "通用")\n触发词: \(triggers)\n规则: \(contentStr)"
-            )
-        }
+        let newMemory = MemoryItem(
+            content: contentStr,
+            category: matchedCategory,
+            importance: importance,
+            createdAt: Date(),
+            embedding: vector,
+            dimension: dimensionStr,
+            toolName: toolName?.isEmpty == true ? nil : toolName,
+            triggers: triggers
+        )
+        self.memories.insert(newMemory, at: 0)
+        self.saveMemories()
+        
+        LogManager.shared.success(
+            "🛡️ 双轨工具经验固化成功",
+            detail: "工具: \(toolName ?? "通用")\n触发词: \(triggers)\n规则: \(contentStr)"
+        )
     }
     
-    /// 全局会话全景潜意识反思核心总线 (后台并发多线程，配载三重抗灾自愈护盾与子属性风道抽取)
+    /// 全局会话全景潜意识反思核心总线
     private nonisolated func reflectOnSessionTurns(_ turns: [DialogueTurn], model: String) async {
         let userMessages = turns.filter { $0.isUser }
         if userMessages.isEmpty { return }
@@ -523,10 +497,10 @@ extension MemoryManager {
         1. 【避坑指南 (lesson)】（核心重点）：
            - 关注点：重点分析日志中「工具调用报错、命令异常退出、参数错误、顺序颠倒、缺失必填项」以及后续「修正成功的真实命令」。
            - 提炼标准：输出必须包含具体技术要素：【工具名/子命令】+【导致报错的写法】+【实测验证有效的正确格式/参数顺序/文件语法】。
-           - 质量要求：拒绝“需要仔细阅读文档”、“避免机械输出”等泛泛而谈的沟通建议；只沉淀具备直接执行价值的技术语法与参数契约。
+           - 质量要求：直接陈述经过验证的技术语法与参数契约。
 
         2. 【用户画像 (persona)】：
-           - 仅提取现实人类用户本人的技术栈背景、工作习惯与称呼。
+           - 提取现实人类用户本人的技术栈背景、工作习惯与称呼。
 
         3. 【项目环境 (project)】：
            - 提取本次会话中出现的客观项目ID、应用ID、租户Key、服务器地址、本地环境路径等。
@@ -555,12 +529,12 @@ extension MemoryManager {
         ]
         """
         
-        await MainActor.run { LogManager.shared.info("🌌 [潜意识反思器] 启动全景多维记忆收割流...") }
+        LogManager.shared.info("🌌 [潜意识反思器] 启动全景多维记忆收割流...")
         let rawJsonReport = await LLMService.shared.askSimple(prompt: batchReflectPrompt, model: model)
         let reportWithoutThink = rawJsonReport.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
         
         guard let extractedStr = await reportWithoutThink.extractJSON() else {
-            await MainActor.run { LogManager.shared.error("❌ [潜意识观察者] 解析失败：未找到有效 JSON 数据") }
+            LogManager.shared.error("❌ [潜意识观察者] 解析失败：未找到有效 JSON 数据")
             return
         }
         
@@ -655,48 +629,35 @@ extension MemoryManager {
         }
         return results
     }
+}
 
-    // MARK: 🌌 认知三：梦境反思 (Memory Consolidation)
+// MARK: - ==================== 4. 梦境反思记忆整合 (Memory Consolidation) ====================
+
+extension MemoryManager {
+    
     /// 触发梦境记忆整合（支持工具独立聚类、参数语法保真与元数据继承）
-    /// - Parameter model: 用于反思整合的轻量模型名称
-    /// - Returns: 成功完成整合的原始记忆碎片总数
     func triggerDreamConsolidation(model: String) async -> Int {
         var totalConsolidatedCount = 0
-        
-        // 1. 避坑指南专用通道：按 toolName 独立聚类，严防跨工具规则混淆抹平
         totalConsolidatedCount += await consolidateToolLessons(model: model)
-        
-        // 2. 用户画像与项目环境常规通道：语义去重与画像融合
         totalConsolidatedCount += await consolidateGeneralCategory(.persona, model: model)
         totalConsolidatedCount += await consolidateGeneralCategory(.project, model: model)
-        
         return totalConsolidatedCount
     }
     
-    // MARK: - 内部私有整合子流水线
-    
-    /// 针对【避坑指南】的独立高保真规则提炼流水线
     private func consolidateToolLessons(model: String) async -> Int {
         var processedCount = 0
-        
-        // 提取所有未置顶的避坑指南
-        let lessonFragments = await MainActor.run {
-            self.memories.filter { $0.category == .lesson && !$0.isPinned }
-        }
+        let lessonFragments = self.memories.filter { $0.category == .lesson && !$0.isPinned }
         guard lessonFragments.count >= 2 else { return 0 }
         
-        // 1. 按 toolName 分组聚类
         var toolGroups: [String: [MemoryItem]] = [:]
         for item in lessonFragments {
             let key = item.toolName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? item.toolName! : "通用规范"
             toolGroups[key, default: []].append(item)
         }
         
-        // 2. 逐工具进行高精度规则融合
         for (toolKey, groupItems) in toolGroups where groupItems.count >= 2 {
             let fragmentsText = groupItems.enumerated().map { "\($0 + 1). \($1.content)" }.joined(separator: "\n")
             
-            // 纯正向、高密度、要求保留参数占位符与命令签名的提示词
             let lessonPrompt = """
             # 角色与任务
             你是一位系统执行规范提炼专家。请对当前工具【\(toolKey)】收集到的调用经验碎片进行去重与结构化融合，输出高密度的调用规范手册。
@@ -706,8 +667,8 @@ extension MemoryManager {
             </raw_lessons>
 
             # 提炼规范
-            1. 语法与参数保真：完整保留具体子命令名、位置参数顺序、长选项定义、文件路径格式（如 @file.json）以及 JSON 键值规范（如 title 与 type）。
-            2. 结构化输出：每条规则单独成行，采用「[场景/子命令]: 正确执行规范（关键说明）」的格式，拒绝任何空泛的沟通套话。
+            1. 语法与参数保真：完整保留具体子命令名、位置参数顺序、长选项定义、文件路径格式（如 @file.json）以及 JSON 键值规范。
+            2. 结构化输出：每条规则单独成行，采用「[场景/子命令]: 正确执行规范（关键说明）」的格式。
             3. 场景触发词提炼：总结 3~5 个高频调用场景关键词或子命令名称。
 
             # 输出格式 (严格输出标准 JSON 单对象)
@@ -733,48 +694,38 @@ extension MemoryManager {
             
             guard !contentStr.isEmpty && contentStr.count > 15 else { continue }
             
-            // 向量特征计算：重点锚定触发词 + 规则正文
             let embedSource = triggers.joined(separator: " ") + " " + contentStr
             let vector = await MicroVectorDB.shared.generateEmbedding(for: embedSource)
-            
             let targetToolName = toolKey == "通用规范" ? nil : toolKey
             let oldIDs = groupItems.map { $0.id }
             
-            await MainActor.run {
-                // 安全替换旧碎片
-                self.memories.removeAll { oldIDs.contains($0.id) }
-                
-                let consolidatedItem = MemoryItem(
-                    content: contentStr,
-                    category: .lesson,
-                    importance: 9,
-                    createdAt: Date(),
-                    embedding: vector,
-                    isPinned: false,
-                    dimension: dimensionStr,
-                    toolName: targetToolName,
-                    triggers: triggers
-                )
-                self.memories.insert(consolidatedItem, at: 0)
-                self.saveMemories()
-                
-                LogManager.shared.success(
-                    "🌌 [梦境反思·工具避坑融合]",
-                    detail: "工具: \(toolKey)\n规则数: \(groupItems.count) -> 1\n触发词: \(triggers)\n正文: \(contentStr)"
-                )
-            }
+            self.memories.removeAll { oldIDs.contains($0.id) }
+            let consolidatedItem = MemoryItem(
+                content: contentStr,
+                category: .lesson,
+                importance: 9,
+                createdAt: Date(),
+                embedding: vector,
+                isPinned: false,
+                dimension: dimensionStr,
+                toolName: targetToolName,
+                triggers: triggers
+            )
+            self.memories.insert(consolidatedItem, at: 0)
+            self.saveMemories()
+            
+            LogManager.shared.success(
+                "🌌 [梦境反思·工具避坑融合]",
+                detail: "工具: \(toolKey)\n规则数: \(groupItems.count) -> 1\n触发词: \(triggers)\n正文: \(contentStr)"
+            )
             
             processedCount += groupItems.count
         }
-        
         return processedCount
     }
     
-    /// 针对【用户画像 / 项目环境】的常规记忆整合流水线
     private func consolidateGeneralCategory(_ category: MemoryCategory, model: String) async -> Int {
-        let fragments = await MainActor.run {
-            self.memories.filter { $0.category == category && !$0.isPinned }
-        }
+        let fragments = self.memories.filter { $0.category == category && !$0.isPinned }
         guard fragments.count >= 3 else { return 0 }
         
         let listStr = fragments.map { "- \($0.content)" }.joined(separator: "\n")
@@ -799,10 +750,8 @@ extension MemoryManager {
         guard !cleanSummary.isEmpty && cleanSummary.count > 15 else { return 0 }
         
         let oldIDs = fragments.map { $0.id }
-        await MainActor.run {
-            self.memories.removeAll { oldIDs.contains($0.id) }
-            self.saveMemories()
-        }
+        self.memories.removeAll { oldIDs.contains($0.id) }
+        self.saveMemories()
         
         _ = await self.addMemory(
             content: "【核心\(categoryName)融合】\n" + cleanSummary,
@@ -815,7 +764,7 @@ extension MemoryManager {
     }
 }
 
-// MARK: - ==================== 4. 视觉面板 UI 视图渲染 ====================
+// MARK: - ==================== 5. MemoryUI Components (管理面板与卡片视图) ====================
 
 struct MemoryManagementPanel: View {
     @State private var manager = MemoryManager.shared
@@ -877,7 +826,8 @@ struct MemoryManagementPanel: View {
                 
                 Button(action: { showAddSheet = true }) { Label("注入记忆", systemImage: "plus") }
                     .buttonStyle(.borderedProminent).tint(.indigo).padding(.leading, 8)
-            }.padding().background(Color.clear);
+            }
+            .padding().background(Color.clear)
             
             ModernDivider(style: .fade(0.18))
             
@@ -937,7 +887,7 @@ struct MemoryCardView: View {
             HStack {
                 HStack(spacing: 2) {
                     ForEach(0..<5) { i in
-                        Image(systemName: "star.fill").font(.system(size: 8)).foregroundColor(i < (memory.importance / 2) ? .orange : .gray.opacity(0.3))
+                        Image(systemName: "star.fill").font(.system(size: 8)).foregroundColor(i < (memory.importance / 2) ? .orange : .gray.opacity(0.25))
                     }
                 }.help("重要度: \(memory.importance) 分")
                 
@@ -981,7 +931,6 @@ struct MemoryAddSheet: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // MARK: 顶部导航栏
             HStack(alignment: .center) {
                 HStack(spacing: 6) {
                     Image(systemName: "brain.head.profile")
@@ -1004,11 +953,8 @@ struct MemoryAddSheet: View {
             
             Divider()
             
-            // MARK: 主表单内容区
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    
-                    // 1. 元数据配置网格 (固定标签宽度，右侧自适应撑满)
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
                         GridRow {
                             Text("分类归属")
@@ -1067,10 +1013,8 @@ struct MemoryAddSheet: View {
                         }
                     }
                     
-                    Divider()
-                        .padding(.vertical, 2)
+                    Divider().padding(.vertical, 2)
                     
-                    // 2. 记忆核心内容编辑区
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("记忆内容 (核心规则 / 事实上下文)")
@@ -1094,7 +1038,6 @@ struct MemoryAddSheet: View {
                             )
                     }
                     
-                    // 3. 重要度权重设定区
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("重要度权重")
@@ -1136,7 +1079,6 @@ struct MemoryAddSheet: View {
             
             Divider()
             
-            // MARK: 底部操作栏
             HStack(spacing: 12) {
                 Spacer()
                 Button("取消", action: onClose)
@@ -1166,8 +1108,7 @@ struct MemoryAddSheet: View {
                 }) {
                     HStack(spacing: 4) {
                         if isSaving {
-                            ProgressView()
-                                .controlSize(.small)
+                            ProgressView().controlSize(.small)
                         } else {
                             Image(systemName: "arrow.up.circle.fill")
                         }

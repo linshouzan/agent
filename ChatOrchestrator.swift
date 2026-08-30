@@ -2,19 +2,20 @@
 // 文件名：ChatOrchestrator.swift
 // 文件说明：适用于 macOS 14+ 的 Agent 全局业务编排与 UI 交互中枢 (Swift 6 Ready)
 //
-// 核心架构与设计模式：
-// 1. 双层解耦架构 (Presenter-Engine Pattern)：
-//    - 将底层的多轮自主推导循环、工具执行、熔断检测与协议自愈全面委托给 `AgentManager.shared`。
-//    - `ChatOrchestrator` 专注于 UI 交互呈现（`AiChatStore` 动画流刷新、气泡卡片渲染、用户交互授权弹窗与会话落盘）。
-// 2. 插件化上下文机制：
-//    - 统一采用 internal 作用域，与 App 主模块保持严格的类型安全一致。
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. OrchestratorModels       : Agent 推演步骤事件 (AgentStep) 与上下文载荷容器
+// ├── 2. OrchestratorProtocols    : 上下文装配器 (ChatContextEnricher) 与后置钩子协议
+// ├── 3. OrchestratorPlugins      : 核心私域记忆唤醒与滑动历史窗口上下文插件
+// ├── 4. OrchestratorNormalizer   : 流式净化网关 (统一提取 <think>，过滤噪声标签)
+// ├── 5. OrchestratorHooks        : 分身心智增量沉淀与会话状态落盘后置钩子
+// └── 6. ChatOrchestrator         : 响应式主交互 Presenter (驱动 AiChatStore，对接 AgentManager)
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
 import Foundation
 import AppKit
 
-// MARK: - ==================== 1. 核心通信实体与插件协议 ====================
+// MARK: - ==================== 1. OrchestratorModels & Protocols (通信协议与实体) ====================
 
 enum AgentStep: Equatable, Sendable {
     case status(String)
@@ -25,7 +26,7 @@ enum AgentStep: Equatable, Sendable {
     case toolCallConfirmation(id: String, name: String, args: [String: Any])
     case toolCallInfo(id: String, name: String, args: [String: Any], thoughtSignature: String?)
     case toolCallResult(name: String, result: String)
-    case pausedForHuman(id: String, reason: String, suggestedActions: [String]) // 人工接管挂起事件
+    case pausedForHuman(id: String, reason: String, suggestedActions: [String])
     case usageUpdate(Int)
     case error(String)
     case done
@@ -74,7 +75,22 @@ protocol PostExecutionHook: Sendable {
     func onCompleted(fullText: String, targetMessageID: UUID, personaID: UUID?) async
 }
 
-// MARK: - ==================== 2. 上下文装配插件集 (Context Enricher Plugins) ====================
+/// 工具调用徽标轻量载荷
+public struct ToolBadgeItem: Sendable, Equatable {
+    public let callId: String
+    public let name: String
+    public let displayName: String
+    public var status: String // "waiting" | "running" | "success" | "failed"
+    
+    public init(callId: String, name: String, displayName: String, status: String = "running") {
+        self.callId = callId
+        self.name = name
+        self.displayName = displayName
+        self.status = status
+    }
+}
+
+// MARK: - ==================== 2. OrchestratorPlugins (上下文装配插件集群) ====================
 
 @MainActor
 struct StickyPrivateQAEnricher: ChatContextEnricher {
@@ -106,7 +122,6 @@ struct StickyPrivateQAEnricher: ChatContextEnricher {
             for qa in activatedQAs {
                 stickyContext += "● [\(qa.keyword)]: \(qa.content)\n"
             }
-            // 尾部追加，严禁插入到 messages[0] 破坏历史缓存前缀
             messages.append(.system(stickyContext))
             totalTokens += Int(Double(stickyContext.count) * 1.5)
         }
@@ -172,35 +187,15 @@ struct HistorySlidingWindowEnricher: ChatContextEnricher {
     }
 }
 
-@MainActor
-struct BlackboardContextEnricher: ChatContextEnricher {
-    let priority: Int = 30
-    init() {}
-    
-    func enrich(payload: ContextEnrichmentPayload, messages: inout [ContextMessage], totalTokens: inout Int) async {
-        // 门禁校验：仅在当前 Agent 已装备并启用 task_planner 时才装配黑板上下文
-        guard payload.activeSkills.contains(where: { $0.name == "task_planner" }),
-              let planJson = payload.sharedContext["AGENT_BLACKBOARD_PLAN"] else { return }
-        
-        let tasks = TaskBlackboardManager.shared.parsePlan(planJson)
-        if let ongoingTask = TaskBlackboardManager.shared.findNextActionableTask(in: tasks) {
-            let artifactsText = (ongoingTask.artifacts?.isEmpty == false) ? ongoingTask.artifacts!.map(\.name).joined(separator: ", ") : "无"
-            let summary = """
-            【系统状态快照 - 任务黑板】
-            🎯 当前聚焦目标: [\(ongoingTask.title)]
-            ⏳ 节点状态: \(ongoingTask.status.rawValue)
-            📦 可用工件: \(artifactsText)
-            """
-            messages.append(.system(summary))
-            totalTokens += Int(Double(summary.count) * 1.5)
-        }
-    }
-}
-
-// MARK: - ==================== 3. 流式拦截规整网 (Stream Normalizer) ====================
+// MARK: - ==================== 3. OrchestratorNormalizer (流式净化过滤网关) ====================
 
 struct UnifiedStreamNormalizer: Sendable {
-    static func formatFullText(reasoning: String, text: String, isReasoningActive: Bool) -> String {
+    static func formatFullText(
+        reasoning: String,
+        text: String,
+        isReasoningActive: Bool,
+        activeRoundToolBadges: [ToolBadgeItem] = []
+    ) -> String {
         var result = ""
         if !reasoning.isEmpty {
             let cleanReasoning = reasoning
@@ -247,7 +242,7 @@ struct UnifiedStreamNormalizer: Sendable {
             }
         }
         
-        // 4. [降噪强化] 过滤模型在正文中散落的自述过渡文本 (如: "我将调用 finish_task...", "【已执行动作总结】...")
+        // 4. 过滤模型散落的自述过渡噪音
         if cleanStreamText.contains("【已执行动作总结】") || cleanStreamText.contains("【待总结】") || cleanStreamText.contains("我将调用") {
             cleanStreamText = cleanStreamText.replacingOccurrences(
                 of: #"(?s)【已执行动作总结】[：:]?.*?(?=【|$|\n\n)"#,
@@ -266,7 +261,7 @@ struct UnifiedStreamNormalizer: Sendable {
             )
         }
         
-        // 5. 过滤伪任务清单与裸露的思考推演段落
+        // 5. 过滤伪任务清单与裸露推演段落
         if cleanStreamText.contains("思考推演") || cleanStreamText.contains("【任务清单】") {
             cleanStreamText = cleanStreamText.replacingOccurrences(
                 of: #"(?s)思考推演[：:]?\s*(?:\d+\.\s*[^：\n]+[：:][^\n]*\n*)+"#,
@@ -280,12 +275,34 @@ struct UnifiedStreamNormalizer: Sendable {
             )
         }
         
-        result += cleanStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmedText = cleanStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
+                
+        // 生成标准化的通用 Action 徽标链接
+        if !activeRoundToolBadges.isEmpty && !trimmedText.isEmpty {
+            let badges = activeRoundToolBadges.map { item -> String in
+                let statusIcon: String
+                switch item.status {
+                case "success": statusIcon = "✓"
+                case "failed": statusIcon = "✕"
+                case "waiting": statusIcon = "⏸"
+                default: statusIcon = "⚡︎"
+                }
+                let encodedName = item.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? item.name
+                let encodedCallId = item.callId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? item.callId
+                return " [\(statusIcon) \(item.displayName)](action://inspect_tool/\(encodedName)?call_id=\(encodedCallId)&status=\(item.status))"
+            }.joined(separator: "")
+            
+            if !trimmedText.hasSuffix(badges) {
+                trimmedText += "\(badges)"
+            }
+        }
+        
+        result += trimmedText
         return result
     }
 }
 
-// MARK: - ==================== 4. 后置状态固化钩子 (Post-Execution Hooks) ====================
+// MARK: - ==================== 4. OrchestratorHooks (后置状态固化钩子) ====================
 
 @MainActor
 struct PersonaMentalDeltaHook: PostExecutionHook {
@@ -306,7 +323,7 @@ struct SessionPersistenceHook: PostExecutionHook {
     }
 }
 
-// MARK: - ==================== 5. ChatOrchestrator 交互编排中心 (Presenter) ====================
+// MARK: - ==================== 5. ChatOrchestrator (Presenter 交互编排中心) ====================
 
 @MainActor
 @Observable
@@ -330,7 +347,6 @@ final class ChatOrchestrator {
         postHooks.append(hook)
     }
     
-    // MARK: - @ 智能体指令清洗与解析
     static func sanitizeUserMessage(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("@") else { return text }
@@ -366,7 +382,6 @@ final class ChatOrchestrator {
         return (nil, query)
     }
     
-    // MARK: - 主交互发送入口 (全面委托 AgentManager)
     func send(text: String, images: [NSImage], files: [URL]) async {
         let trimmedText = text.trimmingCharacters(in: .whitespaces)
         guard !trimmedText.isEmpty || !images.isEmpty || !files.isEmpty else { return }
@@ -384,13 +399,6 @@ final class ChatOrchestrator {
         let historySnapshot = store.messages
         let historyCount = historySnapshot.count
         
-        // MARK: - [Lifecycle Reset] 检查旧黑板状态：若上一轮规划已全量终结，则清理历史缓存以开启干净的新流程
-        if let existingPlan = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"],
-           !TaskBlackboardManager.shared.hasUnfinishedTasks(planString: existingPlan) {
-            agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-            agentVM.sharedContext.removeValue(forKey: "AGENT_GLOBAL_MEMO")
-        }
-        
         withAnimation(.easeOut(duration: 0.2)) {
             store.messages.append(contentsOf: [userMsg, aiMsg])
             store.isLoading = true
@@ -398,7 +406,6 @@ final class ChatOrchestrator {
             store.selectedFiles.removeAll()
         }
         
-        // 1. 开启独立会话日志聚合组
         let sessionLogID = LogManager.shared.startSession(
             query: cleanQuery,
             agentName: targetAgent.name
@@ -427,7 +434,6 @@ final class ChatOrchestrator {
             
             defer {
                 self.store.isLoading = false
-                // 会话结束时固化黑板最终状态
                 if let plan = self.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] {
                     self.store.blackboardPlan = plan
                 }
@@ -448,6 +454,8 @@ final class ChatOrchestrator {
             
             var accumulatedReasoning = ""
             var accumulatedText = ""
+            var currentRoundPendingText = ""
+            var currentRoundToolBadges: [ToolBadgeItem] = []
             var isReasoningActive = false
             var lastUIUpdateTime = Date()
             
@@ -478,17 +486,58 @@ final class ChatOrchestrator {
                         
                     case .textDelta(let t):
                         isReasoningActive = false
-                        accumulatedText += t
+                        currentRoundPendingText += t
                         
                     case .toolCallConfirmation(let id, let name, let args):
+                        let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
+                        let displayName = targetSkill?.displayName ?? name
+                        if let idx = currentRoundToolBadges.firstIndex(where: { $0.callId == id }) {
+                            currentRoundToolBadges[idx].status = "waiting"
+                        } else {
+                            currentRoundToolBadges.append(ToolBadgeItem(callId: id, name: name, displayName: displayName, status: "waiting"))
+                        }
                         updateToolLog(messageID: targetId, name: name, args: args, output: "等待授权...", callID: id)
                         syncBlackboardToStore()
                         
                     case .toolCallInfo(let id, let name, let args, _):
+                        let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
+                        let displayName = targetSkill?.displayName ?? name
+                        if let idx = currentRoundToolBadges.firstIndex(where: { $0.callId == id }) {
+                            currentRoundToolBadges[idx].status = "running"
+                        } else {
+                            currentRoundToolBadges.append(ToolBadgeItem(callId: id, name: name, displayName: displayName, status: "running"))
+                        }
                         updateToolLog(messageID: targetId, name: name, args: args, output: "执行中...", callID: id)
                         syncBlackboardToStore()
                         
                     case .toolCallResult(let name, let result):
+                        let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: name, output: result)
+                        let finalStatus = isFailed ? "failed" : "success"
+                        
+                        if let idx = currentRoundToolBadges.firstIndex(where: { $0.name == name && ($0.status == "running" || $0.status == "waiting") }) {
+                            currentRoundToolBadges[idx].status = finalStatus
+                        } else if let idx = currentRoundToolBadges.lastIndex(where: { $0.name == name }) {
+                            currentRoundToolBadges[idx].status = finalStatus
+                        } else {
+                            let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
+                            let displayName = targetSkill?.displayName ?? name
+                            currentRoundToolBadges.append(ToolBadgeItem(callId: UUID().uuidString, name: name, displayName: displayName, status: finalStatus))
+                        }
+                        
+                        if !currentRoundPendingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !currentRoundToolBadges.isEmpty {
+                            let roundFormatted = UnifiedStreamNormalizer.formatFullText(
+                                reasoning: "",
+                                text: currentRoundPendingText,
+                                isReasoningActive: false,
+                                activeRoundToolBadges: currentRoundToolBadges
+                            )
+                            if !roundFormatted.isEmpty {
+                                accumulatedText += (accumulatedText.isEmpty ? "" : "\n\n") + roundFormatted
+                            }
+                            currentRoundPendingText = ""
+                            currentRoundToolBadges.removeAll()
+                        }
+                        
                         updateToolLogResult(messageID: targetId, name: name, output: result)
                         syncBlackboardToStore()
                         
@@ -502,17 +551,32 @@ final class ChatOrchestrator {
                         
                     case .error(let errorMsg):
                         sessionErrorMsg = errorMsg
-                        accumulatedText += "\n\n> ❌ **异常**: \(errorMsg)"
+                        currentRoundPendingText += "\n\n> ❌ **异常**: \(errorMsg)"
                         
                     case .done:
                         isReasoningActive = false
                         syncBlackboardToStore()
                     }
                     
+                    // 实时组合历史固化轮次文本与当前活跃轮次文本
+                    var streamingCombinedText = accumulatedText
+                    if !currentRoundPendingText.isEmpty || !currentRoundToolBadges.isEmpty {
+                        let activeRoundFormatted = UnifiedStreamNormalizer.formatFullText(
+                            reasoning: "",
+                            text: currentRoundPendingText,
+                            isReasoningActive: false,
+                            activeRoundToolBadges: currentRoundToolBadges
+                        )
+                        if !activeRoundFormatted.isEmpty {
+                            streamingCombinedText += (streamingCombinedText.isEmpty ? "" : "\n\n") + activeRoundFormatted
+                        }
+                    }
+                    
                     let currentFullText = UnifiedStreamNormalizer.formatFullText(
                         reasoning: accumulatedReasoning,
-                        text: accumulatedText,
-                        isReasoningActive: isReasoningActive
+                        text: streamingCombinedText,
+                        isReasoningActive: isReasoningActive,
+                        activeRoundToolBadges: []
                     )
                     
                     let now = Date()
@@ -520,6 +584,19 @@ final class ChatOrchestrator {
                         lastUIUpdateTime = now
                         store.updateMessage(id: targetId) { $0.text = currentFullText }
                         syncBlackboardToStore()
+                    }
+                }
+                
+                // 将剩余的最后一轮内容闭环并入
+                if !currentRoundPendingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !currentRoundToolBadges.isEmpty {
+                    let finalRoundFormatted = UnifiedStreamNormalizer.formatFullText(
+                        reasoning: "",
+                        text: currentRoundPendingText,
+                        isReasoningActive: false,
+                        activeRoundToolBadges: currentRoundToolBadges
+                    )
+                    if !finalRoundFormatted.isEmpty {
+                        accumulatedText += (accumulatedText.isEmpty ? "" : "\n\n") + finalRoundFormatted
                     }
                 }
                 
@@ -533,7 +610,8 @@ final class ChatOrchestrator {
                 let finalFullText = UnifiedStreamNormalizer.formatFullText(
                     reasoning: accumulatedReasoning,
                     text: accumulatedText,
-                    isReasoningActive: false
+                    isReasoningActive: false,
+                    activeRoundToolBadges: []
                 )
                 let sanitizedDisplay = finalFullText.filterPersonaDelta()
                 store.updateMessage(id: targetId) { $0.text = sanitizedDisplay }

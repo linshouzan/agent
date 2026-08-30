@@ -1,28 +1,16 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：KnowledgeManager.swift
-// 文件说明：适用于 macOS 14+ 的知识库管理与 RAG (检索增强生成) 引擎
-// 核心架构：
-// 1. 混合检索 (Hybrid Search): BM25 + Vector 倒数排名融合 (RRF)
-// 2. 纯 Swift 微型向量数据库: 无缝集成、极低资源占用
-// 3. 语义级 RAG 切片: 基于自然语言的智能滑动窗口机制
-// 4. 目录树形双栏 UI: 左侧无限极树状分类，右键可递归全选
-// 5. 沉浸式悬浮操作台: 列表项操作和启停开关转为 macOS 原生悬浮图标，极大释放横向空间
-// 6. 结构化代码提取与专属代码摘要策略: 保护特殊语法边界并以架构师视角进行高维代码总结
-// 7. 并发节流与后台脱轨引擎: 彻底解决海量文件扫描与提取导致的 UI 卡死问题
-// 8. 层级智能排序与面包屑导航: 优先展示当前直属文件，清晰标注子文件相对路径来源
-// 9. 导入路径优化：选择文件夹导入时，自动剥离所选文件夹自身的目录名，直接以其内容作为分类根目录
-// 10. 虚拟路径编辑：支持直接在 UI 中编辑多级目录，严格只读保护底层文件路径
-// 11. 双阶段检索架构：引入滑动窗口的 Native Sentence Level 精排引擎，大幅提升召回精确度
-//////////////////////////////////////////////////////////////////
-
-//////////////////////////////////////////////////////////////////
-// 文件名：KnowledgeManager.swift
-// 文件说明：适用于 macOS 14+ 的知识库管理与自适应 RAG 引擎
-// 核心升级：
-// 1. 废除手动分类策略，改为切片级元数据自适应感知 (Self-Adaptive Retrieval)
-// 2. 物理隔离标签与禁忌词，彻底防止负向词污染 Embedding
-// 3. 2-Gram 连续短语增强与负向词一票否决 (Hard Veto)
-// 4. 切片预览、检索测试与 Agent 检索面板全链路显化结构化元数据徽章
+// 文件说明：适用于 macOS 14+ 的知识库管理与自适应 RAG (检索增强生成) 引擎中心 (Swift 6 Ready)
+//
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. KnowledgeModels          : 知识库元数据、切片实体与树状节点模型
+// ├── 2. KnowledgeExtractors      : 文本清洗规范器与多语言源码 AST 切片提取器
+// ├── 3. KnowledgeNLP             : 多尺度 N-Gram 分词器与 RAG XML 报文解析器
+// ├── 4. MicroVectorDB (Core)     : 纯 Swift 微型向量数据库 (NLEmbedding + Cosine)
+// ├── 5. KnowledgeSearchEngine    : 自适应混合检索 (BM25 + RRF) 与滑动窗口精排 (NativeReranker)
+// ├── 6. KnowledgeViewModel       : 响应式业务编排门面与后台脱轨解析流水线 (@Observable @MainActor)
+// ├── 7. KnowledgeSearchWindow    : 检索测试与自适应诊断独立窗口生命周期管理器 (NSWindowDelegate)
+// └── 8. KnowledgeUI Components   : 无限级树状双栏面板、检索大盘与机制引导 Popover 群
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -32,16 +20,23 @@ import Accelerate
 import PDFKit
 import NaturalLanguage
 
-// MARK: - ==================== 1. 核心数据模型 ====================
+// MARK: - ==================== 1. KnowledgeModels (核心数据模型与节点实体) ====================
 
-public struct ChunkMetadata: Codable, Equatable, Sendable {
-    public var title: String?
-    public var headingPath: [String] = []
-    public var positiveTags: [String] = []  // 正向标签 (tags, 标签)
-    public var negativeTags: [String] = []  // 负向/禁用标签 (prohibited, exclude, 禁用)
-    public var kvPairs: [String: String] = [:]
+/// 切片结构化元数据契约
+struct ChunkMetadata: Codable, Equatable, Sendable {
+    var title: String?
+    var headingPath: [String] = []
+    var positiveTags: [String] = []  // 正向标签 (tags, 标签)
+    var negativeTags: [String] = []  // 负向/禁用标签 (prohibited, exclude, 禁用)
+    var kvPairs: [String: String] = [:]
     
-    public init(title: String? = nil, headingPath: [String] = [], positiveTags: [String] = [], negativeTags: [String] = [], kvPairs: [String : String] = [:]) {
+    init(
+        title: String? = nil,
+        headingPath: [String] = [],
+        positiveTags: [String] = [],
+        negativeTags: [String] = [],
+        kvPairs: [String: String] = [:]
+    ) {
         self.title = title
         self.headingPath = headingPath
         self.positiveTags = positiveTags
@@ -50,8 +45,9 @@ public struct ChunkMetadata: Codable, Equatable, Sendable {
     }
 }
 
-struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable {
-    var id = UUID()
+/// 知识库单文档索引项模型
+struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable, Sendable {
+    var id: UUID = UUID()
     var title: String
     var summary: String
     var chunkCount: Int
@@ -66,7 +62,17 @@ struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable {
         case id, title, summary, chunkCount, status, isEnabled, category, filePath, metaEmbedding, relativePath
     }
     
-    init(title: String, summary: String, chunkCount: Int, status: String, isEnabled: Bool = true, category: String = "默认", filePath: String? = nil, metaEmbedding: [Float]? = nil, relativePath: String? = nil) {
+    init(
+        title: String,
+        summary: String,
+        chunkCount: Int,
+        status: String,
+        isEnabled: Bool = true,
+        category: String = "默认",
+        filePath: String? = nil,
+        metaEmbedding: [Float]? = nil,
+        relativePath: String? = nil
+    ) {
         self.title = title
         self.summary = summary
         self.chunkCount = chunkCount
@@ -93,7 +99,1019 @@ struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable {
     }
 }
 
-// MARK: - ==================== 2. 知识库 ViewModel 引擎 ====================
+/// 知识库左侧无限极树状目录节点
+struct KnowledgeNode: Identifiable, Sendable {
+    let id: String
+    let name: String
+    let isFolder: Bool
+    var item: KnowledgeItem?
+    var children: [KnowledgeNode]?
+}
+
+// MARK: - ==================== 2. KnowledgeExtractors (数据清洗与代码切片提取器) ====================
+
+/// 文本数据规范化与噪声清洗引擎
+struct DataCleaner: Sendable {
+    nonisolated static func clean(_ rawText: String) -> String {
+        var text = rawText.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        text = text.replacing(pattern: "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]", with: "")
+        text = text.replacing(pattern: "(?m)^\\s*(?:page|页码|第)?\\s*-?\\s*\\d+\\s*(?:of\\s*\\d+|页)?\\s*-?\\s*$", with: "")
+        text = text.replacing(pattern: "<[^>]+>", with: " ")
+        text = text.replacing(pattern: "[ \\t]{2,}", with: " ")
+        text = text.replacing(pattern: "\\n{3,}", with: "\n\n")
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    nonisolated static func isValidChunk(_ chunk: String) -> Bool {
+        let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count < 15 { return false }
+        let letters = trimmed.unicodeScalars.filter { CharacterSet.letters.contains($0) || CharacterSet.alphanumerics.contains($0) }
+        return (Double(letters.count) / Double(trimmed.count)) >= 0.3
+    }
+}
+
+fileprivate extension String {
+    nonisolated func replacing(pattern: String, with template: String) -> String {
+        do {
+            let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            return regex.stringByReplacingMatches(in: self, options: [], range: NSRange(self.startIndex..., in: self), withTemplate: template)
+        } catch {
+            return self
+        }
+    }
+}
+
+/// 多语言源代码 AST 边界与类/方法级切片提取器
+struct CodeKnowledgeExtractor: Sendable {
+    
+    static func buildCodeSummaryPrompt(extraction: String, fileName: String) -> String {
+        return """
+        请对代码文件【\(fileName)】进行宏观架构层面的技术摘要，直接输出以下 4 项要点：
+        1. 核心职责：一句话提炼本模块的设计目标与业务范畴。
+        2. 关键组件：列出 2-4 个核心类/接口/方法及其在架构中的职能。
+        3. 架构层级：标明所属技术层级（如 UI 视图层、业务逻辑层、数据持久层、网络通信层等）。
+        4. 外部依赖：列出交互的外部模块或系统组件。
+
+        [代码上下文]
+        \(extraction)
+        """
+    }
+    
+    static func chunkCodeFile(fileURL: URL, projectName: String = "当前项目") throws -> [String] {
+        let content = try String(contentsOf: fileURL, encoding: .utf8)
+        let fileName = fileURL.lastPathComponent
+        let ext = fileURL.pathExtension.lowercased()
+        
+        var chunks: [String] = []
+        let pattern: String
+        let declarationPattern: String
+        
+        switch ext {
+        case "py":
+            pattern = #"(?m)^[ \t]*(?:class|def)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\S|\Z)"#
+            declarationPattern = #"(?:class|def)\s+([A-Za-z0-9_]+)"#
+        case "java", "c", "cpp", "h", "cs":
+            pattern = #"(?m)^[ \t]*(?:public\s+|private\s+|protected\s+)?(?:static\s+|virtual\s+)?(?:class|struct|interface|enum)\s+[^{]+\{([\s\S]*?^\})"#
+            declarationPattern = #"(?:class|struct|interface|enum)\s+([A-Za-z0-9_]+)"#
+        case "js", "ts":
+            pattern = #"(?m)^[ \t]*(?:export\s+|default\s+)?(?:class|function|const)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\n|\Z)"#
+            declarationPattern = #"(?:class|function|const)\s+([A-Za-z0-9_]+)"#
+        case "go":
+            pattern = #"(?m)^[ \t]*(?:func|type)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\n|\Z)"#
+            declarationPattern = #"(?:func|type)\s+([A-Za-z0-9_]+)"#
+        default:
+            pattern = #"(?m)^(?:\s*@\w+\s*)*(?:public\s+|private\s+|internal\s+|open\s+)?(?:final\s+)?(?:class|struct|enum|protocol|actor|extension)\s+[^{]+\{([\s\S]*?^\})"#
+            declarationPattern = #"(?:class|struct|enum|protocol|actor|extension)\s+([A-Za-z0-9_]+)"#
+        }
+        
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
+            let nsString = content as NSString
+            let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsString.length))
+            
+            for match in matches {
+                let codeBlock = nsString.substring(with: match.range)
+                var entityName = "Unknown"
+                if let declRegex = try? NSRegularExpression(pattern: declarationPattern),
+                   let declMatch = declRegex.firstMatch(in: codeBlock, range: NSRange(location: 0, length: (codeBlock as NSString).length)) {
+                    entityName = (codeBlock as NSString).substring(with: declMatch.range(at: 1))
+                }
+                
+                let enrichedChunk = """
+                [所属模块]: \(entityName)
+                ```\(ext)
+                \(codeBlock)
+                ```
+                """
+                chunks.append(enrichedChunk)
+            }
+        }
+        
+        if chunks.isEmpty {
+            return generateFallbackChunks(content: content, fileName: fileName, ext: ext)
+        }
+        
+        return chunks
+    }
+    
+    private static func generateFallbackChunks(content: String, fileName: String, ext: String) -> [String] {
+        var chunks: [String] = []
+        var currentIndex = content.startIndex
+        let chunkSize = 1000
+        
+        while currentIndex < content.endIndex {
+            let endIndex = content.index(currentIndex, offsetBy: chunkSize, limitedBy: content.endIndex) ?? content.endIndex
+            let chunkContent = String(content[currentIndex..<endIndex])
+            chunks.append(chunkContent)
+            currentIndex = endIndex
+        }
+        return chunks
+    }
+}
+
+// MARK: - ==================== 3. KnowledgeNLP (语言学分词与 RAG 报文解析) ====================
+
+struct QueryAnalysis: Sendable {
+    let rawTokens: [String]
+    let anchorEntities: [String]
+    let effectiveTokens: [String]
+}
+
+/// 多尺度滑动 N-Gram 智能分词器 (零人工停用词依赖)
+struct SmartTokenizer: Sendable {
+    
+    static func tokenize(_ text: String) -> [String] {
+        let cleanText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return [] }
+        
+        var tokenSet: Set<String> = []
+        
+        // 1. Apple 原生 NLTokenizer 词法切分
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.string = cleanText
+        if let lang = NLLanguageRecognizer.dominantLanguage(for: cleanText) {
+            tokenizer.setLanguage(lang)
+        }
+        
+        let trimSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+        var words: [String] = []
+        
+        tokenizer.enumerateTokens(in: cleanText.startIndex..<cleanText.endIndex) { range, _ in
+            let word = String(cleanText[range]).trimmingCharacters(in: trimSet)
+            if !word.isEmpty {
+                words.append(word)
+                tokenSet.insert(word)
+            }
+            return true
+        }
+        
+        // 2. 词级 2-Gram 拼接
+        if words.count >= 2 {
+            for i in 0..<(words.count - 1) {
+                tokenSet.insert(words[i] + words[i+1])
+            }
+        }
+        
+        // 3. 字符级多尺度滑动 N-Gram (2-Gram, 3-Gram, 4-Gram)
+        let chars = Array(cleanText.filter { !$0.isWhitespace && !$0.isPunctuation })
+        let charCount = chars.count
+        
+        if charCount >= 2 {
+            for n in 2...min(4, charCount) {
+                for i in 0...(charCount - n) {
+                    let gram = String(chars[i..<(i + n)])
+                    tokenSet.insert(gram)
+                }
+            }
+        }
+        
+        tokenSet.insert(cleanText)
+        return Array(tokenSet)
+    }
+}
+
+/// RAG XML 协议上下文解析提取器
+struct RAGXMLParser: Sendable {
+    struct HitItem: Hashable, Identifiable, Sendable {
+        let id: UUID = UUID()
+        let title: String
+        let score: Float
+        let tags: [String]
+        let prohibited: [String]
+        let snippet: String
+        let rawContent: String
+    }
+    
+    static func extractHits(from xmlString: String) -> [HitItem] {
+        var results: [HitItem] = []
+        let pattern = "(?s)<knowledge_chunk([^>]*)>\\s*<!\\[CDATA\\[(.*?)\\]\\]>"
+        
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let matches = regex.matches(in: xmlString, range: NSRange(xmlString.startIndex..., in: xmlString))
+        
+        for match in matches {
+            if let attrRange = Range(match.range(at: 1), in: xmlString),
+               let contentRange = Range(match.range(at: 2), in: xmlString) {
+                
+                let attrString = String(xmlString[attrRange])
+                let rawContent = String(xmlString[contentRange])
+                
+                let title = extractAttr(named: "source_title", from: attrString) ?? "未知文档"
+                let scoreStr = extractAttr(named: "rrf_score", from: attrString) ?? "0.0"
+                let score = Float(scoreStr) ?? 0.0
+                
+                let tagsStr = extractAttr(named: "tags", from: attrString) ?? ""
+                let tags = tagsStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                
+                let prohStr = extractAttr(named: "prohibited", from: attrString) ?? ""
+                let prohibited = prohStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                
+                let validLines = rawContent.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && !$0.hasPrefix("```") }
+                
+                let firstLine = validLines.first ?? "无可用文本摘要"
+                results.append(HitItem(title: title, score: score, tags: tags, prohibited: prohibited, snippet: firstLine, rawContent: rawContent))
+            }
+        }
+        return results
+    }
+    
+    private static func extractAttr(named: String, from text: String) -> String? {
+        let pattern = "\(named)=\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+}
+
+// MARK: - ==================== 4. MicroVectorDB (纯 Swift 微型向量数据库内核) ====================
+
+final class MicroVectorDB: @unchecked Sendable {
+    static let shared = MicroVectorDB()
+    private init() { load() }
+    
+    struct VectorChunk: Codable, Identifiable, Sendable {
+        var id: UUID = UUID()
+        var kbId: UUID
+        var text: String
+        var embedding: [Float]
+        var score: Float?
+        var debugInfo: String?
+        var metadata: ChunkMetadata? = nil
+        
+        enum CodingKeys: String, CodingKey { case id, kbId, text, embedding, score, debugInfo, metadata }
+    }
+    
+    private var chunks: [VectorChunk] = []
+    private let dbQueue = DispatchQueue(label: "com.lintools.vectordb", qos: .userInitiated)
+    private var dbFileURL: URL { ConfigManager.shared.ragVectordbFileName! }
+    
+    func load() {
+        if let data = try? Data(contentsOf: dbFileURL), let decoded = try? JSONDecoder().decode([VectorChunk].self, from: data) {
+            self.chunks = decoded
+        }
+    }
+    
+    private func save() {
+        if let encoded = try? JSONEncoder().encode(chunks) {
+            try? encoded.write(to: dbFileURL, options: .atomic)
+        }
+    }
+    
+    // MARK: - 纯净切片提取与正文物理隔离
+    func chunkText(_ text: String, maxTokens: Int = 400, overlap: Int = 50) -> [(text: String, meta: ChunkMetadata)] {
+        var result: [(text: String, meta: ChunkMetadata)] = []
+        let lines = text.components(separatedBy: .newlines)
+        
+        let isQADocument = detectQAPattern(in: lines)
+        
+        var currentChunk = ""
+        var currentHeaderContext = ""
+        var currentPositiveTags: [String] = []
+        var currentNegativeTags: [String] = []
+        
+        let tagsRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:tags|category|标签)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
+        let prohRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:prohibited|exclude|forbidden|禁用)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
+        
+        func extractList(from line: String, regex: NSRegularExpression?) -> [String]? {
+            guard let regex = regex else { return nil }
+            let nsString = line as NSString
+            if let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: nsString.length)) {
+                let range1 = match.range(at: 1)
+                let range2 = match.range(at: 2)
+                let matchedRange = (range1.location != NSNotFound) ? range1 : range2
+                guard matchedRange.location != NSNotFound else { return nil }
+                
+                let content = nsString.substring(with: matchedRange)
+                return content.components(separatedBy: CharacterSet(charactersIn: ",，;；、")).map {
+                    $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'[]*")))
+                }.filter { !$0.isEmpty }
+            }
+            return nil
+        }
+        
+        func appendChunkIfValid(chunkStr: String, headers: [String], posTags: [String], negTags: [String]) {
+            let trimmed = chunkStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            
+            let bodyWithoutHeader = trimmed.replacingOccurrences(of: #"^\[.*?\]\n?"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !bodyWithoutHeader.isEmpty || !posTags.isEmpty || !negTags.isEmpty {
+                result.append((trimmed, ChunkMetadata(headingPath: headers, positiveTags: posTags, negativeTags: negTags)))
+            }
+        }
+        
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            if trimmedLine.isEmpty { continue }
+            
+            // a) 解析 Markdown Headers
+            if trimmedLine.hasPrefix("#") {
+                let headerLevel = trimmedLine.prefix(while: { $0 == "#" }).count
+                if headerLevel > 0 && headerLevel <= 6 {
+                    let newHeader = trimmedLine.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces)
+                    
+                    if !currentChunk.isEmpty {
+                        appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                        currentChunk = ""
+                    }
+                    currentHeaderContext = newHeader
+                    currentPositiveTags = []
+                    currentNegativeTags = []
+                    currentChunk = "[\(currentHeaderContext)]\n"
+                    continue
+                }
+            }
+            
+            // b) 嗅探负向标签 (prohibited)
+            if let prohibited = extractList(from: trimmedLine, regex: prohRegex) {
+                currentNegativeTags.append(contentsOf: prohibited)
+                continue
+            }
+            
+            // c) 嗅探正向标签 (tags)
+            if let tags = extractList(from: trimmedLine, regex: tagsRegex) {
+                currentPositiveTags.append(contentsOf: tags)
+                continue
+            }
+            
+            // d) 过滤非正文元数据标记行
+            if trimmedLine.hasPrefix("* **") && trimmedLine.contains("**:") && !trimmedLine.contains("核心特征") && !trimmedLine.contains("描述") {
+                continue
+            }
+            
+            // e) QA 结构问答独立切片
+            if isQADocument && isQuestionLine(trimmedLine) {
+                let strippedChunk = currentChunk.replacingOccurrences(of: "[\(currentHeaderContext)]\n", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !strippedChunk.isEmpty {
+                    appendChunkIfValid(chunkStr: currentChunk, headers: currentHeaderContext.isEmpty ? [] : [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n" : ""
+                }
+            }
+            
+            // f) 常规正文滑动窗口切片
+            let projectedSize = currentChunk.count + trimmedLine.count + 1
+            if projectedSize > maxTokens {
+                if !currentChunk.isEmpty {
+                    appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                }
+                if trimmedLine.count > maxTokens {
+                    let forcedChunks = breakDownHugeSentence(trimmedLine, maxTokens: maxTokens, overlap: overlap)
+                    if let first = forcedChunks.first, !currentHeaderContext.isEmpty {
+                        appendChunkIfValid(chunkStr: "[\(currentHeaderContext)] \(first)", headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                        for chunk in forcedChunks.dropFirst() {
+                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                        }
+                    } else {
+                        for chunk in forcedChunks {
+                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                        }
+                    }
+                    currentChunk = ""
+                } else {
+                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n\(trimmedLine)" : trimmedLine
+                }
+            } else {
+                currentChunk += (currentChunk.isEmpty ? "" : "\n") + trimmedLine
+            }
+        }
+        
+        if !currentChunk.isEmpty {
+            appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+        }
+        
+        return result
+    }
+
+    private func isQuestionLine(_ line: String) -> Bool {
+        let questionPatterns = [
+            #"^(?i)Q[:：]\s*"#,
+            #"^(?i)问[:：]\s*"#,
+            #"^【问】[:：]?\s*"#,
+            #"^(?i)Question[:：]\s*"#
+        ]
+        return questionPatterns.contains { line.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    private func isAnswerLine(_ line: String) -> Bool {
+        let answerPatterns = [
+            #"^(?i)A[:：]\s*"#,
+            #"^(?i)答[:：]\s*"#,
+            #"^【答】[:：]?\s*"#,
+            #"^(?i)Answer[:：]\s*"#
+        ]
+        return answerPatterns.contains { line.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    private func detectQAPattern(in lines: [String]) -> Bool {
+        var questionCount = 0
+        var answerCount = 0
+        
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if isQuestionLine(trimmed) {
+                questionCount += 1
+            } else if isAnswerLine(trimmed) {
+                answerCount += 1
+            }
+        }
+        return questionCount >= 2 && answerCount >= 1
+    }
+    
+    nonisolated private func breakDownHugeSentence(_ text: String, maxTokens: Int, overlap: Int) -> [String] {
+        var chunks: [String] = []
+        var currentIndex = text.startIndex
+        
+        while currentIndex < text.endIndex {
+            let remaining = text.distance(from: currentIndex, to: text.endIndex)
+            if remaining <= maxTokens {
+                chunks.append(String(text[currentIndex...]))
+                break
+            }
+            var endIndex = text.index(currentIndex, offsetBy: maxTokens)
+            var searchIndex = endIndex
+            var foundBoundary = false
+            
+            while searchIndex > currentIndex {
+                let char = text[searchIndex]
+                if char.isWhitespace || char.isPunctuation {
+                    endIndex = searchIndex
+                    foundBoundary = true
+                    break
+                }
+                searchIndex = text.index(before: searchIndex)
+            }
+            if !foundBoundary { endIndex = text.index(currentIndex, offsetBy: maxTokens) }
+            let chunk = String(text[currentIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !chunk.isEmpty { chunks.append(chunk) }
+            
+            var nextIndex = endIndex
+            if overlap > 0 && nextIndex < text.endIndex {
+                var overlapCount = 0
+                while nextIndex > currentIndex && overlapCount < overlap {
+                    nextIndex = text.index(before: nextIndex)
+                    overlapCount += 1
+                }
+                while nextIndex > currentIndex && nextIndex < endIndex {
+                    if text[nextIndex].isWhitespace || text[nextIndex].isPunctuation {
+                        nextIndex = text.index(after: nextIndex)
+                        break
+                    }
+                    nextIndex = text.index(after: nextIndex)
+                }
+            }
+            currentIndex = nextIndex
+        }
+        return chunks
+    }
+    
+    func addDocument(kbId: UUID, chunks: [(text: String, meta: ChunkMetadata)]) async {
+        var newVectorChunks: [VectorChunk] = []
+        for chunk in chunks {
+            newVectorChunks.append(VectorChunk(
+                kbId: kbId,
+                text: chunk.text,
+                embedding: await generateEmbedding(for: chunk.text),
+                metadata: chunk.meta
+            ))
+        }
+        dbQueue.sync {
+            self.chunks.append(contentsOf: newVectorChunks)
+            self.save()
+        }
+    }
+    
+    func deleteDocument(kbId: UUID) {
+        dbQueue.sync {
+            self.chunks.removeAll { $0.kbId == kbId }
+            self.save()
+        }
+    }
+    
+    func fetchChunks(for kbId: UUID) -> [VectorChunk] {
+        return dbQueue.sync { self.chunks.filter { $0.kbId == kbId } }
+    }
+    
+    // MARK: - 自适应混合检索路由
+    func search(query: String, enabledKbIds: [UUID], topK: Int = 3, exactMatch: Bool = false) async -> [VectorChunk] {
+        guard !enabledKbIds.isEmpty else { return [] }
+        
+        let queryVector = await generateEmbedding(for: query)
+        let queryTokens = SmartTokenizer.tokenize(query)
+        let lowerQuery = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        var validChunks = dbQueue.sync { chunks.filter { enabledKbIds.contains($0.kbId) } }
+        
+        if exactMatch {
+            validChunks = validChunks.filter { chunk in
+                let chunkText = chunk.text.lowercased()
+                let meta = chunk.metadata
+                let posTags = meta?.positiveTags.map { $0.lowercased() } ?? []
+                let headers = meta?.headingPath.map { $0.lowercased() } ?? []
+                
+                if chunkText.contains(lowerQuery) ||
+                   posTags.contains(where: { $0.contains(lowerQuery) || lowerQuery.contains($0) }) ||
+                   headers.contains(where: { $0.contains(lowerQuery) }) {
+                    return true
+                }
+                
+                let coreTokens = queryTokens.filter { $0.count >= 2 && $0 != lowerQuery }
+                if coreTokens.isEmpty { return false }
+                
+                let matchedCount = coreTokens.filter { token in
+                    chunkText.contains(token) ||
+                    posTags.contains(where: { $0.contains(token) }) ||
+                    headers.contains(where: { $0.contains(token) })
+                }.count
+                
+                let requiredCount = max(1, Int(ceil(Double(coreTokens.count) * 0.6)))
+                return matchedCount >= requiredCount
+            }
+        }
+        
+        guard !validChunks.isEmpty else { return [] }
+        let totalChunksCount = Float(validChunks.count)
+
+        async let vectorResults = computeVectorSimilarity(queryVector: queryVector, chunks: validChunks)
+        async let bm25Results = computeBM25(queryTokens: queryTokens, chunks: validChunks, totalDocs: totalChunksCount)
+        
+        let (vectorScored, (bm25Scored, idfMap)) = await (vectorResults, bm25Results)
+        
+        let isTechnicalQuery = queryTokens.contains { $0.contains("_") || $0.count < 4 }
+        let bm25Weight: Float = isTechnicalQuery ? 1.8 : 1.3
+        let vectorWeight: Float = isTechnicalQuery ? 0.2 : 0.7
+        
+        let bm25ScoreMap = Dictionary(uniqueKeysWithValues: bm25Scored)
+        let vectorScoreMap = Dictionary(uniqueKeysWithValues: vectorScored)
+        
+        var rrfScores: [UUID: Float] = [:]
+        let rrf_k: Float = 60.0
+        
+        for (rank, item) in vectorScored.enumerated() {
+            rrfScores[item.id] = (1.0 / (rrf_k + Float(rank + 1))) * vectorWeight
+        }
+        for (rank, item) in bm25Scored.enumerated() {
+            let current = rrfScores[item.id] ?? 0
+            rrfScores[item.id] = current + (1.0 / (rrf_k + Float(rank + 1))) * bm25Weight
+        }
+        
+        let validTokensByIDF = queryTokens
+            .filter { $0.count >= 2 && (idfMap[$0] ?? 0) > 0 }
+            .sorted { (idfMap[$0] ?? 0) > (idfMap[$1] ?? 0) }
+        let topAnchorToken = validTokensByIDF.first
+        let topAnchorIDF = topAnchorToken != nil ? (idfMap[topAnchorToken!] ?? 0.0) : 0.0
+        
+        var coarseRanked = validChunks.compactMap { chunk -> VectorChunk? in
+            let bm25 = bm25ScoreMap[chunk.id] ?? 0.0
+            let vecSim = vectorScoreMap[chunk.id] ?? 0.0
+            let chunkTextLower = chunk.text.lowercased()
+            
+            if topAnchorIDF > 1.0, let topAnchor = topAnchorToken {
+                let hasAnchor = chunkTextLower.contains(topAnchor) ||
+                               (chunk.metadata?.positiveTags.contains { $0.lowercased().contains(topAnchor) } ?? false) ||
+                               (chunk.metadata?.headingPath.contains { $0.lowercased().contains(topAnchor) } ?? false)
+                if !hasAnchor && vecSim < 0.68 && bm25 <= 0 {
+                    return nil
+                }
+            }
+            
+            if bm25 <= 0 && vecSim < 0.48 {
+                return nil
+            }
+            
+            guard let score = rrfScores[chunk.id], score > 0 else { return nil }
+            var resultChunk = chunk
+            resultChunk.score = score
+            return resultChunk
+        }
+        
+        coarseRanked.sort { ($0.score ?? 0) > ($1.score ?? 0) }
+        let coarsePool = Array(coarseRanked.prefix(topK * 4))
+        
+        if !coarsePool.isEmpty {
+            var finalRanked = await NativeReranker.shared.rerank(
+                query: query,
+                chunks: coarsePool,
+                topK: topK,
+                idfMap: idfMap
+            )
+            finalRanked = finalRanked.filter { ($0.score ?? 0) >= 0.20 }
+            return finalRanked
+        } else {
+            return Array(coarsePool.prefix(topK))
+        }
+    }
+    
+    private func computeVectorSimilarity(queryVector: [Float], chunks: [VectorChunk]) async -> [(id: UUID, score: Float)] {
+        return await withTaskGroup(of: [(id: UUID, score: Float)].self) { group in
+            let batchSize = 500
+            var results: [(id: UUID, score: Float)] = []
+            for i in stride(from: 0, to: chunks.count, by: batchSize) {
+                let end = min(i + batchSize, chunks.count)
+                let batch = Array(chunks[i..<end])
+                group.addTask {
+                    var batchResults: [(id: UUID, score: Float)] = []
+                    for chunk in batch {
+                        let score = self.cosineSimilarity(a: queryVector, b: chunk.embedding)
+                        if score >= 0.45 { batchResults.append((chunk.id, score)) }
+                    }
+                    return batchResults
+                }
+            }
+            for await batchResult in group { results.append(contentsOf: batchResult) }
+            results.sort { $0.score > $1.score }
+            return results
+        }
+    }
+    
+    // MARK: - 自适应 BM25
+    private func computeBM25(queryTokens: [String], chunks: [VectorChunk], totalDocs: Float) async -> (scored: [(id: UUID, score: Float)], idfMap: [String: Float]) {
+        guard !queryTokens.isEmpty else { return ([], [:]) }
+        
+        let meaningfulTokens = queryTokens.filter { $0.count >= 2 }
+        let effectiveTokens = meaningfulTokens.isEmpty ? queryTokens : meaningfulTokens
+        
+        var documentFrequency: [String: Float] = [:]
+        var idfMap: [String: Float] = [:]
+        
+        for q in effectiveTokens {
+            let count = chunks.filter {
+                $0.text.localizedCaseInsensitiveContains(q) ||
+                ($0.metadata?.positiveTags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false) ||
+                ($0.metadata?.headingPath.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false)
+            }.count
+            
+            documentFrequency[q] = Float(count)
+            
+            if count > 0 {
+                let idf = log((totalDocs - Float(count) + 0.5) / (Float(count) + 0.5) + 1.0)
+                idfMap[q] = max(0.0, idf)
+            } else {
+                idfMap[q] = 0.0
+            }
+        }
+        
+        let avgdl = chunks.map { Float($0.text.count) }.reduce(0, +) / max(totalDocs, 1.0)
+        let k1: Float = 1.5
+        let b: Float = 0.75
+        var bm25Scored: [(id: UUID, score: Float)] = []
+        var maxBM25Score: Float = 0.0
+        
+        for chunk in chunks {
+            let meta = chunk.metadata
+            
+            // 负向禁忌词硬拦截
+            if let negTags = meta?.negativeTags, !negTags.isEmpty {
+                let hasNegativeHit = effectiveTokens.contains { qt in
+                    negTags.contains(where: { $0.lowercased().contains(qt) })
+                }
+                if hasNegativeHit { continue }
+            }
+            
+            // 专用分类与标签过滤
+            if let pos = meta?.positiveTags, !pos.isEmpty {
+                let tagHits = effectiveTokens.filter { qt in pos.contains(where: { $0.lowercased().contains(qt) }) }
+                let headerHits = effectiveTokens.filter { qt in meta?.headingPath.contains(where: { $0.lowercased().contains(qt) }) ?? false }
+                if tagHits.isEmpty && headerHits.isEmpty {
+                    continue
+                }
+            }
+            
+            var totalBM25: Float = 0
+            let chunkText = chunk.text.lowercased()
+            let chunkLength = Float(chunkText.count)
+            
+            for q in effectiveTokens {
+                let idf = idfMap[q] ?? 0.0
+                guard idf > 0 else { continue }
+                
+                var f_qD = Float(chunkText.components(separatedBy: q).count - 1)
+                
+                var fieldMultiplier: Float = 1.0
+                if let tags = meta?.positiveTags, tags.contains(where: { $0.lowercased().contains(q) }) {
+                    fieldMultiplier = 4.0
+                    f_qD += 2.0
+                }
+                if let path = meta?.headingPath, path.contains(where: { $0.lowercased().contains(q) }) {
+                    fieldMultiplier = max(fieldMultiplier, 2.5)
+                }
+                
+                if f_qD <= 0 { continue }
+                
+                let termScore = idf * (f_qD * (k1 + 1) / (f_qD + k1 * (1 - b + b * (chunkLength / avgdl))))
+                totalBM25 += termScore * fieldMultiplier
+            }
+            
+            if totalBM25 > 0 {
+                bm25Scored.append((chunk.id, totalBM25))
+                if totalBM25 > maxBM25Score { maxBM25Score = totalBM25 }
+            }
+        }
+        
+        if maxBM25Score > 0 {
+            bm25Scored = bm25Scored.map { (id: $0.id, score: $0.score / maxBM25Score) }
+        }
+        
+        bm25Scored.sort { $0.score > $1.score }
+        return (bm25Scored, idfMap)
+    }
+    
+    func generateEmbedding(for text: String) async -> [Float] {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanText.isEmpty { return [Float](repeating: 0, count: 300) }
+        
+        let lang = NLLanguageRecognizer.dominantLanguage(for: cleanText) ?? .simplifiedChinese
+        guard let embedding = NLEmbedding.sentenceEmbedding(for: lang) ?? NLEmbedding.wordEmbedding(for: lang) else {
+            guard let fallback = NLEmbedding.wordEmbedding(for: .simplifiedChinese) else {
+                return [Float](repeating: 0, count: 300)
+            }
+            return await computeAverageWordVector(text: cleanText, embedding: fallback)
+        }
+        
+        var vector: [Float] = []
+        if let rawVector = embedding.vector(for: cleanText) {
+            vector = rawVector.map { Float($0) }
+        } else {
+            vector = await computeAverageWordVector(text: cleanText, embedding: embedding)
+        }
+        
+        var norm: Float = 0
+        vDSP_svesq(vector, 1, &norm, vDSP_Length(vector.count))
+        norm = sqrt(norm)
+        
+        if norm > 0 {
+            var normalized = [Float](repeating: 0, count: vector.count)
+            vDSP_vsdiv(vector, 1, &norm, &normalized, 1, vDSP_Length(vector.count))
+            return normalized
+        }
+        return vector
+    }
+    
+    private func computeAverageWordVector(text: String, embedding: NLEmbedding) async -> [Float] {
+        let targetDimension = 300
+        var combinedVector = [Double](repeating: 0, count: targetDimension)
+        var wordCount = 0
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.string = text
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let word = String(text[range])
+            if let wv = embedding.vector(for: word) {
+                for i in 0..<min(targetDimension, wv.count) { combinedVector[i] += wv[i] }
+                wordCount += 1
+            }
+            return true
+        }
+        return wordCount > 0 ? combinedVector.map { Float($0 / Double(wordCount)) } : [Float](repeating: 0, count: targetDimension)
+    }
+    
+    func cosineSimilarity(a: [Float], b: [Float]) -> Float {
+        guard a.count == b.count else { return 0 }
+        let n = vDSP_Length(a.count)
+        var dotProduct: Float = 0
+        vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
+        var aNorm: Float = 0
+        vDSP_svesq(a, 1, &aNorm, n)
+        var bNorm: Float = 0
+        vDSP_svesq(b, 1, &bNorm, n)
+        let denominator = sqrt(aNorm) * sqrt(bNorm)
+        return denominator == 0 ? 0 : dotProduct / denominator
+    }
+}
+
+// MARK: - ==================== 5. KnowledgeSearchEngine (滑动窗口精排引擎) ====================
+
+actor NativeReranker: Sendable {
+    static let shared = NativeReranker()
+    private init() {}
+    
+    func rerank(
+        query: String,
+        chunks: [MicroVectorDB.VectorChunk],
+        topK: Int,
+        idfMap: [String: Float] = [:]
+    ) async -> [MicroVectorDB.VectorChunk] {
+        guard !chunks.isEmpty else { return [] }
+        
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let queryTokens = SmartTokenizer.tokenize(cleanQuery)
+        
+        let meaningfulTokens = queryTokens.filter { $0.count >= 2 && (idfMap[$0] ?? 0) > 0 }
+        let coreTokens = meaningfulTokens.isEmpty ? queryTokens.filter { $0.count >= 2 } : meaningfulTokens
+        
+        let totalQueryIDF = coreTokens.reduce(0.0) { $0 + (idfMap[$1] ?? 1.0) }
+        let sortedTokensByIDF = coreTokens.sorted { (idfMap[$0] ?? 0) > (idfMap[$1] ?? 0) }
+        let topAnchorToken = sortedTokensByIDF.first
+        let topAnchorIDF = topAnchorToken != nil ? (idfMap[topAnchorToken!] ?? 0.0) : 0.0
+        
+        let qVec = await MicroVectorDB.shared.generateEmbedding(for: cleanQuery)
+        
+        var rerankedChunks = await withTaskGroup(of: MicroVectorDB.VectorChunk.self) { group in
+            for chunk in chunks {
+                group.addTask {
+                    var modifiedChunk = chunk
+                    
+                    let rerankScore = self.computeSentenceLevelScore(
+                        chunkText: chunk.text,
+                        chunkEmbedding: chunk.embedding,
+                        queryVector: qVec
+                    )
+                    
+                    let chunkTextLower = chunk.text.lowercased()
+                    let meta = chunk.metadata
+                    
+                    var exactTitleBonus: Float = 0.0
+                    if let headers = meta?.headingPath, headers.contains(where: { $0.localizedCaseInsensitiveContains(cleanQuery) }) {
+                        exactTitleBonus = 0.35
+                    } else if chunkTextLower.contains(cleanQuery.lowercased()) {
+                        exactTitleBonus = 0.20
+                    }
+                    
+                    var hitIDF: Float = 0.0
+                    for token in coreTokens {
+                        if chunkTextLower.contains(token) ||
+                           (meta?.positiveTags.contains(where: { $0.lowercased().contains(token) }) ?? false) ||
+                           (meta?.headingPath.contains(where: { $0.lowercased().contains(token) }) ?? false) {
+                            hitIDF += idfMap[token] ?? 1.0
+                        }
+                    }
+                    
+                    let coverageRatio = totalQueryIDF > 0 ? (hitIDF / totalQueryIDF) : 0.0
+                    var coverageBonus: Float = 0.0
+                    if coverageRatio >= 0.4 {
+                        coverageBonus = 0.15 * coverageRatio
+                    }
+                    
+                    var tagMultiplier: Float = 1.0
+                    var negativePenalty: Float = 0.0
+                    
+                    let hasTopAnchor = topAnchorToken != nil && (
+                        chunkTextLower.contains(topAnchorToken!) ||
+                        (meta?.positiveTags.contains(where: { $0.lowercased().contains(topAnchorToken!) }) ?? false) ||
+                        (meta?.headingPath.contains(where: { $0.lowercased().contains(topAnchorToken!) }) ?? false)
+                    )
+                    
+                    if topAnchorIDF > 1.0 && !hasTopAnchor && exactTitleBonus == 0.0 {
+                        negativePenalty -= 0.55
+                    } else if coreTokens.count >= 2 && coverageRatio < 0.20 && exactTitleBonus == 0.0 {
+                        negativePenalty -= 0.40
+                    }
+                    
+                    if let meta = meta {
+                        if !meta.negativeTags.isEmpty {
+                            let matchedNeg = coreTokens.filter { qt in
+                                meta.negativeTags.contains(where: { $0.lowercased().contains(qt) })
+                            }
+                            if !matchedNeg.isEmpty {
+                                negativePenalty -= 10.0
+                            }
+                        }
+                        
+                        if !meta.positiveTags.isEmpty {
+                            let matchedTags = coreTokens.filter { qt in
+                                meta.positiveTags.contains(where: { $0.lowercased().contains(qt) || qt.contains($0.lowercased()) })
+                            }
+                            
+                            let isExactTagMatch = meta.positiveTags.contains(where: { tag in
+                                let cleanTag = tag.lowercased().trimmingCharacters(in: .whitespaces)
+                                let cleanQ = cleanQuery.lowercased()
+                                if cleanQ.contains(cleanTag) || cleanTag.contains(cleanQ) { return true }
+                                guard cleanTag.count >= 3 else { return false }
+                                let tagChars = Array(cleanTag)
+                                for token in coreTokens where token.count >= 3 {
+                                    let matchedCount = tagChars.filter { token.contains($0) }.count
+                                    if Float(matchedCount) / Float(tagChars.count) >= 0.80 { return true }
+                                }
+                                let globalMatched = tagChars.filter { cleanQ.contains($0) }.count
+                                return Float(globalMatched) / Float(tagChars.count) >= 0.85
+                            })
+                            
+                            if isExactTagMatch {
+                                tagMultiplier = 5.0
+                            } else if !matchedTags.isEmpty {
+                                let coverage = Float(matchedTags.count) / Float(max(1, coreTokens.count))
+                                tagMultiplier = 1.5 + (coverage * 2.5)
+                            } else {
+                                tagMultiplier = 0.3
+                            }
+                        }
+                    }
+                    
+                    let originalScore = chunk.score ?? 0
+                    let normalizedRRF = min(originalScore * 15.0, 1.0)
+                    
+                    var enhancedCos = max(0.0, (rerankScore - 0.45) * 2.0)
+                    if topAnchorIDF > 1.0 && !hasTopAnchor && exactTitleBonus == 0.0 {
+                        enhancedCos *= 0.15
+                    }
+                    
+                    let baseScore = (normalizedRRF * 0.30) + (enhancedCos * 0.70) + exactTitleBonus + coverageBonus
+                    let finalMultiplier = baseScore > 0.05 ? tagMultiplier : 1.0
+                    
+                    let rawFinal = max(0.0, min(1.0, (baseScore * finalMultiplier) + negativePenalty))
+                    modifiedChunk.score = rawFinal
+                    modifiedChunk.debugInfo = String(format: "Raw:%.2f (Base:%.2f x%.1f Cov:%.0f%%) | Pen:%.2f", rawFinal, baseScore, finalMultiplier, coverageRatio * 100, negativePenalty)
+                    
+                    return modifiedChunk
+                }
+            }
+            
+            var results: [MicroVectorDB.VectorChunk] = []
+            for await sc in group { results.append(sc) }
+            return results
+        }
+        
+        rerankedChunks = rerankedChunks.filter { ($0.score ?? 0) > 0 }
+        rerankedChunks.sort { ($0.score ?? 0) > ($1.score ?? 0) }
+        
+        return Array(rerankedChunks.prefix(topK))
+    }
+    
+    nonisolated private func computeSentenceLevelScore(chunkText: String, chunkEmbedding: [Float], queryVector: [Float]) -> Float {
+        let chunkCos = computeCosine(a: queryVector, b: chunkEmbedding)
+        var maxSentenceSimilarity: Float = chunkCos
+        
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = chunkText
+        
+        let embeddingHelper = NLEmbedding.sentenceEmbedding(for: .simplifiedChinese)
+            ?? NLEmbedding.wordEmbedding(for: .simplifiedChinese)
+            ?? NLEmbedding.sentenceEmbedding(for: .english)
+            ?? NLEmbedding.wordEmbedding(for: .english)
+            
+        guard let embeddingHelper = embeddingHelper else {
+            return maxSentenceSimilarity
+        }
+        
+        tokenizer.enumerateTokens(in: chunkText.startIndex..<chunkText.endIndex) { range, _ in
+            let sentence = String(chunkText[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if sentence.count > 3 {
+                var sVec: [Float] = []
+                if let rawVec = embeddingHelper.vector(for: sentence) {
+                    sVec = rawVec.map { Float($0) }
+                } else {
+                    let words = SmartTokenizer.tokenize(sentence)
+                    var combined = [Double](repeating: 0, count: queryVector.count)
+                    var count = 0
+                    for w in words {
+                        if let wv = embeddingHelper.vector(for: w) {
+                            for i in 0..<min(queryVector.count, wv.count) { combined[i] += wv[i] }
+                            count += 1
+                        }
+                    }
+                    if count > 0 {
+                        sVec = combined.map { Float($0 / Double(count)) }
+                    }
+                }
+                
+                if !sVec.isEmpty && sVec.count == queryVector.count {
+                    let sim = computeCosine(a: queryVector, b: sVec)
+                    if sim > maxSentenceSimilarity {
+                        maxSentenceSimilarity = sim
+                    }
+                }
+            }
+            return true
+        }
+        
+        return maxSentenceSimilarity
+    }
+    
+    nonisolated private func computeCosine(a: [Float], b: [Float]) -> Float {
+        guard a.count == b.count && !a.isEmpty else { return 0 }
+        let n = vDSP_Length(a.count)
+        var dotProduct: Float = 0
+        vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
+        var aNorm: Float = 0
+        vDSP_svesq(a, 1, &aNorm, n)
+        var bNorm: Float = 0
+        vDSP_svesq(b, 1, &bNorm, n)
+        let denominator = sqrt(aNorm) * sqrt(bNorm)
+        return denominator == 0 ? 0 : dotProduct / denominator
+    }
+}
+
+// MARK: - ==================== 6. KnowledgeViewModel (响应式业务门面中枢) ====================
 
 @Observable
 @MainActor
@@ -167,7 +1185,9 @@ class KnowledgeViewModel {
         }
         
         saveCategories()
-        for i in 0..<knowledgeBases.count { if knowledgeBases[i].category == oldName { knowledgeBases[i].category = trimmed } }
+        for i in 0..<knowledgeBases.count {
+            if knowledgeBases[i].category == oldName { knowledgeBases[i].category = trimmed }
+        }
         saveKnowledgeMeta()
     }
     
@@ -177,13 +1197,16 @@ class KnowledgeViewModel {
         else { categories.removeAll { $0 == name } }
         
         saveCategories()
-        for i in 0..<knowledgeBases.count { if knowledgeBases[i].category == name { knowledgeBases[i].category = "默认" } }
+        for i in 0..<knowledgeBases.count {
+            if knowledgeBases[i].category == name { knowledgeBases[i].category = "默认" }
+        }
         saveKnowledgeMeta()
     }
     
     func toggleKnowledgeStatus(id: UUID, isEnabled: Bool) {
         if let index = knowledgeBases.firstIndex(where: { $0.id == id }) {
-            knowledgeBases[index].isEnabled = isEnabled; saveKnowledgeMeta()
+            knowledgeBases[index].isEnabled = isEnabled
+            saveKnowledgeMeta()
         }
     }
     
@@ -279,7 +1302,6 @@ class KnowledgeViewModel {
                 do {
                     extractedText = try await DoclingBridge.parseTo(fileURL: url)
                 } catch {
-                    // Docling 失败或未安装，自动降级为原生解析
                     extractedText = self.extractNativeFallback(url: url, ext: ext)
                 }
             } else if ["swift", "java", "json", "py", "c", "cpp", "h", "cs", "js", "ts", "go", "rs", "php", "sh"].contains(ext) {
@@ -294,20 +1316,15 @@ class KnowledgeViewModel {
                 return
             }
             
-            guard !extractedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                await MainActor.run { self.updateKnowledgeStatus(id: kbId, status: "失败", count: 0, summary: "文件内容为空或提取失败") }
-                return
-            }
-            
             let cleanedText = DataCleaner.clean(extractedText)
             
             await MainActor.run { self.updateKnowledgeStatus(id: kbId, status: "切片中", count: 0, summary: "正在进行智能滑动语义分块与元数据隔离...") }
             
-            let validChunks: [(text: String, meta: MicroVectorDB.ChunkMetadata)]
+            let validChunks: [(text: String, meta: ChunkMetadata)]
             let isCodeFile = (predefinedStructuralChunks != nil)
             
             if let structuralChunks = predefinedStructuralChunks, !structuralChunks.isEmpty {
-                validChunks = structuralChunks.filter { DataCleaner.isValidChunk($0) }.map { ($0, MicroVectorDB.ChunkMetadata()) }
+                validChunks = structuralChunks.filter { DataCleaner.isValidChunk($0) }.map { ($0, ChunkMetadata()) }
             } else {
                 let rawChunks = MicroVectorDB.shared.chunkText(cleanedText, maxTokens: 500)
                 validChunks = rawChunks.filter { DataCleaner.isValidChunk($0.text) }
@@ -363,7 +1380,7 @@ class KnowledgeViewModel {
         
         let promptText: String
         if isCodeFile {
-            promptText = CodeKnowledgeExtractor.buildCodeSummaryPrompt(extraction: extraction, fileName: fileName)
+            promptText = await CodeKnowledgeExtractor.buildCodeSummaryPrompt(extraction: extraction, fileName: fileName)
         } else {
             promptText = """
             请对以下文档内容进行精准、客观的结构化摘要：
@@ -398,7 +1415,8 @@ class KnowledgeViewModel {
     
     private func updateKnowledgeStatus(id: UUID, status: String, count: Int, summary: String? = nil) {
         if let index = knowledgeBases.firstIndex(where: { $0.id == id }) {
-            knowledgeBases[index].status = status; knowledgeBases[index].chunkCount = count
+            knowledgeBases[index].status = status
+            knowledgeBases[index].chunkCount = count
             if let sum = summary { knowledgeBases[index].summary = sum }
             saveKnowledgeMeta()
         }
@@ -449,7 +1467,7 @@ class KnowledgeViewModel {
         }
     }
     
-    // MARK: - 支持结构化元数据封装与自适应加权的 RAG 检索
+    // MARK: - RAG 上下文注入与检索调度
     func injectedRag(query: String, category: String = "", currentModel: String) async -> (context: String, logString: String) {
         let config = ConfigManager.shared.app.generalConfig
         var activeKBs = getActiveKnowledgeItems()
@@ -557,7 +1575,6 @@ class KnowledgeViewModel {
         return kbs.filter { $0.isEnabled && $0.status == "索引完成" }
     }
     
-    // 原生降级文本解析兜底
     nonisolated private func extractNativeFallback(url: URL, ext: String) -> String {
         if ext == "pdf", let pdf = PDFDocument(url: url) {
             return (0..<pdf.pageCount).compactMap { pdf.page(at: $0)?.string }.joined(separator: "\n")
@@ -576,542 +1593,62 @@ class KnowledgeViewModel {
     }
 }
 
-// MARK: - ==================== 3. 纯 Swift 微型向量数据库 (自适应版) ====================
+// MARK: - ==================== 7. KnowledgeSearchWindowManager (独立窗口管理器) ====================
 
-class MicroVectorDB: @unchecked Sendable {
-    static let shared = MicroVectorDB()
-    private init() { load() }
+@MainActor
+final class KnowledgeSearchWindowManager: NSObject, NSWindowDelegate {
+    static let shared = KnowledgeSearchWindowManager()
+    private var window: NSWindow?
     
-    public struct ChunkMetadata: Codable, Equatable, Sendable {
-        public var headingPath: [String] = []
-        public var positiveTags: [String] = []
-        public var negativeTags: [String] = []
-        public var kvPairs: [String: String] = [:]
-        
-        public init(headingPath: [String] = [], positiveTags: [String] = [], negativeTags: [String] = [], kvPairs: [String : String] = [:]) {
-            self.headingPath = headingPath
-            self.positiveTags = positiveTags
-            self.negativeTags = negativeTags
-            self.kvPairs = kvPairs
+    var isVisible: Bool { window != nil }
+    private override init() { super.init() }
+    
+    func show(viewModel: KnowledgeViewModel) {
+        if let existingWindow = window {
+            if existingWindow.isMiniaturized { existingWindow.deminiaturize(nil) }
+            existingWindow.makeKeyAndOrderFront(nil)
+            existingWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
+        
+        let contentView = KnowledgeSearchTestView(viewModel: viewModel) { [weak self] in
+            self?.window?.close()
+        }
+        
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        newWindow.title = "知识库向量检索与自适应诊断"
+        newWindow.center()
+        newWindow.setFrameAutosaveName("LinTools_KnowledgeSearchTest_Window")
+        newWindow.isReleasedWhenClosed = false
+        newWindow.delegate = self
+        newWindow.isOpaque = false
+        newWindow.hasShadow = true
+        newWindow.titlebarAppearsTransparent = true
+        newWindow.titleVisibility = .hidden
+        newWindow.contentView = NSHostingView(rootView: contentView)
+        
+        self.window = newWindow
+        newWindow.makeKeyAndOrderFront(nil)
+        newWindow.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        MainWindowManager.syncDockIconPolicy()
     }
     
-    struct VectorChunk: Codable, Identifiable {
-        var id = UUID()
-        var kbId: UUID
-        var text: String
-        var embedding: [Float]
-        var score: Float?
-        var debugInfo: String?
-        var metadata: ChunkMetadata? = nil
-        
-        enum CodingKeys: String, CodingKey { case id, kbId, text, embedding, score, debugInfo, metadata }
-    }
-    
-    private var chunks: [VectorChunk] = []
-    private let dbQueue = DispatchQueue(label: "com.lintools.vectordb", qos: .userInitiated)
-    private var dbFileURL: URL { ConfigManager.shared.ragVectordbFileName! }
-    
-    func load() {
-        if let data = try? Data(contentsOf: dbFileURL), let decoded = try? JSONDecoder().decode([VectorChunk].self, from: data) { self.chunks = decoded }
-    }
-    private func save() { if let encoded = try? JSONEncoder().encode(chunks) { try? encoded.write(to: dbFileURL, options: .atomic) } }
-    
-    // MARK: - 纯净切片提取与正文物理隔离
-    func chunkText(_ text: String, maxTokens: Int = 400, overlap: Int = 50) -> [(text: String, meta: ChunkMetadata)] {
-        var result: [(text: String, meta: ChunkMetadata)] = []
-        let lines = text.components(separatedBy: .newlines)
-        
-        // 1. 预先检测文档是否为纯正或成体系的 QA 问答文档 (出现 >= 2 组问答特征)
-        let isQADocument = detectQAPattern(in: lines)
-        
-        var currentChunk = ""
-        var currentHeaderContext = ""
-        var currentPositiveTags: [String] = []
-        var currentNegativeTags: [String] = []
-        
-        let tagsRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:tags|category|标签)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
-        let prohRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:prohibited|exclude|forbidden|禁用)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
-        
-        func extractList(from line: String, regex: NSRegularExpression?) -> [String]? {
-            guard let regex = regex else { return nil }
-            let nsString = line as NSString
-            if let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: nsString.length)) {
-                let range1 = match.range(at: 1)
-                let range2 = match.range(at: 2)
-                let matchedRange = (range1.location != NSNotFound) ? range1 : range2
-                guard matchedRange.location != NSNotFound else { return nil }
-                
-                let content = nsString.substring(with: matchedRange)
-                return content.components(separatedBy: CharacterSet(charactersIn: ",，;；、")).map {
-                    $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'[]*")))
-                }.filter { !$0.isEmpty }
-            }
-            return nil
-        }
-        
-        func appendChunkIfValid(chunkStr: String, headers: [String], posTags: [String], negTags: [String]) {
-            let trimmed = chunkStr.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            
-            let bodyWithoutHeader = trimmed.replacingOccurrences(of: #"^\[.*?\]\n?"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            if !bodyWithoutHeader.isEmpty || !posTags.isEmpty || !negTags.isEmpty {
-                result.append((trimmed, ChunkMetadata(headingPath: headers, positiveTags: posTags, negativeTags: negTags)))
-            }
-        }
-        
-        for line in lines {
-            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-            if trimmedLine.isEmpty { continue }
-            
-            // a) 解析 Markdown Headers 并重置上下文
-            if trimmedLine.hasPrefix("#") {
-                let headerLevel = trimmedLine.prefix(while: { $0 == "#" }).count
-                if headerLevel > 0 && headerLevel <= 6 {
-                    let newHeader = trimmedLine.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces)
-                    
-                    if !currentChunk.isEmpty {
-                        appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        currentChunk = ""
-                    }
-                    currentHeaderContext = newHeader
-                    currentPositiveTags = []
-                    currentNegativeTags = []
-                    currentChunk = "[\(currentHeaderContext)]\n"
-                    continue
-                }
-            }
-            
-            // b) 嗅探并隔离负向标签 (prohibited)
-            if let prohibited = extractList(from: trimmedLine, regex: prohRegex) {
-                currentNegativeTags.append(contentsOf: prohibited)
-                continue
-            }
-            
-            // c) 嗅探并隔离正向标签 (tags)
-            if let tags = extractList(from: trimmedLine, regex: tagsRegex) {
-                currentPositiveTags.append(contentsOf: tags)
-                continue
-            }
-            
-            // d) 过滤非正文元数据标记行
-            if trimmedLine.hasPrefix("* **") && trimmedLine.contains("**:") && !trimmedLine.contains("核心特征") && !trimmedLine.contains("描述") {
-                continue
-            }
-            
-            // e) [QA 结构边界识别]：仅在判定为 QA 文档时，遇新问题强制作为独立切片起点
-            if isQADocument && isQuestionLine(trimmedLine) {
-                let strippedChunk = currentChunk.replacingOccurrences(of: "[\(currentHeaderContext)]\n", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !strippedChunk.isEmpty {
-                    appendChunkIfValid(chunkStr: currentChunk, headers: currentHeaderContext.isEmpty ? [] : [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n" : ""
-                }
-            }
-            
-            // f) 常规正文滑动窗口切片
-            let projectedSize = currentChunk.count + trimmedLine.count + 1
-            if projectedSize > maxTokens {
-                if !currentChunk.isEmpty {
-                    appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                }
-                if trimmedLine.count > maxTokens {
-                    let forcedChunks = breakDownHugeSentence(trimmedLine, maxTokens: maxTokens, overlap: overlap)
-                    if let first = forcedChunks.first, !currentHeaderContext.isEmpty {
-                        appendChunkIfValid(chunkStr: "[\(currentHeaderContext)] \(first)", headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        for chunk in forcedChunks.dropFirst() {
-                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        }
-                    } else {
-                        for chunk in forcedChunks {
-                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        }
-                    }
-                    currentChunk = ""
-                } else {
-                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n\(trimmedLine)" : trimmedLine
-                }
-            } else {
-                currentChunk += (currentChunk.isEmpty ? "" : "\n") + trimmedLine
-            }
-        }
-        
-        if !currentChunk.isEmpty {
-            appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-        }
-        
-        return result
-    }
-
-    // MARK: - QA 问答特征探测辅助逻辑
-    private func isQuestionLine(_ line: String) -> Bool {
-        let questionPatterns = [
-            #"^(?i)Q[:：]\s*"#,
-            #"^(?i)问[:：]\s*"#,
-            #"^【问】[:：]?\s*"#,
-            #"^(?i)Question[:：]\s*"#
-        ]
-        return questionPatterns.contains { line.range(of: $0, options: .regularExpression) != nil }
-    }
-
-    private func isAnswerLine(_ line: String) -> Bool {
-        let answerPatterns = [
-            #"^(?i)A[:：]\s*"#,
-            #"^(?i)答[:：]\s*"#,
-            #"^【答】[:：]?\s*"#,
-            #"^(?i)Answer[:：]\s*"#
-        ]
-        return answerPatterns.contains { line.range(of: $0, options: .regularExpression) != nil }
-    }
-
-    private func detectQAPattern(in lines: [String]) -> Bool {
-        var questionCount = 0
-        var answerCount = 0
-        
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if isQuestionLine(trimmed) {
-                questionCount += 1
-            } else if isAnswerLine(trimmed) {
-                answerCount += 1
-            }
-        }
-        // 必须存在至少 2 个明确的问题行，且存在至少 1 个回答行，才判定为问答类知识文档
-        return questionCount >= 2 && answerCount >= 1
-    }
-    
-    nonisolated private func breakDownHugeSentence(_ text: String, maxTokens: Int, overlap: Int) -> [String] {
-        var chunks: [String] = []; var currentIndex = text.startIndex
-        while currentIndex < text.endIndex {
-            let remaining = text.distance(from: currentIndex, to: text.endIndex)
-            if remaining <= maxTokens { chunks.append(String(text[currentIndex...])); break }
-            var endIndex = text.index(currentIndex, offsetBy: maxTokens); var searchIndex = endIndex; var foundBoundary = false
-            while searchIndex > currentIndex {
-                let char = text[searchIndex]; if char.isWhitespace || char.isPunctuation { endIndex = searchIndex; foundBoundary = true; break }
-                searchIndex = text.index(before: searchIndex)
-            }
-            if !foundBoundary { endIndex = text.index(currentIndex, offsetBy: maxTokens) }
-            let chunk = String(text[currentIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines); if !chunk.isEmpty { chunks.append(chunk) }
-            var nextIndex = endIndex
-            if overlap > 0 && nextIndex < text.endIndex {
-                var overlapCount = 0; while nextIndex > currentIndex && overlapCount < overlap { nextIndex = text.index(before: nextIndex); overlapCount += 1 }
-                while nextIndex > currentIndex && nextIndex < endIndex { if text[nextIndex].isWhitespace || text[nextIndex].isPunctuation { nextIndex = text.index(after: nextIndex); break }; nextIndex = text.index(after: nextIndex) }
-            }
-            currentIndex = nextIndex
-        }
-        return chunks
-    }
-    
-    func addDocument(kbId: UUID, chunks: [(text: String, meta: ChunkMetadata)]) async {
-        var newVectorChunks: [VectorChunk] = []
-        for chunk in chunks {
-            newVectorChunks.append(VectorChunk(kbId: kbId, text: chunk.text, embedding: await generateEmbedding(for: chunk.text), metadata: chunk.meta))
-        }
-        dbQueue.sync { self.chunks.append(contentsOf: newVectorChunks); self.save() }
-    }
-    
-    func deleteDocument(kbId: UUID) { dbQueue.sync { self.chunks.removeAll { $0.kbId == kbId }; self.save() } }
-    
-    func fetchChunks(for kbId: UUID) -> [VectorChunk] { return dbQueue.sync { self.chunks.filter { $0.kbId == kbId } } }
-    
-    // MARK: - 自适应感知混合检索
-    func search(query: String, enabledKbIds: [UUID], topK: Int = 3, exactMatch: Bool = false) async -> [VectorChunk] {
-        guard !enabledKbIds.isEmpty else { return [] }
-        
-        let queryVector = await generateEmbedding(for: query)
-        let queryTokens = SmartTokenizer.tokenize(query)
-        let lowerQuery = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        var validChunks = dbQueue.sync { chunks.filter { enabledKbIds.contains($0.kbId) } }
-        
-        if exactMatch {
-            validChunks = validChunks.filter { chunk in
-                let chunkText = chunk.text.lowercased()
-                let meta = chunk.metadata
-                let posTags = meta?.positiveTags.map { $0.lowercased() } ?? []
-                let headers = meta?.headingPath.map { $0.lowercased() } ?? []
-                
-                if chunkText.contains(lowerQuery) ||
-                   posTags.contains(where: { $0.contains(lowerQuery) || lowerQuery.contains($0) }) ||
-                   headers.contains(where: { $0.contains(lowerQuery) }) {
-                    return true
-                }
-                
-                let coreTokens = queryTokens.filter { $0.count >= 2 && $0 != lowerQuery }
-                if coreTokens.isEmpty { return false }
-                
-                let matchedCount = coreTokens.filter { token in
-                    chunkText.contains(token) ||
-                    posTags.contains(where: { $0.contains(token) }) ||
-                    headers.contains(where: { $0.contains(token) })
-                }.count
-                
-                let requiredCount = max(1, Int(ceil(Double(coreTokens.count) * 0.6)))
-                return matchedCount >= requiredCount
-            }
-        }
-        
-        guard !validChunks.isEmpty else { return [] }
-        let totalChunksCount = Float(validChunks.count)
-
-        async let vectorResults = computeVectorSimilarity(queryVector: queryVector, chunks: validChunks)
-        async let bm25Results = computeBM25(queryTokens: queryTokens, chunks: validChunks, totalDocs: totalChunksCount)
-        
-        let (vectorScored, (bm25Scored, idfMap)) = await (vectorResults, bm25Results)
-        
-        let isTechnicalQuery = queryTokens.contains { $0.contains("_") || $0.count < 4 }
-        let bm25Weight: Float = isTechnicalQuery ? 1.8 : 1.3
-        let vectorWeight: Float = isTechnicalQuery ? 0.2 : 0.7
-        
-        let bm25ScoreMap = Dictionary(uniqueKeysWithValues: bm25Scored)
-        let vectorScoreMap = Dictionary(uniqueKeysWithValues: vectorScored)
-        
-        var rrfScores: [UUID: Float] = [:]
-        let rrf_k: Float = 60.0
-        
-        for (rank, item) in vectorScored.enumerated() {
-            rrfScores[item.id] = (1.0 / (rrf_k + Float(rank + 1))) * vectorWeight
-        }
-        for (rank, item) in bm25Scored.enumerated() {
-            let current = rrfScores[item.id] ?? 0
-            rrfScores[item.id] = current + (1.0 / (rrf_k + Float(rank + 1))) * bm25Weight
-        }
-        
-        // 仅在库内实际存在的有效词 (IDF > 0) 中选取最高信息熵锚点
-        let validTokensByIDF = queryTokens
-            .filter { $0.count >= 2 && (idfMap[$0] ?? 0) > 0 }
-            .sorted { (idfMap[$0] ?? 0) > (idfMap[$1] ?? 0) }
-        let topAnchorToken = validTokensByIDF.first
-        let topAnchorIDF = topAnchorToken != nil ? (idfMap[topAnchorToken!] ?? 0.0) : 0.0
-        
-        var coarseRanked = validChunks.compactMap { chunk -> VectorChunk? in
-            let bm25 = bm25ScoreMap[chunk.id] ?? 0.0
-            let vecSim = vectorScoreMap[chunk.id] ?? 0.0
-            let chunkTextLower = chunk.text.lowercased()
-            
-            // 实体门禁放行判定
-            if topAnchorIDF > 1.0, let topAnchor = topAnchorToken {
-                let hasAnchor = chunkTextLower.contains(topAnchor) ||
-                               (chunk.metadata?.positiveTags.contains { $0.lowercased().contains(topAnchor) } ?? false) ||
-                               (chunk.metadata?.headingPath.contains { $0.lowercased().contains(topAnchor) } ?? false)
-                if !hasAnchor && vecSim < 0.68 && bm25 <= 0 {
-                    return nil
-                }
-            }
-            
-            // 底噪初筛：无 BM25 且稠密向量低于 0.48 直接剔除
-            if bm25 <= 0 && vecSim < 0.48 {
-                return nil
-            }
-            
-            guard let score = rrfScores[chunk.id], score > 0 else { return nil }
-            var resultChunk = chunk
-            resultChunk.score = score
-            return resultChunk
-        }
-        
-        coarseRanked.sort { ($0.score ?? 0) > ($1.score ?? 0) }
-        let coarsePool = Array(coarseRanked.prefix(topK * 4))
-        
-        if !coarsePool.isEmpty {
-            var finalRanked = await NativeReranker.shared.rerank(
-                query: query,
-                chunks: coarsePool,
-                topK: topK,
-                idfMap: idfMap
-            )
-            
-            finalRanked = finalRanked.filter { ($0.score ?? 0) >= 0.20 }
-            return finalRanked
-        } else {
-            return Array(coarsePool.prefix(topK))
-        }
-    }
-    
-    private func computeVectorSimilarity(queryVector: [Float], chunks: [VectorChunk]) async -> [(id: UUID, score: Float)] {
-        return await withTaskGroup(of: [(id: UUID, score: Float)].self) { group in
-            let batchSize = 500
-            var results: [(id: UUID, score: Float)] = []
-            for i in stride(from: 0, to: chunks.count, by: batchSize) {
-                let end = min(i + batchSize, chunks.count)
-                let batch = Array(chunks[i..<end])
-                group.addTask {
-                    var batchResults: [(id: UUID, score: Float)] = []
-                    for chunk in batch {
-                        let score = self.cosineSimilarity(a: queryVector, b: chunk.embedding)
-                        if score >= 0.45 { batchResults.append((chunk.id, score)) }
-                    }
-                    return batchResults
-                }
-            }
-            for await batchResult in group { results.append(contentsOf: batchResult) }
-            results.sort { $0.score > $1.score }
-            return results
-        }
-    }
-    
-    // MARK: - 自适应 BM25 (负向拦截 + Tag 自感知)
-    private func computeBM25(queryTokens: [String], chunks: [VectorChunk], totalDocs: Float) async -> (scored: [(id: UUID, score: Float)], idfMap: [String: Float]) {
-        guard !queryTokens.isEmpty else { return ([], [:]) }
-        
-        let meaningfulTokens = queryTokens.filter { $0.count >= 2 }
-        let effectiveTokens = meaningfulTokens.isEmpty ? queryTokens : meaningfulTokens
-        
-        var documentFrequency: [String: Float] = [:]
-        var idfMap: [String: Float] = [:]
-        
-        for q in effectiveTokens {
-            // 统计正文及正向标签中包含该词的切片数
-            let count = chunks.filter {
-                $0.text.localizedCaseInsensitiveContains(q) ||
-                ($0.metadata?.positiveTags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false) ||
-                ($0.metadata?.headingPath.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false)
-            }.count
-            
-            documentFrequency[q] = Float(count)
-            
-            // 库中完全不存在的 0 频拼接短语赋予 IDF = 0.0，不作为核心实体锚点
-            if count > 0 {
-                let idf = log((totalDocs - Float(count) + 0.5) / (Float(count) + 0.5) + 1.0)
-                idfMap[q] = max(0.0, idf)
-            } else {
-                idfMap[q] = 0.0
-            }
-        }
-        
-        let avgdl = chunks.map { Float($0.text.count) }.reduce(0, +) / max(totalDocs, 1.0)
-        let k1: Float = 1.5; let b: Float = 0.75
-        var bm25Scored: [(id: UUID, score: Float)] = []
-        var maxBM25Score: Float = 0.0
-        
-        for chunk in chunks {
-            let meta = chunk.metadata
-            
-            // 1. 负向禁忌词硬拦截 (保持原有逻辑)
-            if let negTags = meta?.negativeTags, !negTags.isEmpty {
-                let hasNegativeHit = effectiveTokens.contains { qt in
-                    negTags.contains(where: { $0.lowercased().contains(qt) })
-                }
-                if hasNegativeHit { continue }
-            }
-            
-            // 2. 专用分类与标签过滤 (保持原有逻辑)
-            if let pos = meta?.positiveTags, !pos.isEmpty {
-                let tagHits = effectiveTokens.filter { qt in pos.contains(where: { $0.lowercased().contains(qt) }) }
-                let headerHits = effectiveTokens.filter { qt in meta?.headingPath.contains(where: { $0.lowercased().contains(qt) }) ?? false }
-                if tagHits.isEmpty && headerHits.isEmpty {
-                    continue
-                }
-            }
-            
-            var totalBM25: Float = 0
-            let chunkText = chunk.text.lowercased()
-            let chunkLength = Float(chunkText.count)
-            
-            for q in effectiveTokens {
-                let idf = idfMap[q] ?? 0.0
-                guard idf > 0 else { continue }
-                
-                var f_qD = Float(chunkText.components(separatedBy: q).count - 1)
-                
-                var fieldMultiplier: Float = 1.0
-                if let tags = meta?.positiveTags, tags.contains(where: { $0.lowercased().contains(q) }) {
-                    fieldMultiplier = 4.0
-                    f_qD += 2.0
-                }
-                if let path = meta?.headingPath, path.contains(where: { $0.lowercased().contains(q) }) {
-                    fieldMultiplier = max(fieldMultiplier, 2.5)
-                }
-                
-                if f_qD <= 0 { continue }
-                
-                let termScore = idf * (f_qD * (k1 + 1) / (f_qD + k1 * (1 - b + b * (chunkLength / avgdl))))
-                totalBM25 += termScore * fieldMultiplier
-            }
-            
-            if totalBM25 > 0 {
-                bm25Scored.append((chunk.id, totalBM25))
-                if totalBM25 > maxBM25Score { maxBM25Score = totalBM25 }
-            }
-        }
-        
-        if maxBM25Score > 0 {
-            bm25Scored = bm25Scored.map { (id: $0.id, score: $0.score / maxBM25Score) }
-        }
-        
-        bm25Scored.sort { $0.score > $1.score }
-        return (bm25Scored, idfMap)
-    }
-    
-    func generateEmbedding(for text: String) async -> [Float] {
-        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleanText.isEmpty { return [Float](repeating: 0, count: 300) }
-        
-        let lang = NLLanguageRecognizer.dominantLanguage(for: cleanText) ?? .simplifiedChinese
-        guard let embedding = NLEmbedding.sentenceEmbedding(for: lang) ?? NLEmbedding.wordEmbedding(for: lang) else {
-            guard let fallback = NLEmbedding.wordEmbedding(for: .simplifiedChinese) else {
-                return [Float](repeating: 0, count: 300)
-            }
-            return await computeAverageWordVector(text: cleanText, embedding: fallback)
-        }
-        
-        var vector: [Float] = []
-        if let rawVector = embedding.vector(for: cleanText) {
-            vector = rawVector.map { Float($0) }
-        } else {
-            vector = await computeAverageWordVector(text: cleanText, embedding: embedding)
-        }
-        
-        var norm: Float = 0
-        vDSP_svesq(vector, 1, &norm, vDSP_Length(vector.count))
-        norm = sqrt(norm)
-        
-        if norm > 0 {
-            var normalized = [Float](repeating: 0, count: vector.count)
-            vDSP_vsdiv(vector, 1, &norm, &normalized, 1, vDSP_Length(vector.count))
-            return normalized
-        }
-        return vector
-    }
-    
-    private func computeAverageWordVector(text: String, embedding: NLEmbedding) async -> [Float] {
-        let targetDimension = 300
-        var combinedVector = [Double](repeating: 0, count: targetDimension)
-        var wordCount = 0
-        let tokenizer = NLTokenizer(unit: .word)
-        tokenizer.string = text
-        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-            let word = String(text[range])
-            if let wv = embedding.vector(for: word) {
-                for i in 0..<min(targetDimension, wv.count) { combinedVector[i] += wv[i] }
-                wordCount += 1
-            }
-            return true
-        }
-        return wordCount > 0 ? combinedVector.map { Float($0 / Double(wordCount)) } : [Float](repeating: 0, count: targetDimension)
-    }
-    
-    private func cosineSimilarity(a: [Float], b: [Float]) -> Float {
-        guard a.count == b.count else { return 0 }
-        let n = vDSP_Length(a.count); var dotProduct: Float = 0
-        vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
-        var aNorm: Float = 0; vDSP_svesq(a, 1, &aNorm, n)
-        var bNorm: Float = 0; vDSP_svesq(b, 1, &bNorm, n)
-        let denominator = sqrt(aNorm) * sqrt(bNorm)
-        return denominator == 0 ? 0 : dotProduct / denominator
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+        MainWindowManager.syncDockIconPolicy()
     }
 }
 
-// MARK: - ==================== 4. 知识库 UI 视图组件 ====================
+// MARK: - ==================== 8. KnowledgeUI Components (管理面板与交互视图) ====================
 
-struct KnowledgeNode: Identifiable {
-    let id: String
-    let name: String
-    let isFolder: Bool
-    var item: KnowledgeItem?
-    var children: [KnowledgeNode]?
-}
-
+@MainActor
 struct KnowledgeBasePanel: View {
     @Bindable var viewModel: KnowledgeViewModel
     @State private var generalConfig = ConfigManager.shared.app.generalConfig
@@ -1143,7 +1680,10 @@ struct KnowledgeBasePanel: View {
             var children: [String: NodeBuilder] = [:]
             
             init(name: String, path: String, isFolder: Bool, item: KnowledgeItem? = nil) {
-                self.name = name; self.path = path; self.isFolder = isFolder; self.item = item
+                self.name = name
+                self.path = path
+                self.isFolder = isFolder
+                self.item = item
             }
             
             func toNode() -> KnowledgeNode {
@@ -1246,7 +1786,10 @@ struct KnowledgeBasePanel: View {
         }
         .alert("批量删除？", isPresented: $showBatchDeleteAlert) {
             Button("删除", role: .destructive) {
-                withAnimation { viewModel.deleteMultipleKnowledge(ids: selectedKnowledgeIDs); selectedKnowledgeIDs.removeAll() }
+                withAnimation {
+                    viewModel.deleteMultipleKnowledge(ids: selectedKnowledgeIDs)
+                    selectedKnowledgeIDs.removeAll()
+                }
             }
             Button("取消", role: .cancel) { }
         } message: {
@@ -1266,8 +1809,12 @@ struct KnowledgeBasePanel: View {
                 } onCancel: { showEditSheet = false }
             }
         }
-        .sheet(item: $showingChunksFor) { kb in KnowledgeChunksPreviewView(knowledge: kb) { showingChunksFor = nil } }
-        .sheet(isPresented: $showingCategoryManager) { CategoryManagerView(viewModel: viewModel) { showingCategoryManager = false } }
+        .sheet(item: $showingChunksFor) { kb in
+            KnowledgeChunksPreviewView(knowledge: kb) { showingChunksFor = nil }
+        }
+        .sheet(isPresented: $showingCategoryManager) {
+            CategoryManagerView(viewModel: viewModel) { showingCategoryManager = false }
+        }
     }
     
     private func selectAll(in path: String) {
@@ -1400,7 +1947,6 @@ struct KnowledgeBasePanel: View {
             
             Spacer()
             
-            // Docling 安装状态与引导胶囊
             Button(action: { showDoclingGuidePopover.toggle() }) {
                 HStack(spacing: 5) {
                     Circle()
@@ -1509,7 +2055,6 @@ struct KnowledgeBasePanel: View {
     }
 }
 
-// 行组件
 struct KnowledgeRowView: View {
     let kb: KnowledgeItem
     let viewModel: KnowledgeViewModel
@@ -1627,7 +2172,6 @@ struct KnowledgeRowView: View {
     }
 }
 
-// MARK: - 知识库检索测试面板 (显化结构化元数据徽章)
 struct KnowledgeSearchTestView: View {
     @Bindable var viewModel: KnowledgeViewModel
     var onClose: () -> Void
@@ -1638,17 +2182,13 @@ struct KnowledgeSearchTestView: View {
     @State private var searchTime: TimeInterval = 0
     @State private var isExactMatch: Bool = false
     @State private var selectedCategory: String = "全部"
-    
-    // 是否仅展示达标切片
     @State private var showQualifiedOnly: Bool = false
     
-    /// 当前生效的有效最低分值门槛
     private var minThreshold: Float {
         let userScore = ConfigManager.shared.app.generalConfig.ragScore
         return userScore < 0.1 ? 0.35 : userScore
     }
     
-    /// 诊断视图下的渲染列表（包含是否达标标记）
     private var diagnosticResults: [(index: Int, chunk: MicroVectorDB.VectorChunk, isQualified: Bool)] {
         let mapped = results.enumerated().map { index, chunk in
             let score = chunk.score ?? 0.0
@@ -1661,14 +2201,12 @@ struct KnowledgeSearchTestView: View {
         return mapped
     }
     
-    /// 达标切片数量统计
     private var qualifiedCount: Int {
         results.filter { ($0.score ?? 0.0) >= minThreshold }.count
     }
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶栏
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("向量检索测试与自适应诊断").font(.headline)
@@ -1683,7 +2221,6 @@ struct KnowledgeSearchTestView: View {
             
             Divider()
             
-            // 搜索输入与控制项
             VStack(spacing: 12) {
                 HStack(spacing: 12) {
                     TextField("输入需要测试的关键词或自然语言问题...", text: $query)
@@ -1705,7 +2242,6 @@ struct KnowledgeSearchTestView: View {
                         .font(.system(size: 12, weight: isExactMatch ? .semibold : .regular))
                         .foregroundColor(isExactMatch ? .blue : .secondary)
                     
-                    // 仅看达标切片
                     Toggle("仅看达标切片 (≥ \(String(format: "%.3f", minThreshold)))", isOn: $showQualifiedOnly)
                         .toggleStyle(.checkbox)
                         .font(.system(size: 12, weight: showQualifiedOnly ? .semibold : .regular))
@@ -1728,7 +2264,6 @@ struct KnowledgeSearchTestView: View {
             }
             .padding()
             
-            // 检索结果展示
             List {
                 if isSearching {
                     HStack { Spacer(); ProgressView("正在执行多通道自适应混合检索与精排...").padding(); Spacer() }
@@ -1757,7 +2292,6 @@ struct KnowledgeSearchTestView: View {
                     let targetTopK = ConfigManager.shared.app.generalConfig.ragTopK
                     let qualifiedRate = results.isEmpty ? 0.0 : (Double(qualifiedCount) / Double(results.count)) * 100.0
                     
-                    // 仪表盘 Header
                     Section(header: HStack {
                         Text("📊 检索性能仪表盘")
                             .font(.system(size: 12, weight: .bold))
@@ -1773,7 +2307,6 @@ struct KnowledgeSearchTestView: View {
                             let score = chunk.score ?? 0.0
                             
                             VStack(alignment: .leading, spacing: 8) {
-                                // 头部指标行
                                 HStack(alignment: .top) {
                                     Text("#\(index + 1)")
                                         .font(.system(size: 11, weight: .bold))
@@ -1788,7 +2321,6 @@ struct KnowledgeSearchTestView: View {
                                                 .font(.system(size: 12, weight: .bold))
                                                 .foregroundColor(isQualified ? scoreColor(score) : .secondary)
                                             
-                                            // 达标状态徽章
                                             if isQualified {
                                                 HStack(spacing: 3) {
                                                     Image(systemName: "checkmark.seal.fill").font(.system(size: 9))
@@ -1834,7 +2366,6 @@ struct KnowledgeSearchTestView: View {
                                     }
                                 }
                                 
-                                // 结构化元数据徽章
                                 if let meta = chunk.metadata {
                                     if !meta.positiveTags.isEmpty || !meta.negativeTags.isEmpty {
                                         ScrollView(.horizontal, showsIndicators: false) {
@@ -1868,7 +2399,6 @@ struct KnowledgeSearchTestView: View {
                                     }
                                 }
                                 
-                                // 正文
                                 Text(chunk.text)
                                     .font(.system(size: 13))
                                     .lineSpacing(4)
@@ -1877,7 +2407,6 @@ struct KnowledgeSearchTestView: View {
                                     .padding(.top, 2)
                             }
                             .padding(.vertical, 8)
-                            // 未达标切片施加轻微低饱和度降权视觉
                             .opacity(isQualified ? 1.0 : 0.65)
                         }
                     }
@@ -1928,7 +2457,6 @@ struct KnowledgeSearchTestView: View {
     }
 }
 
-// MARK: - 分类架构与机制指南面板
 struct CategoryManagerView: View {
     @Bindable var viewModel: KnowledgeViewModel
     var onClose: () -> Void
@@ -1944,9 +2472,10 @@ struct CategoryManagerView: View {
                 Text("分类架构与机制指南").font(.headline)
                 Spacer()
                 Button(action: onClose) { Image(systemName: "xmark.circle.fill").foregroundColor(.secondary) }.buttonStyle(.plain)
-            }.padding(); Divider()
+            }
+            .padding()
+            Divider()
             
-            // 创建新分类区
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 12) {
                     TextField("输入新分类名称...", text: $newCategoryName).textFieldStyle(.roundedBorder)
@@ -1975,34 +2504,62 @@ struct CategoryManagerView: View {
                 }
             }
             
-            Divider(); HStack { Spacer(); Button("完成", action: onClose).keyboardShortcut(.defaultAction) }.padding()
-        }.frame(width: 620, height: 600)
+            Divider()
+            HStack {
+                Spacer()
+                Button("完成", action: onClose).keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(width: 620, height: 600)
     }
     
     @ViewBuilder private func categoryRow(name: String, isDedicated: Bool) -> some View {
         HStack {
             if editingCategory == name {
                 TextField("名称", text: $editName).textFieldStyle(.roundedBorder)
-                Button("保存") { viewModel.renameCategory(oldName: name, newName: editName, isDedicated: isDedicated); editingCategory = nil }
+                Button("保存") {
+                    viewModel.renameCategory(oldName: name, newName: editName, isDedicated: isDedicated)
+                    editingCategory = nil
+                }
             } else {
                 Image(systemName: isDedicated ? "lock.doc.fill" : "folder.fill").foregroundStyle(isDedicated ? .purple.opacity(0.7) : .blue.opacity(0.7))
                 Text(name).font(.system(size: 13))
-                if isDedicated { Text("专用").font(.system(size: 9)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.purple.opacity(0.1)).foregroundStyle(.purple).cornerRadius(4) }
+                if isDedicated {
+                    Text("专用")
+                        .font(.system(size: 9))
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.1))
+                        .foregroundStyle(.purple)
+                        .cornerRadius(4)
+                }
                 
                 Spacer()
                 
                 if name != "默认" {
-                    Button("重命名") { editName = name; editingCategory = name }.buttonStyle(.plain).foregroundStyle(.blue)
-                    Button("删除") { viewModel.deleteCategory(name, isDedicated: isDedicated) }.buttonStyle(.plain).foregroundStyle(.red).padding(.leading, 8)
+                    Button("重命名") {
+                        editName = name
+                        editingCategory = name
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.blue)
+                    
+                    Button("删除") {
+                        viewModel.deleteCategory(name, isDedicated: isDedicated)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                    .padding(.leading, 8)
                 }
             }
-        }.padding(.vertical, 4)
+        }
+        .padding(.vertical, 4)
     }
 }
 
-// MARK: - 知识切片详情预览 (显化结构化元数据徽章)
 struct KnowledgeChunksPreviewView: View {
-    let knowledge: KnowledgeItem; var onClose: () -> Void
+    let knowledge: KnowledgeItem
+    var onClose: () -> Void
     @State private var chunks: [MicroVectorDB.VectorChunk] = []
     
     var body: some View {
@@ -2011,7 +2568,9 @@ struct KnowledgeChunksPreviewView: View {
                 Text("切片详情与结构化元数据预览").font(.headline)
                 Spacer()
                 Button(action: onClose) { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain)
-            }.padding(); Divider()
+            }
+            .padding()
+            Divider()
             
             List {
                 ForEach(Array(chunks.enumerated()), id: \.element.id) { index, chunk in
@@ -2025,7 +2584,6 @@ struct KnowledgeChunksPreviewView: View {
                             Text("字符数: \(chunk.text.count)").font(.caption).foregroundStyle(.secondary)
                         }
                         
-                        // 显化切片提取出的结构化元数据徽章
                         if let meta = chunk.metadata {
                             if !meta.positiveTags.isEmpty || !meta.negativeTags.isEmpty {
                                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2060,14 +2618,18 @@ struct KnowledgeChunksPreviewView: View {
                         }
                         
                         Text(chunk.text).font(.system(size: 13)).textSelection(.enabled)
-                    }.padding(.vertical, 8)
+                    }
+                    .padding(.vertical, 8)
                 }
             }
-        }.frame(width: 680, height: 560).onAppear { chunks = MicroVectorDB.shared.fetchChunks(for: knowledge.id) }
+        }
+        .frame(width: 680, height: 560)
+        .onAppear {
+            chunks = MicroVectorDB.shared.fetchChunks(for: knowledge.id)
+        }
     }
 }
 
-// 知识库编辑视图
 struct KnowledgeEditView: View {
     @State var knowledge: KnowledgeItem
     var categories: [String]
@@ -2170,64 +2732,9 @@ struct KnowledgeEditView: View {
     }
 }
 
-// MARK: - 检索测试独立窗口生命周期管理器
-@MainActor
-final class KnowledgeSearchWindowManager: NSObject, NSWindowDelegate {
-    static let shared = KnowledgeSearchWindowManager()
-    private var window: NSWindow?
-    
-    var isVisible: Bool { window != nil }
-    private override init() { super.init() }
-    
-    func show(viewModel: KnowledgeViewModel) {
-        if let existingWindow = window {
-            if existingWindow.isMiniaturized { existingWindow.deminiaturize(nil) }
-            existingWindow.makeKeyAndOrderFront(nil)
-            existingWindow.orderFrontRegardless()
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-        
-        let contentView = KnowledgeSearchTestView(viewModel: viewModel) { [weak self] in
-            self?.window?.close()
-        }
-        
-        let newWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 860, height: 700),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        newWindow.title = "知识库向量检索与自适应诊断"
-        newWindow.center()
-        newWindow.setFrameAutosaveName("LinTools_KnowledgeSearchTest_Window")
-        newWindow.isReleasedWhenClosed = false
-        newWindow.delegate = self
-        newWindow.isOpaque = false
-        //newWindow.backgroundColor = .clear
-        newWindow.hasShadow = true
-        newWindow.titlebarAppearsTransparent = true
-        newWindow.titleVisibility = .hidden
-        newWindow.contentView = NSHostingView(rootView: contentView)
-        
-        self.window = newWindow
-        newWindow.makeKeyAndOrderFront(nil)
-        newWindow.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
-        MainWindowManager.syncDockIconPolicy()
-    }
-    
-    func windowWillClose(_ notification: Notification) {
-        window = nil
-        MainWindowManager.syncDockIconPolicy()
-    }
-}
-
-// MARK: - 算法逻辑与切片机制深度解析 Popover
 struct RAGAlgorithmEngineGuidePopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // 头部
             HStack(spacing: 8) {
                 Image(systemName: "cpu.fill")
                     .foregroundColor(.cyan)
@@ -2240,7 +2747,6 @@ struct RAGAlgorithmEngineGuidePopover: View {
             
             Divider().opacity(0.5)
             
-            // 模块 1：双阶段检索与算分机制
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.triangle.merge")
@@ -2261,7 +2767,6 @@ struct RAGAlgorithmEngineGuidePopover: View {
                 .padding(.leading, 14)
             }
             
-            // 模块 2：切片架构说明
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 4) {
                     Image(systemName: "doc.badge.gearshape")
@@ -2304,457 +2809,6 @@ struct RAGAlgorithmEngineGuidePopover: View {
         .background(.regularMaterial)
     }
 }
-
-// MARK: - ==================== 5. 清洗引擎 ====================
-
-struct DataCleaner: Sendable {
-    nonisolated static func clean(_ rawText: String) -> String {
-        var text = rawText.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        text = text.replacing(pattern: "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]", with: "")
-        text = text.replacing(pattern: "(?m)^\\s*(?:page|页码|第)?\\s*-?\\s*\\d+\\s*(?:of\\s*\\d+|页)?\\s*-?\\s*$", with: "")
-        text = text.replacing(pattern: "<[^>]+>", with: " ")
-        text = text.replacing(pattern: "[ \\t]{2,}", with: " ")
-        text = text.replacing(pattern: "\\n{3,}", with: "\n\n")
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    nonisolated static func isValidChunk(_ chunk: String) -> Bool {
-        let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.count < 15 { return false }
-        let letters = trimmed.unicodeScalars.filter { CharacterSet.letters.contains($0) || CharacterSet.alphanumerics.contains($0) }
-        return (Double(letters.count) / Double(trimmed.count)) >= 0.3
-    }
-}
-
-fileprivate extension String {
-    nonisolated func replacing(pattern: String, with template: String) -> String {
-        do { let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive]); return regex.stringByReplacingMatches(in: self, options: [], range: NSRange(self.startIndex..., in: self), withTemplate: template) } catch { return self }
-    }
-}
-
-// MARK: - ==================== 6. 多语言代码专用切片逻辑 ====================
-
-public struct CodeKnowledgeExtractor {
-    
-    public static func buildCodeSummaryPrompt(extraction: String, fileName: String) -> String {
-        return """
-        请对代码文件【\(fileName)】进行宏观架构层面的技术摘要，直接输出以下 4 项要点：
-        1. 核心职责：一句话提炼本模块的设计目标与业务范畴。
-        2. 关键组件：列出 2-4 个核心类/接口/方法及其在架构中的职能。
-        3. 架构层级：标明所属技术层级（如 UI 视图层、业务逻辑层、数据持久层、网络通信层等）。
-        4. 外部依赖：列出交互的外部模块或系统组件。
-
-        [代码上下文]
-        \(extraction)
-        """
-    }
-    
-    public static func chunkCodeFile(fileURL: URL, projectName: String = "当前项目") throws -> [String] {
-        let content = try String(contentsOf: fileURL, encoding: .utf8)
-        let fileName = fileURL.lastPathComponent
-        let ext = fileURL.pathExtension.lowercased()
-        
-        var chunks: [String] = []
-        let pattern: String
-        let declarationPattern: String
-        
-        switch ext {
-        case "py":
-            pattern = #"(?m)^[ \t]*(?:class|def)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\S|\Z)"#
-            declarationPattern = #"(?:class|def)\s+([A-Za-z0-9_]+)"#
-        case "java", "c", "cpp", "h", "cs":
-            pattern = #"(?m)^[ \t]*(?:public\s+|private\s+|protected\s+)?(?:static\s+|virtual\s+)?(?:class|struct|interface|enum)\s+[^{]+\{([\s\S]*?^\})"#
-            declarationPattern = #"(?:class|struct|interface|enum)\s+([A-Za-z0-9_]+)"#
-        case "js", "ts":
-            pattern = #"(?m)^[ \t]*(?:export\s+|default\s+)?(?:class|function|const)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\n|\Z)"#
-            declarationPattern = #"(?:class|function|const)\s+([A-Za-z0-9_]+)"#
-        case "go":
-            pattern = #"(?m)^[ \t]*(?:func|type)\s+[A-Za-z0-9_]+[\s\S]*?(?=\n\n|\Z)"#
-            declarationPattern = #"(?:func|type)\s+([A-Za-z0-9_]+)"#
-        default:
-            pattern = #"(?m)^(?:\s*@\w+\s*)*(?:public\s+|private\s+|internal\s+|open\s+)?(?:final\s+)?(?:class|struct|enum|protocol|actor|extension)\s+[^{]+\{([\s\S]*?^\})"#
-            declarationPattern = #"(?:class|struct|enum|protocol|actor|extension)\s+([A-Za-z0-9_]+)"#
-        }
-        
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
-            let nsString = content as NSString
-            let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsString.length))
-            
-            for match in matches {
-                let codeBlock = nsString.substring(with: match.range)
-                var entityName = "Unknown"
-                if let declRegex = try? NSRegularExpression(pattern: declarationPattern),
-                   let declMatch = declRegex.firstMatch(in: codeBlock, range: NSRange(location: 0, length: (codeBlock as NSString).length)) {
-                    entityName = (codeBlock as NSString).substring(with: declMatch.range(at: 1))
-                }
-                
-                let enrichedChunk = """
-                [所属模块]: \(entityName)
-                ```\(ext)
-                \(codeBlock)
-                ```
-                """
-                chunks.append(enrichedChunk)
-            }
-        }
-        
-        if chunks.isEmpty {
-            return generateFallbackChunks(content: content, fileName: fileName, ext: ext)
-        }
-        
-        return chunks
-    }
-    
-    private static func generateFallbackChunks(content: String, fileName: String, ext: String) -> [String] {
-        var chunks: [String] = []
-        var currentIndex = content.startIndex
-        let chunkSize = 1000
-        
-        while currentIndex < content.endIndex {
-            let endIndex = content.index(currentIndex, offsetBy: chunkSize, limitedBy: content.endIndex) ?? content.endIndex
-            let chunkContent = String(content[currentIndex..<endIndex])
-            chunks.append(chunkContent)
-            currentIndex = endIndex
-        }
-        return chunks
-    }
-}
-
-// MARK: - ==================== 7. 智能分词与 NLTagger 语言学实体解析引擎 ====================
-
-public struct QueryAnalysis: Sendable {
-    public let rawTokens: [String]
-    public let anchorEntities: [String]    // 核心专名/名词锚点 (权重 1.0)
-    public let effectiveTokens: [String]   // 有效实词与 2-Gram 组合
-}
-
-public struct SmartTokenizer: Sendable {
-    
-    /// 提取词法分词与字符级 2~4 Gram 连续片段（彻底免除对人工停用词库与分词边界的依赖）
-    public static func tokenize(_ text: String) -> [String] {
-        let cleanText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanText.isEmpty else { return [] }
-        
-        var tokenSet: Set<String> = []
-        
-        // 1. Apple 原生 NLTokenizer 词法切分
-        let tokenizer = NLTokenizer(unit: .word)
-        tokenizer.string = cleanText
-        if let lang = NLLanguageRecognizer.dominantLanguage(for: cleanText) {
-            tokenizer.setLanguage(lang)
-        }
-        
-        let trimSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
-        var words: [String] = []
-        
-        tokenizer.enumerateTokens(in: cleanText.startIndex..<cleanText.endIndex) { range, _ in
-            let word = String(cleanText[range]).trimmingCharacters(in: trimSet)
-            if !word.isEmpty {
-                words.append(word)
-                tokenSet.insert(word)
-            }
-            return true
-        }
-        
-        // 2. 词级 2-Gram 拼接
-        if words.count >= 2 {
-            for i in 0..<(words.count - 1) {
-                tokenSet.insert(words[i] + words[i+1])
-            }
-        }
-        
-        // 3. 字符级多尺度滑动 N-Gram (2-Gram, 3-Gram, 4-Gram)
-        // 专为中文未登录专有名词（如 "利欧"、"京桥通"）设计的零词库连续特征提取
-        let chars = Array(cleanText.filter { !$0.isWhitespace && !$0.isPunctuation })
-        let charCount = chars.count
-        
-        if charCount >= 2 {
-            for n in 2...min(4, charCount) {
-                for i in 0...(charCount - n) {
-                    let gram = String(chars[i..<(i + n)])
-                    tokenSet.insert(gram)
-                }
-            }
-        }
-        
-        // 保留整句特征
-        tokenSet.insert(cleanText)
-        
-        return Array(tokenSet)
-    }
-}
-
-// MARK: - 鲁棒性精排引擎
-public actor NativeReranker: Sendable {
-    public static let shared = NativeReranker()
-    private init() {}
-    
-    func rerank(
-        query: String,
-        chunks: [MicroVectorDB.VectorChunk],
-        topK: Int,
-        idfMap: [String: Float] = [:]
-    ) async -> [MicroVectorDB.VectorChunk] {
-        guard !chunks.isEmpty else { return [] }
-        
-        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let queryTokens = SmartTokenizer.tokenize(cleanQuery)
-        
-        // 提取有效核心词（>=2 字符且在库内有频次）
-        let meaningfulTokens = queryTokens.filter { $0.count >= 2 && (idfMap[$0] ?? 0) > 0 }
-        let coreTokens = meaningfulTokens.isEmpty ? queryTokens.filter { $0.count >= 2 } : meaningfulTokens
-        
-        let totalQueryIDF = coreTokens.reduce(0.0) { $0 + (idfMap[$1] ?? 1.0) }
-        let sortedTokensByIDF = coreTokens.sorted { (idfMap[$0] ?? 0) > (idfMap[$1] ?? 0) }
-        let topAnchorToken = sortedTokensByIDF.first
-        let topAnchorIDF = topAnchorToken != nil ? (idfMap[topAnchorToken!] ?? 0.0) : 0.0
-        
-        let qVec = await MicroVectorDB.shared.generateEmbedding(for: cleanQuery)
-        
-        var rerankedChunks = await withTaskGroup(of: MicroVectorDB.VectorChunk.self) { group in
-            for chunk in chunks {
-                group.addTask {
-                    var modifiedChunk = chunk
-                    
-                    let rerankScore = self.computeSentenceLevelScore(
-                        chunkText: chunk.text,
-                        chunkEmbedding: chunk.embedding,
-                        queryVector: qVec
-                    )
-                    
-                    let chunkTextLower = chunk.text.lowercased()
-                    let meta = chunk.metadata
-                    
-                    // 1. 标题与所属模块全字面匹配加分
-                    var exactTitleBonus: Float = 0.0
-                    if let headers = meta?.headingPath, headers.contains(where: { $0.localizedCaseInsensitiveContains(cleanQuery) }) {
-                        exactTitleBonus = 0.35
-                    } else if chunkTextLower.contains(cleanQuery.lowercased()) {
-                        exactTitleBonus = 0.20
-                    }
-                    
-                    // 2. 动态计算核心信息覆盖率
-                    var hitIDF: Float = 0.0
-                    for token in coreTokens {
-                        if chunkTextLower.contains(token) ||
-                           (meta?.positiveTags.contains(where: { $0.lowercased().contains(token) }) ?? false) ||
-                           (meta?.headingPath.contains(where: { $0.lowercased().contains(token) }) ?? false) {
-                            hitIDF += idfMap[token] ?? 1.0
-                        }
-                    }
-                    
-                    let coverageRatio = totalQueryIDF > 0 ? (hitIDF / totalQueryIDF) : 0.0
-                    var coverageBonus: Float = 0.0
-                    if coverageRatio >= 0.4 {
-                        coverageBonus = 0.15 * coverageRatio
-                    }
-                    
-                    // 3. 标签提权与实体硬门禁
-                    var tagMultiplier: Float = 1.0
-                    var negativePenalty: Float = 0.0
-                    
-                    let hasTopAnchor = topAnchorToken != nil && (
-                        chunkTextLower.contains(topAnchorToken!) ||
-                        (meta?.positiveTags.contains(where: { $0.lowercased().contains(topAnchorToken!) }) ?? false) ||
-                        (meta?.headingPath.contains(where: { $0.lowercased().contains(topAnchorToken!) }) ?? false)
-                    )
-                    
-                    if topAnchorIDF > 1.0 && !hasTopAnchor && exactTitleBonus == 0.0 {
-                        negativePenalty -= 0.55
-                    } else if coreTokens.count >= 2 && coverageRatio < 0.20 && exactTitleBonus == 0.0 {
-                        negativePenalty -= 0.40
-                    }
-                    
-                    if let meta = meta {
-                        // a) 负向 Tags 一票否决
-                        if !meta.negativeTags.isEmpty {
-                            let matchedNeg = coreTokens.filter { qt in
-                                meta.negativeTags.contains(where: { $0.lowercased().contains(qt) })
-                            }
-                            if !matchedNeg.isEmpty {
-                                negativePenalty -= 10.0
-                            }
-                        }
-                        
-                        // b) 正向 Tags 阶梯加权 (完全保留)
-                        if !meta.positiveTags.isEmpty {
-                            let matchedTags = coreTokens.filter { qt in
-                                meta.positiveTags.contains(where: { $0.lowercased().contains(qt) || qt.contains($0.lowercased()) })
-                            }
-                            
-                            let isExactTagMatch = meta.positiveTags.contains(where: { tag in
-                                let cleanTag = tag.lowercased().trimmingCharacters(in: .whitespaces)
-                                let cleanQ = cleanQuery.lowercased()
-                                if cleanQ.contains(cleanTag) || cleanTag.contains(cleanQ) { return true }
-                                guard cleanTag.count >= 3 else { return false }
-                                let tagChars = Array(cleanTag)
-                                for token in coreTokens where token.count >= 3 {
-                                    let matchedCount = tagChars.filter { token.contains($0) }.count
-                                    if Float(matchedCount) / Float(tagChars.count) >= 0.80 { return true }
-                                }
-                                let globalMatched = tagChars.filter { cleanQ.contains($0) }.count
-                                return Float(globalMatched) / Float(tagChars.count) >= 0.85
-                            })
-                            
-                            if isExactTagMatch {
-                                tagMultiplier = 5.0
-                            } else if !matchedTags.isEmpty {
-                                let coverage = Float(matchedTags.count) / Float(max(1, coreTokens.count))
-                                tagMultiplier = 1.5 + (coverage * 2.5)
-                            } else {
-                                tagMultiplier = 0.3
-                            }
-                        }
-                    }
-                    
-                    let originalScore = chunk.score ?? 0
-                    let normalizedRRF = min(originalScore * 15.0, 1.0)
-                    
-                    var enhancedCos = max(0.0, (rerankScore - 0.45) * 2.0)
-                    if topAnchorIDF > 1.0 && !hasTopAnchor && exactTitleBonus == 0.0 {
-                        enhancedCos *= 0.15
-                    }
-                    
-                    let baseScore = (normalizedRRF * 0.30) + (enhancedCos * 0.70) + exactTitleBonus + coverageBonus
-                    let finalMultiplier = baseScore > 0.05 ? tagMultiplier : 1.0
-                    
-                    let rawFinal = max(0.0, min(1.0, (baseScore * finalMultiplier) + negativePenalty))
-                    modifiedChunk.score = rawFinal
-                    modifiedChunk.debugInfo = String(format: "Raw:%.2f (Base:%.2f x%.1f Cov:%.0f%%) | Pen:%.2f", rawFinal, baseScore, finalMultiplier, coverageRatio * 100, negativePenalty)
-                    
-                    return modifiedChunk
-                }
-            }
-            
-            var results: [MicroVectorDB.VectorChunk] = []
-            for await sc in group { results.append(sc) }
-            return results
-        }
-        
-        rerankedChunks = rerankedChunks.filter { ($0.score ?? 0) > 0 }
-        rerankedChunks.sort { ($0.score ?? 0) > ($1.score ?? 0) }
-        
-        return Array(rerankedChunks.prefix(topK))
-    }
-    
-    nonisolated private func computeSentenceLevelScore(chunkText: String, chunkEmbedding: [Float], queryVector: [Float]) -> Float {
-        let chunkCos = computeCosine(a: queryVector, b: chunkEmbedding)
-        var maxSentenceSimilarity: Float = chunkCos
-        
-        let tokenizer = NLTokenizer(unit: .sentence)
-        tokenizer.string = chunkText
-        
-        let embeddingHelper = NLEmbedding.sentenceEmbedding(for: .simplifiedChinese)
-            ?? NLEmbedding.wordEmbedding(for: .simplifiedChinese)
-            ?? NLEmbedding.sentenceEmbedding(for: .english)
-            ?? NLEmbedding.wordEmbedding(for: .english)
-            
-        guard let embeddingHelper = embeddingHelper else {
-            return maxSentenceSimilarity
-        }
-        
-        tokenizer.enumerateTokens(in: chunkText.startIndex..<chunkText.endIndex) { range, _ in
-            let sentence = String(chunkText[range]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if sentence.count > 3 {
-                var sVec: [Float] = []
-                if let rawVec = embeddingHelper.vector(for: sentence) {
-                    sVec = rawVec.map { Float($0) }
-                } else {
-                    let words = SmartTokenizer.tokenize(sentence)
-                    var combined = [Double](repeating: 0, count: queryVector.count)
-                    var count = 0
-                    for w in words {
-                        if let wv = embeddingHelper.vector(for: w) {
-                            for i in 0..<min(queryVector.count, wv.count) { combined[i] += wv[i] }
-                            count += 1
-                        }
-                    }
-                    if count > 0 {
-                        sVec = combined.map { Float($0 / Double(count)) }
-                    }
-                }
-                
-                if !sVec.isEmpty && sVec.count == queryVector.count {
-                    let sim = computeCosine(a: queryVector, b: sVec)
-                    if sim > maxSentenceSimilarity {
-                        maxSentenceSimilarity = sim
-                    }
-                }
-            }
-            return true
-        }
-        
-        return maxSentenceSimilarity
-    }
-    
-    nonisolated private func computeCosine(a: [Float], b: [Float]) -> Float {
-        guard a.count == b.count && !a.isEmpty else { return 0 }
-        let n = vDSP_Length(a.count)
-        var dotProduct: Float = 0
-        vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
-        var aNorm: Float = 0; vDSP_svesq(a, 1, &aNorm, n)
-        var bNorm: Float = 0; vDSP_svesq(b, 1, &bNorm, n)
-        let denominator = sqrt(aNorm) * sqrt(bNorm)
-        return denominator == 0 ? 0 : dotProduct / denominator
-    }
-}
-
-// MARK: - RAG 统一解析引擎 (支持提取 tags 与 prohibited)
-struct RAGXMLParser {
-    struct HitItem: Hashable, Identifiable {
-        let id = UUID()
-        let title: String
-        let score: Float
-        let tags: [String]
-        let prohibited: [String]
-        let snippet: String
-        let rawContent: String
-    }
-    
-    static func extractHits(from xmlString: String) -> [HitItem] {
-        var results: [HitItem] = []
-        let pattern = "(?s)<knowledge_chunk([^>]*)>\\s*<!\\[CDATA\\[(.*?)\\]\\]>"
-        
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
-        let matches = regex.matches(in: xmlString, range: NSRange(xmlString.startIndex..., in: xmlString))
-        
-        for match in matches {
-            if let attrRange = Range(match.range(at: 1), in: xmlString),
-               let contentRange = Range(match.range(at: 2), in: xmlString) {
-                
-                let attrString = String(xmlString[attrRange])
-                let rawContent = String(xmlString[contentRange])
-                
-                let title = extractAttr(named: "source_title", from: attrString) ?? "未知文档"
-                let scoreStr = extractAttr(named: "rrf_score", from: attrString) ?? "0.0"
-                let score = Float(scoreStr) ?? 0.0
-                
-                let tagsStr = extractAttr(named: "tags", from: attrString) ?? ""
-                let tags = tagsStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                
-                let prohStr = extractAttr(named: "prohibited", from: attrString) ?? ""
-                let prohibited = prohStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                
-                let validLines = rawContent.components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty && !$0.hasPrefix("```") }
-                
-                let firstLine = validLines.first ?? "无可用文本摘要"
-                results.append(HitItem(title: title, score: score, tags: tags, prohibited: prohibited, snippet: firstLine, rawContent: rawContent))
-            }
-        }
-        return results
-    }
-    
-    private static func extractAttr(named: String, from text: String) -> String? {
-        let pattern = "\(named)=\"([^\"]+)\""
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-              let range = Range(match.range(at: 1), in: text) else { return nil }
-        return String(text[range])
-    }
-}
-
-// MARK: - Docling 安装向导与状态检测 Popover (macOS 14+ 视觉体验)
 
 struct DoclingInstallGuidePopover: View {
     @Binding var isInstalled: Bool
@@ -2863,4 +2917,3 @@ struct DoclingInstallGuidePopover: View {
         .background(.regularMaterial)
     }
 }
-

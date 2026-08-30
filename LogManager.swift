@@ -1,18 +1,24 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：LogManager.swift
-// 文件说明：适用于 macOS 14+ 的全局独立时间轴日志面板 (V6 会话卡片与树状降维性能版)
-// 核心架构：
-// 1. 会话级聚合容器 (Session Grouping)：每次对话独立生成顶级卡片，新对话自动折叠历史会话。
-// 2. 状态与指标可视化：顶部卡片集成状态圆点、推演耗时统计、Token 实时汇总与 Agent 徽标。
-// 3. 树状一维降维引擎：继承 UInt64 Bitmask 导引线算法，O(0) 内存分配绘制多层缩进。
-// 4. 便捷折叠总控：工具栏提供「全部折叠 / 全部展开」与「快速清理」快捷控制。
+// 文件说明：适用于 macOS 14+ 的全局独立时间轴日志面板 (V8.5 严格保序与大模型语义化排版版)
+//
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. LogModels             : 会话门类、日志级别、执行状态与不可变一维节点快照 (Sendable)
+// ├── 2. LogPayloadFormatter   : 大模型请求/响应载荷 (Gemini/OpenAI/XML/JSON) 深度解构与格式化引擎
+// ├── 3. LogEngine (Actor)     : 100% 脱离主线程的独立后台日志计算引擎 (严格 FIFO 串行通道/Token级联)
+// ├── 4. LogExportBridge       : 纯文本结构化导出与剪贴板桥接器
+// ├── 5. LogManager (Facade)   : 面向前台 UI 绑定的响应式调度门面 (@Observable @MainActor)
+// ├── 6. LogWindowManager      : 原生独立的日志监控窗口生命周期控制器 (NSWindowDelegate)
+// ├── 7. FastLogTextView       : 禁用昂贵文本系统的轻量级 NSTextView 包装器
+// └── 8. LogUI Components      : 时间轴主面板、三模载荷查看器与分级树状分支视图
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
 import AppKit
 import Combine
+import Foundation
 
-// MARK: - 1. 数据模型与枚举
+// MARK: - ==================== 1. LogModels (数据模型与不可变快照) ====================
 
 enum SessionCategory: String, Codable, Sendable {
     case agent = "Agent 智能体"
@@ -78,31 +84,8 @@ enum SessionState: String, Codable, Sendable {
     }
 }
 
-// 一维化扁平视图结构，切断 SwiftUI 深层递归追踪
-struct FlatLogNode: Identifiable, Equatable {
-    var id: UUID { node.id }
-    let node: LogNode
-    let depth: Int
-    let isLast: Bool
-    let ancestorMask: UInt64 // 位运算掩码：用于 O(1) 计算深层缩进的参考线
-    
-    static func == (lhs: FlatLogNode, rhs: FlatLogNode) -> Bool {
-        lhs.node.id == rhs.node.id &&
-        lhs.depth == rhs.depth &&
-        lhs.isLast == rhs.isLast &&
-        lhs.ancestorMask == rhs.ancestorMask &&
-        lhs.node.isExpanded == rhs.node.isExpanded &&
-        lhs.node.sessionState == rhs.node.sessionState &&
-        lhs.node.totalTokens == rhs.node.totalTokens &&
-        lhs.node.duration == rhs.node.duration
-    }
-}
-
-@MainActor
-@Observable
-class LogNode: Identifiable, Equatable {
-    static func == (lhs: LogNode, rhs: LogNode) -> Bool { lhs.id == rhs.id }
-    
+/// 后台内存树内部维护节点实体 (运行于 LogEngine Actor 内部)
+final class InternalLogNode: @unchecked Sendable {
     let id: UUID
     let timestamp: Date
     var level: LogLevel
@@ -110,9 +93,8 @@ class LogNode: Identifiable, Equatable {
     var detail: String?
     var isExpanded: Bool
     
-    // 会话级元数据
     var isSessionRoot: Bool = false
-    var sessionCategory: SessionCategory = .agent // [Added]
+    var sessionCategory: SessionCategory = .agent
     var sessionState: SessionState = .executing
     var agentName: String?
     var startTime: Date?
@@ -122,9 +104,8 @@ class LogNode: Identifiable, Equatable {
     let function: String
     let line: Int
     
-    var children: [LogNode] = []
-    
-    @ObservationIgnored weak var parent: LogNode?
+    var children: [InternalLogNode] = []
+    weak var parent: InternalLogNode?
     
     var tokens: Int = 0
     var totalTokens: Int = 0
@@ -165,62 +146,305 @@ class LogNode: Identifiable, Equatable {
         }
     }
     
-    func updateSelfTokens(_ newTokens: Int) {
+    func updateSelfTokens(_ newTokens: Int, onTotalDelta: (Int) -> Void) {
         let delta = newTokens - self.tokens
         self.tokens = newTokens
-        self.addTokens(delta)
+        self.addTokens(delta, onTotalDelta: onTotalDelta)
     }
     
-    func addTokens(_ delta: Int) {
+    func addTokens(_ delta: Int, onTotalDelta: (Int) -> Void) {
         if delta == 0 { return }
         self.totalTokens += delta
-        self.parent?.addTokens(delta)
-        LogManager.shared.sessionTotalTokens += delta
+        onTotalDelta(delta)
+        self.parent?.addTokens(delta, onTotalDelta: { _ in })
     }
 }
 
-// MARK: - 2. 全局日志管理器 (业务层调用入口)
+/// 纯不可变、线程安全的视图渲染扁平快照 (100% Sendable)
+struct FlatLogNode: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let timestamp: Date
+    let level: LogLevel
+    let title: String
+    let detail: String?
+    let isExpanded: Bool
+    let isSessionRoot: Bool
+    let sessionCategory: SessionCategory
+    let sessionState: SessionState
+    let agentName: String?
+    let duration: TimeInterval?
+    let fileName: String
+    let line: Int
+    let tokens: Int
+    let totalTokens: Int
+    let depth: Int
+    let isLast: Bool
+    let ancestorMask: UInt64
+    let hasChildren: Bool
+    
+    static func == (lhs: FlatLogNode, rhs: FlatLogNode) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.depth == rhs.depth &&
+        lhs.isLast == rhs.isLast &&
+        lhs.ancestorMask == rhs.ancestorMask &&
+        lhs.isExpanded == rhs.isExpanded &&
+        lhs.sessionState == rhs.sessionState &&
+        lhs.totalTokens == rhs.totalTokens &&
+        lhs.duration == rhs.duration &&
+        lhs.detail == rhs.detail
+    }
+}
 
-@MainActor
-class LogManager: NSObject, NSWindowDelegate, ObservableObject {
-    static let shared = LogManager()
+// MARK: - ==================== 2. LogPayloadFormatter (深度语义化解构引擎) ====================
+
+struct LogPayloadFormatter: Sendable {
     
-    @Published var rootLogs: [LogNode] = []
-    @Published var flatLogs: [FlatLogNode] = []
+    /// 语义化解构与排版（支持 Gemini / OpenAI / Claude / 通用 JSON）
+    static func formatSemantic(rawText: String) -> String {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        
+        // 提取 JSON 载荷主体与前置文本（例如 "【发起网络请求】:\n{...}"）
+        let (prefix, jsonObject) = extractJSON(from: trimmed)
+        guard let jsonObject = jsonObject else {
+            return unescapeString(rawText)
+        }
+        
+        // 若为字典对象，尝试执行专有 LLM 语义排版
+        if let dict = jsonObject as? [String: Any] {
+            if let semanticLLM = formatLLMRequestDict(dict) {
+                return (prefix.isEmpty ? "" : "\(prefix)\n\n") + semanticLLM
+            }
+        }
+        
+        // 通用 JSON 深度美化并还原内嵌换行
+        if let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted, .withoutEscapingSlashes]),
+           let prettyStr = String(data: prettyData, encoding: .utf8) {
+            return (prefix.isEmpty ? "" : "\(prefix)\n\n") + unescapeString(prettyStr)
+        }
+        
+        return rawText
+    }
     
-    @Published var lastAddedLogID: UUID? = nil
-    @Published var sessionTotalTokens: Int = 0
+    /// 标准美化 JSON（保留完整键值对缩进）
+    static func formatJSON(rawText: String) -> String {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        
+        let (prefix, jsonObject) = extractJSON(from: trimmed)
+        guard let jsonObject = jsonObject else { return rawText }
+        
+        if let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted, .withoutEscapingSlashes]),
+           let prettyStr = String(data: prettyData, encoding: .utf8) {
+            return (prefix.isEmpty ? "" : "\(prefix)\n\n") + prettyStr
+        }
+        return rawText
+    }
     
-    private var nodeMap: [UUID: LogNode] = [:]
-    private let maxLogCount = 400
+    // MARK: - 私有解析辅助
     
-    @Published var activeContextID: UUID? = nil
+    private static func extractJSON(from text: String) -> (prefix: String, object: Any?) {
+        guard let firstBrace = text.firstIndex(of: "{"),
+              let lastBrace = text.lastIndex(of: "}") else {
+            if let firstBracket = text.firstIndex(of: "["),
+               let lastBracket = text.lastIndex(of: "]") {
+                let prefix = String(text[..<firstBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let sub = String(text[firstBracket...lastBracket])
+                let obj = sub.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0, options: []) }
+                return (prefix, obj)
+            }
+            return ("", nil)
+        }
+        
+        let prefix = String(text[..<firstBrace]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let jsonSub = String(text[firstBrace...lastBrace])
+        let obj = jsonSub.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0, options: []) }
+        return (prefix, obj)
+    }
     
-    private var logWindow: NSWindow?
-    var isVisible: Bool { return logWindow != nil }
+    private static func formatLLMRequestDict(_ dict: [String: Any]) -> String? {
+        var sections: [String] = []
+        
+        // 1. 系统指令解构 (System Instruction)
+        if let sysInst = dict["systemInstruction"] as? [String: Any],
+           let parts = sysInst["parts"] as? [[String: Any]] {
+            var sysText = ""
+            for p in parts {
+                if let t = p["text"] as? String { sysText += t }
+            }
+            if !sysText.isEmpty {
+                sections.append("╔════════════════════════════════════════════════════════════════╗\n║ 👑 SYSTEM INSTRUCTION (系统提示词指令)                          ║\n╚════════════════════════════════════════════════════════════════╝\n\(sysText.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        } else if let sys = dict["system"] as? String, !sys.isEmpty {
+            sections.append("╔════════════════════════════════════════════════════════════════╗\n║ 👑 SYSTEM INSTRUCTION (系统提示词指令)                          ║\n╚════════════════════════════════════════════════════════════════╝\n\(sys.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        
+        // 2. 工具声明解构 (Tools & Functions)
+        if let tools = dict["tools"] as? [[String: Any]], !tools.isEmpty {
+            var toolLines: [String] = ["╔════════════════════════════════════════════════════════════════╗\n║ 🛠 TOOLS & FUNCTION DEFINITIONS (可用工具函数声明)              ║\n╚════════════════════════════════════════════════════════════════╝"]
+            for tool in tools {
+                if let declarations = tool["functionDeclarations"] as? [[String: Any]] {
+                    for decl in declarations {
+                        let name = decl["name"] as? String ?? "未命名函数"
+                        let desc = decl["description"] as? String ?? "无描述"
+                        toolLines.append("● [工具: \(name)]\n  描述: \(desc)")
+                        if let params = decl["parameters"] as? [String: Any],
+                           let props = params["properties"] as? [String: [String: Any]] {
+                            let required = (params["required"] as? [String]) ?? []
+                            for (pName, pDict) in props {
+                                let pDesc = pDict["description"] as? String ?? ""
+                                let pType = pDict["type"] as? String ?? "string"
+                                let reqTag = required.contains(pName) ? " [必需]" : " [可选]"
+                                toolLines.append("    └─ 参数 \(pName) (\(pType))\(reqTag): \(pDesc)")
+                            }
+                        }
+                    }
+                }
+            }
+            if toolLines.count > 1 {
+                sections.append(toolLines.joined(separator: "\n\n"))
+            }
+        }
+        
+        // 3. 多轮对话流解构 (Gemini contents / OpenAI messages)
+        if let contents = dict["contents"] as? [[String: Any]], !contents.isEmpty {
+            var msgBlock = "╔════════════════════════════════════════════════════════════════╗\n║ 💬 CONVERSATION TURNS (多轮会话交互流 - 共 \(contents.count) 轮)                  ║\n╚════════════════════════════════════════════════════════════════╝"
+            
+            for (idx, turn) in contents.enumerated() {
+                let role = (turn["role"] as? String)?.uppercased() ?? "USER"
+                let roleIcon = (role == "USER") ? "👤" : (role == "MODEL" || role == "ASSISTANT") ? "🤖" : "⚙️"
+                
+                var turnPartsText: [String] = []
+                if let parts = turn["parts"] as? [[String: Any]] {
+                    for part in parts {
+                        if let text = part["text"] as? String, !text.isEmpty {
+                            turnPartsText.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                        }
+                        
+                        // 提取函数调用 (Tool Call)
+                        if let call = part["functionCall"] as? [String: Any] {
+                            let callName = call["name"] as? String ?? "unknown"
+                            var argsStr = "{}"
+                            if let args = call["args"] as? [String: Any],
+                               let argsData = try? JSONSerialization.data(withJSONObject: args, options: [.prettyPrinted, .withoutEscapingSlashes]),
+                               let s = String(data: argsData, encoding: .utf8) {
+                                argsStr = s
+                            }
+                            turnPartsText.append("⚡️ [下发动作 Tool Call: \(callName)]:\n\(argsStr)")
+                        }
+                        
+                        // 提取函数响应 (Tool Response & RAG 知识切片)
+                        if let resp = part["functionResponse"] as? [String: Any] {
+                            let respName = resp["name"] as? String ?? "unknown"
+                            var resBody = ""
+                            if let responseObj = resp["response"] as? [String: Any] {
+                                if let resultStr = responseObj["result"] as? String {
+                                    resBody = resultStr.trimmingCharacters(in: .whitespacesAndNewlines)
+                                } else if let rData = try? JSONSerialization.data(withJSONObject: responseObj, options: [.prettyPrinted, .withoutEscapingSlashes]),
+                                          let s = String(data: rData, encoding: .utf8) {
+                                    resBody = s
+                                }
+                            }
+                            turnPartsText.append("📦 [动作反馈 Tool Response: \(respName)]:\n\(resBody)")
+                        }
+                    }
+                }
+                
+                let joinedParts = turnPartsText.joined(separator: "\n\n")
+                msgBlock += "\n\n┌── [Turn \(idx + 1)] \(roleIcon) \(role)\n\(joinedParts.indentLines(spaces: 2))\n└──"
+            }
+            sections.append(msgBlock)
+        } else if let messages = dict["messages"] as? [[String: Any]], !messages.isEmpty {
+            var msgBlock = "╔════════════════════════════════════════════════════════════════╗\n║ 💬 CONVERSATION TURNS (多轮会话交互流 - 共 \(messages.count) 轮)                  ║\n╚════════════════════════════════════════════════════════════════╝"
+            
+            for (idx, msg) in messages.enumerated() {
+                let role = (msg["role"] as? String)?.uppercased() ?? "USER"
+                let roleIcon = (role == "USER") ? "👤" : (role == "ASSISTANT") ? "🤖" : (role == "SYSTEM") ? "👑" : "⚙️"
+                let content = (msg["content"] as? String) ?? ""
+                
+                msgBlock += "\n\n┌── [Turn \(idx + 1)] \(roleIcon) \(role)\n\(content.trimmingCharacters(in: .whitespacesAndNewlines).indentLines(spaces: 2))\n└──"
+            }
+            sections.append(msgBlock)
+        }
+        
+        guard !sections.isEmpty else { return nil }
+        return sections.joined(separator: "\n\n")
+    }
     
-    private var rebuildTask: Task<Void, Never>?
+    private static func unescapeString(_ str: String) -> String {
+        return str
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\t", with: "  ")
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\/", with: "/")
+    }
+}
+
+private extension String {
+    func indentLines(spaces: Int) -> String {
+        let indent = String(repeating: " ", count: spaces)
+        return self.components(separatedBy: "\n").map { "\(indent)\($0)" }.joined(separator: "\n")
+    }
+}
+
+// MARK: - ==================== 3. LogEngine (后台严格 FIFO 串行日志引擎) ====================
+
+fileprivate enum LogAction: Sendable {
+    case startSession(id: UUID, query: String, agentName: String, category: SessionCategory, file: String, function: String, line: Int)
+    case endSession(sessionID: UUID, isSuccess: Bool, detail: String?)
+    case setContext(id: UUID?)
+    case log(id: UUID, level: LogLevel, title: String, detail: String?, parentID: UUID?, expandDefault: Bool, file: String, function: String, line: Int)
+    case updateTokens(nodeID: UUID, tokens: Int)
+    case updateDetail(nodeID: UUID, detail: String)
+    case appendDetail(nodeID: UUID, textDelta: String)
+    case toggleExpand(nodeID: UUID)
+    case expandAll
+    case collapseAll
+    case clearLogs
+    case forceSync
+}
+
+actor LogEngine {
+    static let shared = LogEngine()
     
-    private override init() { super.init() }
+    private var rootLogs: [InternalLogNode] = []
+    private var nodeMap: [UUID: InternalLogNode] = [:]
+    private var sessionTotalTokens: Int = 0
+    private var activeContextID: UUID? = nil
     
-    /// 开启单次独立会话分组（自动折叠历史旧会话）
-    @discardableResult
-    nonisolated func startSession(
-        query: String,
-        agentName: String,
-        category: SessionCategory = .agent,
-        file: String = #file,
-        function: String = #function,
-        line: Int = #line
-    ) -> UUID {
-        let sessionID = UUID()
-        Task { @MainActor in
-            for root in self.rootLogs where root.isSessionRoot {
+    private let maxLogCount = 500
+    private var isSyncScheduled = false
+    private var pendingLastAddedID: UUID? = nil
+    
+    // 不可变 Sendable 常量 continuation：保证 nonisolated 绝对安全读取与 FIFO 入队
+    private let continuation: AsyncStream<LogAction>.Continuation
+    
+    private init() {
+        let (stream, cont) = AsyncStream.makeStream(of: LogAction.self)
+        self.continuation = cont
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            for await action in stream {
+                guard let self = self else { break }
+                await self.processAction(action)
+            }
+        }
+    }
+    
+    fileprivate nonisolated func enqueue(_ action: LogAction) {
+        continuation.yield(action)
+    }
+    
+    // MARK: - 串行执行核心
+    
+    private func processAction(_ action: LogAction) {
+        switch action {
+        case .startSession(let id, let query, let agentName, let category, let file, let function, let line):
+            for root in rootLogs where root.isSessionRoot {
                 root.isExpanded = false
             }
-            
-            let sessionNode = LogNode(
-                id: sessionID,
+            let sessionNode = InternalLogNode(
+                id: id,
                 timestamp: Date(),
                 level: .info,
                 title: query.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -233,223 +457,206 @@ class LogManager: NSObject, NSWindowDelegate, ObservableObject {
                 function: function,
                 line: line
             )
+            nodeMap[id] = sessionNode
+            rootLogs.append(sessionNode)
             
-            self.nodeMap[sessionID] = sessionNode
-            self.rootLogs.append(sessionNode)
-            
-            while self.rootLogs.count > self.maxLogCount {
-                let removed = self.rootLogs.removeFirst()
-                self.removeNodeFromMap(removed)
+            while rootLogs.count > maxLogCount {
+                let removed = rootLogs.removeFirst()
+                removeNodeFromMap(removed)
             }
+            activeContextID = id
+            scheduleThrottledSync(lastAddedID: id)
             
-            self.activeContextID = sessionID
-            self.lastAddedLogID = sessionID
-            self.rebuildFlatData()
-        }
-        return sessionID
-    }
-    
-    /// 结束会话并固化状态与总耗时
-    nonisolated func endSession(sessionID: UUID, isSuccess: Bool = true, detail: String? = nil) {
-        Task { @MainActor in
-            guard let sessionNode = self.nodeMap[sessionID] else { return }
+        case .endSession(let sessionID, let isSuccess, let detail):
+            guard let sessionNode = nodeMap[sessionID] else { return }
             if let start = sessionNode.startTime {
                 sessionNode.duration = Date().timeIntervalSince(start)
             }
             sessionNode.sessionState = isSuccess ? .completed : .failed
             sessionNode.level = isSuccess ? .success : .error
-            
             if let d = detail, !d.isEmpty {
                 sessionNode.detail = d
                 sessionNode.detailLineCount = max(1, d.filter { $0 == "\n" }.count + 1)
             }
-            
-            if self.activeContextID == sessionID {
-                self.activeContextID = nil
+            if activeContextID == sessionID {
+                activeContextID = nil
             }
-            self.rebuildFlatData()
-        }
-    }
-    
-    // MARK: - 🚀 V6 扁平化重建引擎
-    
-    func setNeedsRebuildFlatData() {
-        rebuildTask?.cancel()
-        rebuildTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms 节流窗口
-            guard !Task.isCancelled else { return }
-            self.rebuildFlatData()
-        }
-    }
-    
-    func rebuildFlatData() {
-        var result: [FlatLogNode] = []
-        result.reserveCapacity(self.flatLogs.count + 50)
-        
-        func traverse(_ nodes: [LogNode], depth: Int, ancestorMask: UInt64) {
-            for (index, node) in nodes.enumerated() {
-                let isLast = index == nodes.count - 1
-                result.append(FlatLogNode(node: node, depth: depth, isLast: isLast, ancestorMask: ancestorMask))
-                
-                if node.isExpanded && !node.children.isEmpty {
-                    var nextMask = ancestorMask
-                    if isLast && depth < 63 { nextMask |= (1 << depth) }
-                    traverse(node.children, depth: depth + 1, ancestorMask: nextMask)
+            scheduleThrottledSync(lastAddedID: sessionID)
+            
+        case .setContext(let id):
+            self.activeContextID = id
+            
+        case .log(let id, let level, let title, let detail, let parentID, let expandDefault, let file, let function, let line):
+            let node = InternalLogNode(
+                id: id,
+                timestamp: Date(),
+                level: level,
+                title: title,
+                detail: detail,
+                isExpanded: expandDefault,
+                file: file,
+                function: function,
+                line: line
+            )
+            nodeMap[id] = node
+            
+            // 严格上下文归属判定：显式父节点 > 当前活跃上下文 > 最新顶级会话
+            let effectiveParentID = parentID ?? self.activeContextID ?? rootLogs.last(where: { $0.isSessionRoot })?.id
+            
+            if let pid = effectiveParentID, let parentNode = nodeMap[pid] {
+                node.parent = parentNode
+                parentNode.children.append(node)
+                parentNode.addTokens(node.totalTokens, onTotalDelta: { self.sessionTotalTokens += $0 })
+                if level == .error { parentNode.isExpanded = true }
+            } else {
+                rootLogs.append(node)
+                while rootLogs.count > maxLogCount {
+                    let removedNode = rootLogs.removeFirst()
+                    removeNodeFromMap(removedNode)
                 }
             }
-        }
-        traverse(self.rootLogs, depth: 0, ancestorMask: 0)
-        self.flatLogs = result
-    }
-    
-    func toggleExpand(for nodeID: UUID) {
-        if let node = nodeMap[nodeID] {
-            node.isExpanded.toggle()
-            rebuildFlatData()
-        }
-    }
-    
-    func expandAll() {
-        for node in nodeMap.values { node.isExpanded = true }
-        rebuildFlatData()
-    }
-    
-    func collapseAll() {
-        for node in nodeMap.values { node.isExpanded = false }
-        rebuildFlatData()
-    }
-    
-    // MARK: - 常规调用入口
-    
-    func show() {
-        if let existingWindow = logWindow, existingWindow.isVisible {
-            existingWindow.makeKeyAndOrderFront(nil)
-            return
-        }
-        
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 820, height: 560),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Agent 核心执行树"
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: LogPanelWindow())
-        window.makeKeyAndOrderFront(nil)
-        window.delegate = self
-        self.logWindow = window
-        
-        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        MainWindowManager.syncDockIconPolicy()
-    }
-    
-    func windowWillClose(_ notification: Notification) {
-        logWindow = nil
-        MainWindowManager.syncDockIconPolicy()
-    }
-    
-    nonisolated func setContext(_ id: UUID?) {
-        Task { @MainActor in self.activeContextID = id }
-    }
-    
-    @discardableResult
-    nonisolated func startGroup(
-        title: String, detail: String? = nil, level: LogLevel = .info, parentID: UUID? = nil,
-        expandDefault: Bool = false, file: String = #file, function: String = #function, line: Int = #line
-    ) -> UUID {
-        return log(level: level, title: title, detail: detail, parentID: parentID, expandDefault: expandDefault, file: file, function: function, line: line)
-    }
-    
-    nonisolated func updateTokens(nodeID: UUID, tokens: Int) {
-        Task { @MainActor in if let node = self.nodeMap[nodeID] { node.updateSelfTokens(tokens) } }
-    }
-    
-    nonisolated func updateLogDetail(nodeID: UUID, detail: String) {
-        Task { @MainActor in
-            if let node = self.nodeMap[nodeID] {
+            scheduleThrottledSync(lastAddedID: id)
+            
+        case .updateTokens(let nodeID, let tokens):
+            if let node = nodeMap[nodeID] {
+                node.updateSelfTokens(tokens, onTotalDelta: { self.sessionTotalTokens += $0 })
+                scheduleThrottledSync()
+            }
+            
+        case .updateDetail(let nodeID, let detail):
+            if let node = nodeMap[nodeID] {
                 node.detail = detail
                 node.detailLineCount = max(1, detail.filter { $0 == "\n" }.count + 1)
+                scheduleThrottledSync()
             }
-        }
-    }
-    
-    nonisolated func appendLogDetail(nodeID: UUID, textDelta: String) {
-        guard !textDelta.isEmpty else { return }
-        Task { @MainActor in
-            if let node = self.nodeMap[nodeID] {
+            
+        case .appendDetail(let nodeID, let textDelta):
+            guard !textDelta.isEmpty else { return }
+            if let node = nodeMap[nodeID] {
                 if node.detail == nil { node.detail = "" }
                 node.detail! += textDelta
                 node.detailLineCount += textDelta.filter { $0 == "\n" }.count
+                scheduleThrottledSync()
             }
+            
+        case .toggleExpand(let nodeID):
+            if let node = nodeMap[nodeID] {
+                node.isExpanded.toggle()
+                scheduleThrottledSync(force: true)
+            }
+            
+        case .expandAll:
+            for node in nodeMap.values { node.isExpanded = true }
+            scheduleThrottledSync(force: true)
+            
+        case .collapseAll:
+            for node in nodeMap.values { node.isExpanded = false }
+            scheduleThrottledSync(force: true)
+            
+        case .clearLogs:
+            rootLogs.removeAll()
+            nodeMap.removeAll()
+            sessionTotalTokens = 0
+            activeContextID = nil
+            scheduleThrottledSync(force: true)
+            
+        case .forceSync:
+            scheduleThrottledSync(force: true)
         }
     }
     
-    @discardableResult
-    nonisolated func log(
-        level: LogLevel = .info, title: String, detail: String? = nil, parentID: UUID? = nil,
-        expandDefault: Bool = false, file: String = #file, function: String = #function, line: Int = #line
-    ) -> UUID {
-        let newID = UUID()
-        Task { @MainActor in
-            let node = LogNode(id: newID, timestamp: Date(), level: level, title: title, detail: detail, isExpanded: expandDefault, file: file, function: function, line: line)
-            self.nodeMap[newID] = node
-            
-            let effectiveParentID = parentID ?? self.activeContextID
-            
-            if let pid = effectiveParentID, let parentNode = self.nodeMap[pid] {
-                node.parent = parentNode
-                parentNode.children.append(node)
-                parentNode.addTokens(node.totalTokens)
-                
-                if level == .error { parentNode.isExpanded = true }
-                self.setNeedsRebuildFlatData()
-            } else {
-                self.rootLogs.append(node)
-                while self.rootLogs.count > self.maxLogCount {
-                    let removedNode = self.rootLogs.removeFirst()
-                    self.removeNodeFromMap(removedNode)
-                }
-                self.setNeedsRebuildFlatData()
-            }
-            self.lastAddedLogID = newID
-        }
-        return newID
+    func exportLogs() -> String {
+        return LogExportBridge.formatLogs(rootLogs: rootLogs)
     }
     
-    private func removeNodeFromMap(_ node: LogNode) {
+    private func removeNodeFromMap(_ node: InternalLogNode) {
         nodeMap.removeValue(forKey: node.id)
         for child in node.children { removeNodeFromMap(child) }
     }
     
-    nonisolated func info(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-        log(level: .info, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
-    }
-    nonisolated func success(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-        log(level: .success, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
-    }
-    nonisolated func warning(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-        log(level: .warning, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
-    }
-    nonisolated func error(_ title: String, detail: String? = nil, parentID: UUID? = nil, expand: Bool = true, file: String = #file, function: String = #function, line: Int = #line) {
-        log(level: .error, title: title, detail: detail, parentID: parentID, expandDefault: expand, file: file, function: function, line: line)
+    // MARK: - 扁平快照合批渲染
+    
+    private func scheduleThrottledSync(lastAddedID: UUID? = nil, force: Bool = false) {
+        if let id = lastAddedID { pendingLastAddedID = id }
+        guard !isSyncScheduled || force else { return }
+        isSyncScheduled = true
+        
+        Task {
+            if !force {
+                try? await Task.sleep(nanoseconds: 35_000_000) // 35ms 平滑帧率
+            }
+            self.isSyncScheduled = false
+            
+            let snapshot = self.buildFlatSnapshot()
+            let totalTokens = self.sessionTotalTokens
+            let lastID = self.pendingLastAddedID
+            self.pendingLastAddedID = nil
+            
+            await LogManager.shared.applyBackgroundSnapshot(
+                flatLogs: snapshot,
+                sessionTotalTokens: totalTokens,
+                lastAddedID: lastID
+            )
+        }
     }
     
-    func clearLogs() {
-        self.rootLogs.removeAll()
-        self.flatLogs.removeAll()
-        self.nodeMap.removeAll()
-        self.sessionTotalTokens = 0
+    private func buildFlatSnapshot() -> [FlatLogNode] {
+        var result: [FlatLogNode] = []
+        result.reserveCapacity(nodeMap.count + 20)
+        
+        func traverse(_ nodes: [InternalLogNode], depth: Int, ancestorMask: UInt64) {
+            for (index, node) in nodes.enumerated() {
+                let isLast = index == nodes.count - 1
+                
+                let flat = FlatLogNode(
+                    id: node.id,
+                    timestamp: node.timestamp,
+                    level: node.level,
+                    title: node.title,
+                    detail: node.detail,
+                    isExpanded: node.isExpanded,
+                    isSessionRoot: node.isSessionRoot,
+                    sessionCategory: node.sessionCategory,
+                    sessionState: node.sessionState,
+                    agentName: node.agentName,
+                    duration: node.duration,
+                    fileName: node.fileName,
+                    line: node.line,
+                    tokens: node.tokens,
+                    totalTokens: node.totalTokens,
+                    depth: depth,
+                    isLast: isLast,
+                    ancestorMask: ancestorMask,
+                    hasChildren: !node.children.isEmpty
+                )
+                result.append(flat)
+                
+                if node.isExpanded && !node.children.isEmpty {
+                    var nextMask = ancestorMask
+                    if !isLast && depth < 63 {
+                        nextMask |= (1 << depth)
+                    }
+                    traverse(node.children, depth: depth + 1, ancestorMask: nextMask)
+                }
+            }
+        }
+        traverse(rootLogs, depth: 0, ancestorMask: 0)
+        return result
     }
-    
-    func exportLogs() -> String {
+}
+
+// MARK: - ==================== 4. LogExportBridge (纯文本导出桥接器) ====================
+
+struct LogExportBridge: Sendable {
+    static func formatLogs(rootLogs: [InternalLogNode]) -> String {
         var lines: [String] = []
-        for node in rootLogs { lines.append(contentsOf: formatNodeForExport(node, indentLevel: 0)) }
+        for node in rootLogs {
+            lines.append(contentsOf: formatNodeForExport(node, indentLevel: 0))
+        }
         return lines.joined(separator: "\n")
     }
     
-    private func formatNodeForExport(_ node: LogNode, indentLevel: Int) -> [String] {
+    private static func formatNodeForExport(_ node: InternalLogNode, indentLevel: Int) -> [String] {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
         let indent = String(repeating: "  ", count: indentLevel)
@@ -468,14 +675,293 @@ class LogManager: NSObject, NSWindowDelegate, ObservableObject {
     }
 }
 
-// MARK: - 3. UI 视图渲染 (时间轴面板)
+// MARK: - ==================== 5. LogManager (前台门面与状态分发) ====================
 
+@MainActor
+class LogManager: NSObject, ObservableObject {
+    static let shared = LogManager()
+    
+    @Published var flatLogs: [FlatLogNode] = []
+    @Published var lastAddedLogID: UUID? = nil
+    @Published var sessionTotalTokens: Int = 0
+    @Published var activeContextID: UUID? = nil
+    
+    private override init() {
+        super.init()
+    }
+    
+    // MARK: - 核心业务调用入口 (完全零阻塞 + 严格 FIFO 顺序入队)
+    
+    @discardableResult
+    nonisolated func startSession(
+        query: String,
+        agentName: String,
+        category: SessionCategory = .agent,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) -> UUID {
+        let sessionID = UUID()
+        LogEngine.shared.enqueue(.startSession(
+            id: sessionID,
+            query: query,
+            agentName: agentName,
+            category: category,
+            file: file,
+            function: function,
+            line: line
+        ))
+        Task { @MainActor in self.activeContextID = sessionID }
+        return sessionID
+    }
+    
+    nonisolated func endSession(sessionID: UUID, isSuccess: Bool = true, detail: String? = nil) {
+        LogEngine.shared.enqueue(.endSession(sessionID: sessionID, isSuccess: isSuccess, detail: detail))
+        Task { @MainActor in
+            if self.activeContextID == sessionID { self.activeContextID = nil }
+        }
+    }
+    
+    nonisolated func setContext(_ id: UUID?) {
+        LogEngine.shared.enqueue(.setContext(id: id))
+        Task { @MainActor in self.activeContextID = id }
+    }
+    
+    @discardableResult
+    nonisolated func startGroup(
+        title: String,
+        detail: String? = nil,
+        level: LogLevel = .info,
+        parentID: UUID? = nil,
+        expandDefault: Bool = false,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) -> UUID {
+        return log(level: level, title: title, detail: detail, parentID: parentID, expandDefault: expandDefault, file: file, function: function, line: line)
+    }
+    
+    nonisolated func updateTokens(nodeID: UUID, tokens: Int) {
+        LogEngine.shared.enqueue(.updateTokens(nodeID: nodeID, tokens: tokens))
+    }
+    
+    nonisolated func updateLogDetail(nodeID: UUID, detail: String) {
+        LogEngine.shared.enqueue(.updateDetail(nodeID: nodeID, detail: detail))
+    }
+    
+    nonisolated func appendLogDetail(nodeID: UUID, textDelta: String) {
+        guard !textDelta.isEmpty else { return }
+        LogEngine.shared.enqueue(.appendDetail(nodeID: nodeID, textDelta: textDelta))
+    }
+    
+    @discardableResult
+    nonisolated func log(
+        level: LogLevel = .info,
+        title: String,
+        detail: String? = nil,
+        parentID: UUID? = nil,
+        expandDefault: Bool = false,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) -> UUID {
+        let newID = UUID()
+        LogEngine.shared.enqueue(.log(
+            id: newID,
+            level: level,
+            title: title,
+            detail: detail,
+            parentID: parentID,
+            expandDefault: expandDefault,
+            file: file,
+            function: function,
+            line: line
+        ))
+        return newID
+    }
+    
+    nonisolated func info(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+        log(level: .info, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
+    }
+    
+    nonisolated func success(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+        log(level: .success, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
+    }
+    
+    nonisolated func warning(_ title: String, detail: String? = nil, parentID: UUID? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+        log(level: .warning, title: title, detail: detail, parentID: parentID, file: file, function: function, line: line)
+    }
+    
+    nonisolated func error(_ title: String, detail: String? = nil, parentID: UUID? = nil, expand: Bool = true, file: String = #file, function: String = #function, line: Int = #line) {
+        log(level: .error, title: title, detail: detail, parentID: parentID, expandDefault: expand, file: file, function: function, line: line)
+    }
+    
+    // MARK: - UI 控制
+    
+    func toggleExpand(for nodeID: UUID) {
+        LogEngine.shared.enqueue(.toggleExpand(nodeID: nodeID))
+    }
+    
+    func expandAll() {
+        LogEngine.shared.enqueue(.expandAll)
+    }
+    
+    func collapseAll() {
+        LogEngine.shared.enqueue(.collapseAll)
+    }
+    
+    func clearLogs() {
+        self.flatLogs.removeAll()
+        self.sessionTotalTokens = 0
+        LogEngine.shared.enqueue(.clearLogs)
+    }
+    
+    func refreshLogs() {
+        LogEngine.shared.enqueue(.forceSync)
+    }
+    
+    func exportLogs() async -> String {
+        return await LogEngine.shared.exportLogs()
+    }
+    
+    func show() {
+        LogWindowManager.shared.show()
+    }
+    
+    func applyBackgroundSnapshot(flatLogs: [FlatLogNode], sessionTotalTokens: Int, lastAddedID: UUID?) {
+        self.flatLogs = flatLogs
+        self.sessionTotalTokens = sessionTotalTokens
+        if let newID = lastAddedID {
+            self.lastAddedLogID = newID
+        }
+    }
+}
+
+// MARK: - ==================== 6. LogWindowManager (窗口生命周期控制器) ====================
+
+@MainActor
+final class LogWindowManager: NSObject, NSWindowDelegate {
+    static let shared = LogWindowManager()
+    private var window: NSWindow?
+    
+    var isVisible: Bool {
+        guard let w = window else { return false }
+        return w.isVisible && !w.isMiniaturized
+    }
+    
+    private override init() {
+        super.init()
+    }
+    
+    func show() {
+        if let existingWindow = window {
+            if existingWindow.isMiniaturized { existingWindow.deminiaturize(nil) }
+            existingWindow.makeKeyAndOrderFront(nil)
+            existingWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            LogManager.shared.refreshLogs()
+            return
+        }
+        
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        newWindow.title = "Agent 核心执行树"
+        newWindow.center()
+        newWindow.isReleasedWhenClosed = false
+        newWindow.contentView = NSHostingView(rootView: LogPanelWindow())
+        newWindow.makeKeyAndOrderFront(nil)
+        newWindow.delegate = self
+        self.window = newWindow
+        
+        NSApp.activate(ignoringOtherApps: true)
+        MainWindowManager.syncDockIconPolicy()
+        LogManager.shared.refreshLogs()
+    }
+    
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+        MainWindowManager.syncDockIconPolicy()
+    }
+}
+
+// MARK: - ==================== 7. FastLogTextView (轻量滚动文本视图) ====================
+
+struct FastLogTextView: NSViewRepresentable {
+    var text: String
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textColor = NSColor.labelColor.withAlphaComponent(0.88)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        
+        if let textContainer = textView.textContainer {
+            textContainer.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+            textContainer.widthTracksTextView = true
+        }
+        
+        textView.layoutManager?.allowsNonContiguousLayout = true
+        scrollView.documentView = textView
+        return scrollView
+    }
+    
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let tv = nsView.documentView as? NSTextView else { return }
+        
+        if text.count > tv.string.count && text.hasPrefix(tv.string) {
+            let newPart = String(text.dropFirst(tv.string.count))
+            let attrStr = NSAttributedString(string: newPart, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.labelColor.withAlphaComponent(0.88)
+            ])
+            tv.textStorage?.append(attrStr)
+            tv.scrollToEndOfDocument(nil)
+        } else if tv.string != text {
+            tv.string = text
+        }
+    }
+}
+
+// MARK: - ==================== 8. LogUI Components (时间轴与面板视图) ====================
+
+enum LogDetailDisplayMode: String, CaseIterable, Identifiable {
+    case semantic = "排版"
+    case json = "JSON"
+    case raw = "原始"
+    
+    var id: String { self.rawValue }
+}
+
+@MainActor
 struct LogPanelWindow: View {
-    @StateObject private var manager = LogManager.shared
+    @ObservedObject private var manager = LogManager.shared
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部精致工具栏
             HStack(spacing: 12) {
                 HStack(spacing: 6) {
                     Image(systemName: "network").foregroundColor(.blue).font(.system(size: 14, weight: .bold))
@@ -484,7 +970,6 @@ struct LogPanelWindow: View {
                 
                 Spacer()
                 
-                // 折叠总控快捷胶囊
                 HStack(spacing: 2) {
                     Button(action: { manager.collapseAll() }) {
                         HStack(spacing: 3) {
@@ -523,10 +1008,13 @@ struct LogPanelWindow: View {
                 }
                 
                 Button(action: {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(manager.exportLogs(), forType: .string)
-                    Util.message("树状日志已全量复制")
+                    Task {
+                        let text = await manager.exportLogs()
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.setString(text, forType: .string)
+                        Util.message("树状日志已全量复制")
+                    }
                 }) {
                     Image(systemName: "doc.on.clipboard").font(.system(size: 12))
                 }
@@ -552,7 +1040,9 @@ struct LogPanelWindow: View {
                             VStack(spacing: 12) {
                                 Image(systemName: "tray").font(.system(size: 32)).foregroundColor(.secondary.opacity(0.4))
                                 Text("等待会话推演执行...").font(.system(size: 13)).foregroundColor(.secondary)
-                            }.frame(maxWidth: .infinity, alignment: .center).padding(.top, 120)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.top, 120)
                         } else {
                             ForEach(flatData) { item in
                                 LogTreeView(item: item)
@@ -569,32 +1059,31 @@ struct LogPanelWindow: View {
                 }
             }
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minWidth: 760, minHeight: 520)
+        .onAppear {
+            manager.refreshLogs()
+        }
     }
 }
 
-// MARK: - 4. 树状一维渲染节点组件 (含顶级会话卡片)
-
 struct LogTreeView: View {
     let item: FlatLogNode
-    var node: LogNode { item.node }
     
     @State private var isHovered: Bool = false
-    @State private var formattedDetail: String? = nil
+    @State private var displayMode: LogDetailDisplayMode = .semantic
+    @State private var semanticDetail: String? = nil
+    @State private var jsonDetail: String? = nil
     
     var body: some View {
-        if node.isSessionRoot {
-            // 🌟 顶级会话卡片呈现
+        if item.isSessionRoot {
             sessionCardView
                 .padding(.top, 8)
-                .padding(.bottom, node.isExpanded ? 4 : 8)
+                .padding(.bottom, item.isExpanded ? 4 : 8)
         } else {
-            // 递归子步骤呈现
             standardNodeRowView
         }
     }
     
-    // MARK: - 顶级会话卡片视图
     @ViewBuilder
     var sessionCardView: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -610,20 +1099,21 @@ struct LogTreeView: View {
             .background(Color.primary.opacity(isHovered ? 0.06 : 0.03))
             .contentShape(Rectangle())
             .onTapGesture {
-                LogManager.shared.toggleExpand(for: node.id)
-                if node.isExpanded && formattedDetail == nil { formatLogDetailAsync() }
+                LogManager.shared.toggleExpand(for: item.id)
             }
             .onHover { h in isHovered = h }
             
-            // 展开会话卡片时，呈现最终交付的 Markdown 回复全文
-            if node.isExpanded && node.detail != nil {
-                let textToDisplay = formattedDetail ?? node.detail ?? ""
-                VStack(alignment: .leading, spacing: 4) {
+            if item.isExpanded && item.detail != nil {
+                VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("📝 最终交付正文")
                             .font(.system(size: 9.5, weight: .bold))
                             .foregroundColor(.secondary)
+                        
                         Spacer()
+                        
+                        displayModePicker
+                        
                         Button(action: copyDetailToClipboard) {
                             Image(systemName: "doc.on.clipboard").font(.system(size: 9.5))
                         }
@@ -631,7 +1121,7 @@ struct LogTreeView: View {
                     }
                     .padding(.horizontal, 8).padding(.top, 6)
                     
-                    FastLogTextView(text: textToDisplay)
+                    FastLogTextView(text: currentTextToDisplay)
                         .frame(height: 220)
                         .padding(.horizontal, 4).padding(.bottom, 6)
                 }
@@ -644,56 +1134,56 @@ struct LogTreeView: View {
         .background(.ultraThinMaterial)
         .cornerRadius(8)
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+        .task(id: item.detail) {
+            parsePayloadAsync()
+        }
     }
     
     private var chevronIndicator: some View {
         Image(systemName: "chevron.right")
             .font(.system(size: 10, weight: .bold))
             .foregroundColor(.secondary)
-            .rotationEffect(.degrees(node.isExpanded ? 90 : 0))
-            .animation(.spring(response: 0.25, dampingFraction: 0.75), value: node.isExpanded)
+            .rotationEffect(.degrees(item.isExpanded ? 90 : 0))
+            .animation(.spring(response: 0.25, dampingFraction: 0.75), value: item.isExpanded)
             .frame(width: 14)
     }
     
     private var stateBadgeView: some View {
         HStack(spacing: 5) {
             Circle()
-                .fill(node.sessionState.themeColor)
+                .fill(item.sessionState.themeColor)
                 .frame(width: 7, height: 7)
-            Text(node.sessionState.rawValue)
+            Text(item.sessionState.rawValue)
                 .font(.system(size: 9.5, weight: .bold))
-                .foregroundColor(node.sessionState.themeColor)
+                .foregroundColor(item.sessionState.themeColor)
         }
         .padding(.horizontal, 5)
         .padding(.vertical, 2)
-        .background(node.sessionState.themeColor.opacity(0.12))
+        .background(item.sessionState.themeColor.opacity(0.12))
         .cornerRadius(4)
     }
     
     @ViewBuilder
     var sessionTitleView: some View {
-        // 1. 类型标签 (智能体 / 单次LLM / 记忆提炼)
         HStack(spacing: 4) {
-            Image(systemName: node.sessionCategory.icon)
+            Image(systemName: item.sessionCategory.icon)
                 .font(.system(size: 8.5))
-            Text(node.sessionCategory.rawValue)
+            Text(item.sessionCategory.rawValue)
                 .font(.system(size: 9.5, weight: .bold))
         }
-        .foregroundColor(node.sessionCategory.color)
+        .foregroundColor(item.sessionCategory.color)
         .padding(.horizontal, 5)
         .padding(.vertical, 2)
-        .background(node.sessionCategory.color.opacity(0.12))
+        .background(item.sessionCategory.color.opacity(0.12))
         .cornerRadius(4)
         
-        // 2. 角色名标签
-        if let aName = node.agentName, !aName.isEmpty {
+        if let aName = item.agentName, !aName.isEmpty {
             Text("[\(aName)]")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundColor(.primary.opacity(0.85))
         }
         
-        // 3. 用户输入标题
-        Text(node.title)
+        Text(item.title)
             .font(.system(size: 13, weight: .bold))
             .foregroundColor(.primary)
             .lineLimit(1)
@@ -701,14 +1191,14 @@ struct LogTreeView: View {
     
     @ViewBuilder
     private var sessionMetricsView: some View {
-        if let dur = node.duration {
+        if let dur = item.duration {
             Text(String(format: "%.1fs", dur))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.secondary)
         }
         
-        if node.totalTokens > 0 {
-            Text("\(node.totalTokens) T")
+        if item.totalTokens > 0 {
+            Text("\(item.totalTokens) T")
                 .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                 .foregroundColor(.cyan)
                 .padding(.horizontal, 4)
@@ -717,20 +1207,18 @@ struct LogTreeView: View {
                 .cornerRadius(4)
         }
         
-        Text(timeString(from: node.timestamp))
+        Text(timeString(from: item.timestamp))
             .font(.system(size: 10, design: .monospaced))
             .foregroundColor(.secondary)
     }
     
-    // MARK: - 标准子步骤行
     @ViewBuilder
     private var standardNodeRowView: some View {
         HStack(alignment: .top, spacing: 0) {
-            // 1. O(0) 位运算绘制深层连接参考线
             ForEach(0..<item.depth, id: \.self) { d in
-                let isAncestorLast = (item.ancestorMask & (1 << d)) != 0
+                let hasGuideLine = (item.ancestorMask & (1 << d)) != 0
                 ZStack(alignment: .leading) {
-                    if !isAncestorLast {
+                    if hasGuideLine {
                         Rectangle()
                             .fill(Color(NSColor.separatorColor).opacity(0.45))
                             .frame(width: 1.5)
@@ -740,14 +1228,13 @@ struct LogTreeView: View {
                 }.frame(width: 28)
             }
             
-            // 2. 节点圆点与分支线
             VStack(spacing: 0) {
                 ZStack {
-                    Circle().fill(node.level.color.opacity(0.18)).frame(width: 16, height: 16)
-                    Image(systemName: node.level.icon).foregroundColor(node.level.color).font(.system(size: 8.5))
+                    Circle().fill(item.level.color.opacity(0.18)).frame(width: 16, height: 16)
+                    Image(systemName: item.level.icon).foregroundColor(item.level.color).font(.system(size: 8.5))
                 }.padding(.top, 4)
                 
-                if !item.isLast || (node.isExpanded && !node.children.isEmpty) {
+                if !item.isLast || (item.isExpanded && item.hasChildren) {
                     Rectangle()
                         .fill(Color(NSColor.separatorColor).opacity(0.45))
                         .frame(width: 1.5)
@@ -758,24 +1245,23 @@ struct LogTreeView: View {
             
             Spacer().frame(width: 10)
             
-            // 3. 核心日志文本区
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .center, spacing: 6) {
-                    if !node.children.isEmpty || node.detail != nil {
+                    if item.hasChildren || item.detail != nil {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 9, weight: .bold))
                             .foregroundStyle(.secondary)
-                            .rotationEffect(.degrees(node.isExpanded ? 90 : 0))
-                            .animation(.spring(response: 0.25, dampingFraction: 0.75), value: node.isExpanded)
+                            .rotationEffect(.degrees(item.isExpanded ? 90 : 0))
+                            .animation(.spring(response: 0.25, dampingFraction: 0.75), value: item.isExpanded)
                             .frame(width: 10)
                     } else { Spacer().frame(width: 10) }
                     
-                    Text(timeString(from: node.timestamp))
+                    Text(timeString(from: item.timestamp))
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundColor(.secondary)
                     
-                    if node.totalTokens > 0 {
-                        Text("\(node.totalTokens) T")
+                    if item.totalTokens > 0 {
+                        Text("\(item.totalTokens) T")
                             .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                             .foregroundColor(.cyan)
                             .padding(.horizontal, 3.5).padding(.vertical, 0.5)
@@ -783,7 +1269,7 @@ struct LogTreeView: View {
                             .cornerRadius(3)
                     }
                     
-                    Text(node.title)
+                    Text(item.title)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.primary)
                         .lineLimit(1)
@@ -791,28 +1277,30 @@ struct LogTreeView: View {
                     Spacer(minLength: 8)
                     
                     HStack(spacing: 6) {
-                        Button(action: copyDetailToClipboard) {
-                            Image(systemName: "doc.on.clipboard").font(.system(size: 10)).foregroundColor(.secondary)
+                        if item.detail != nil {
+                            displayModePicker
+                            
+                            Button(action: copyDetailToClipboard) {
+                                Image(systemName: "doc.on.clipboard").font(.system(size: 10)).foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .opacity(isHovered ? 1.0 : 0.6)
                         }
-                        .buttonStyle(.plain)
-                        .opacity((isHovered && node.detail != nil) ? 1.0 : 0.0)
                         
-                        Text("\(node.fileName):\(node.line)")
+                        Text("\(item.fileName):\(item.line)")
                             .font(.system(size: 8.5, design: .monospaced))
                             .foregroundColor(.secondary.opacity(0.7))
                     }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    LogManager.shared.toggleExpand(for: node.id)
-                    if node.isExpanded && formattedDetail == nil { formatLogDetailAsync() }
+                    LogManager.shared.toggleExpand(for: item.id)
                 }
                 
-                if node.isExpanded && node.detail != nil {
-                    let textToDisplay = formattedDetail ?? node.detail ?? ""
-                    FastLogTextView(text: textToDisplay)
-                        .frame(height: 160)
-                        .background(Color(NSColor.textBackgroundColor).opacity(0.2))
+                if item.isExpanded && item.detail != nil {
+                    FastLogTextView(text: currentTextToDisplay)
+                        .frame(height: 180)
+                        .background(Color.clear)
                         .cornerRadius(5)
                         .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color(NSColor.separatorColor).opacity(0.25), lineWidth: 0.8))
                 }
@@ -820,7 +1308,41 @@ struct LogTreeView: View {
             .padding(.bottom, 6)
         }
         .onHover { hovering in isHovered = hovering }
-        .onAppear { if node.isExpanded && formattedDetail == nil { formatLogDetailAsync() } }
+        .task(id: item.detail) {
+            parsePayloadAsync()
+        }
+    }
+    
+    @ViewBuilder
+    private var displayModePicker: some View {
+        HStack(spacing: 2) {
+            ForEach(LogDetailDisplayMode.allCases) { mode in
+                Button(action: { displayMode = mode }) {
+                    Text(mode.rawValue)
+                        .font(.system(size: 8.5, weight: displayMode == mode ? .bold : .regular))
+                        .foregroundColor(displayMode == mode ? .blue : .secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(displayMode == mode ? Color.blue.opacity(0.15) : Color.clear)
+                        .cornerRadius(3)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(1)
+        .background(Color.primary.opacity(0.04))
+        .cornerRadius(4)
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.primary.opacity(0.08), lineWidth: 0.8))
+    }
+    
+    private var currentTextToDisplay: String {
+        switch displayMode {
+        case .semantic:
+            return semanticDetail ?? item.detail ?? ""
+        case .json:
+            return jsonDetail ?? item.detail ?? ""
+        case .raw:
+            return item.detail ?? ""
+        }
     }
     
     private func timeString(from date: Date) -> String {
@@ -830,84 +1352,22 @@ struct LogTreeView: View {
     }
     
     private func copyDetailToClipboard() {
-        guard let text = formattedDetail ?? node.detail else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        let text = currentTextToDisplay
+        guard !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
     
-    private func formatLogDetailAsync() {
-        guard let rawText = node.detail else { return }
+    private func parsePayloadAsync() {
+        guard let rawText = item.detail, !rawText.isEmpty else { return }
         Task.detached(priority: .userInitiated) {
-            let clean = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if (clean.hasPrefix("{") && clean.hasSuffix("}")) || (clean.hasPrefix("[") && clean.hasSuffix("]")) {
-                if let d = clean.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: d, options: []),
-                   let pd = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .withoutEscapingSlashes]),
-                   let pStr = String(data: pd, encoding: .utf8) {
-                    await MainActor.run { self.formattedDetail = pStr }
-                }
+            let semantic = LogPayloadFormatter.formatSemantic(rawText: rawText)
+            let prettyJSON = LogPayloadFormatter.formatJSON(rawText: rawText)
+            await MainActor.run {
+                self.semanticDetail = semantic
+                self.jsonDetail = prettyJSON
             }
-        }
-    }
-}
-
-// MARK: - 5. 高性能滚动文本组件
-
-struct FastLogTextView: NSViewRepresentable {
-    var text: String
-    
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        textView.textColor = NSColor.labelColor.withAlphaComponent(0.85)
-        textView.textContainerInset = NSSize(width: 8, height: 8)
-        
-        // 禁用昂贵的文本辅助系统
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticSpellingCorrectionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        
-        // 约束单向弹性布局，宽度跟随父级，高度在内部滚动
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        
-        if let textContainer = textView.textContainer {
-            textContainer.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
-            textContainer.widthTracksTextView = true
-        }
-        
-        textView.layoutManager?.allowsNonContiguousLayout = true
-        scrollView.documentView = textView
-        
-        return scrollView
-    }
-    
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let tv = nsView.documentView as? NSTextView else { return }
-        
-        if text.count > tv.string.count && text.hasPrefix(tv.string) {
-            let newPart = String(text.dropFirst(tv.string.count))
-            let attrStr = NSAttributedString(string: newPart, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.labelColor.withAlphaComponent(0.85)
-            ])
-            tv.textStorage?.append(attrStr)
-            tv.scrollToEndOfDocument(nil)
-        } else if tv.string != text {
-            tv.string = text
         }
     }
 }

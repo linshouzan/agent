@@ -1,19 +1,22 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：AgentManager.swift
-// 文件说明：适用于 macOS 14+ 的 Agent 智能体编排与 AI 引擎配置中心 (Swift 6 Ready)
+// 文件说明：适用于 macOS 14+ 的 Agent 智能体编排、模型原生自主内省与 AI 引擎配置中心 (Swift 6 Ready)
 //
 // 核心架构与运行逻辑说明：
-// 1. 全局通用无头 Agent 调度中枢 (Headless Core Engine)：
-//    - 承载全系统的多轮自主推理 (Autonomy Loop)、工具并发执行 (TaskGroup)、
-//      动作指纹死循环熔断、HTTP 指数退避重试、Gemini 协议自愈与黑板状态机自推进。
-// 2. 阶段化心智装配架构 (Stage-based Mental Pipeline)：
-//    - STAGE 1 [蓝色] · 核心身份与引擎底座
-//    - STAGE 2 [橙色] · 认知中枢与系统指令
-//    - STAGE 3 [红色] · 自主推理与安全熔断
-//    - STAGE 4 [青色] · 知识图谱与私域记忆
-//    - STAGE 5 [紫色] · 武器库与协作矩阵
-// 3. Facade 外观门面：
-//    - `AgentViewModel` 作为统一管理门面，封装技能池与团队白皮书 (Team Manifest)。
+// 1. 模型原生自主内省与轻量名录架构 (Model-Native Autonomous Introspection):
+//    - 释放大模型原生深度思考 (Deep Thinking) 能力，通过动态生成 <available_skills_directory> 引导自主检索。
+//    - 默认装配静态核心元工具箱：read_skill_manual（支持渐进式多级文档查阅与沙盒安全防线）与 execute_skill（通用具身动态执行代理）。
+// 2. 长短任务兼顾机制 (Dual Lifecycle):
+//    - 短任务与简单问答采用自然语言直接交付；长任务则由外部工作区及领域专属规范流驱动。
+// 3. 抗脆弱性防御与物理真值核验 (Anti-fragile & Safeguards):
+//    - 内置周期震荡死循环熔断器 (Oscillating Loop Breaker)、多工具并发执行 (TaskGroup)、网络抖动指数退避自愈、参数类型动态 Coerce 与无头公证员对账机制。
+// 4. 正向逻辑规约设计 (Positive Framing):
+//    - 系统指引全面采用正向行为边界规范，确保语义纯净度并维持模型最佳执行状态。
+// 5. 阶段化装配工坊与 Facade 门面模式:
+//    - AgentViewModel 统一封装技能池、模型调度与团队协作白皮书 (Team Manifest)。
+//    - 拟物化 5 阶段卡片式流水线配置面板（身份 → 指令 → 推理 → 记忆 → 武器库）。
+// 6. 提示词缓存保护 (Prompt Cache Optimization):
+//    - 静态 System Prompt 保持 100% 不变，动态技能名录作为独立系统消息头部注入，最大化命中大模型底层 KV Cache。
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -21,7 +24,7 @@ import AppKit
 import Combine
 import Foundation
 
-// MARK: - ==================== 0. 全局通用无头 Agent 调度中枢 (Core Engine) ====================
+// MARK: - ==================== 1. AgentExecutionModels (调度与指标模型域) ====================
 
 /// Agent 调度请求统一载荷
 struct AgentExecutionRequest: Sendable {
@@ -64,711 +67,205 @@ struct AgentExecutionRequest: Sendable {
     }
 }
 
-/// 全局通用的无头 Agent 调度与执行管理器
-@Observable
-@MainActor
-final class AgentManager: Sendable {
-    static let shared = AgentManager()
+/// 高精度 Token 计量引擎 (全局统一标准：支持 CJK 字符、ASCII 单词与多模态图片预估)
+enum TokenEstimationEngine {
     
-    var agentVM: AgentViewModel
-    var knowledgeVM: KnowledgeViewModel
-    
-    // 插件化上下文装配器
-    var enrichers: [ChatContextEnricher] = [
-        StickyPrivateQAEnricher(),
-        BlackboardContextEnricher(),
-        HistorySlidingWindowEnricher()
-    ]
-    
-    private init() {
-        self.agentVM = AgentViewModel()
-        self.knowledgeVM = KnowledgeViewModel()
-    }
-    
-    func registerEnricher(_ enricher: ChatContextEnricher) {
-        enrichers.append(enricher)
-        enrichers.sort { $0.priority < $1.priority }
-    }
-    
-    /// 核心公共调用入口：拉起标准 Agent 流式执行管道
-    func executeStream(request: AgentExecutionRequest) -> AsyncThrowingStream<AgentStep, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self.runPipeline(request: request, continuation: continuation)
-                    continuation.yield(.done)
-                    continuation.finish()
-                } catch {
-                    if !(error is CancellationError) {
-                        continuation.yield(.error(error.localizedDescription))
-                    }
-                    continuation.finish(throwing: error)
+    /// 估算全量上下文与消息载荷的 Token 总量
+    static func estimateTokens(
+        messages: [ContextMessage],
+        systemInstruction: String = "",
+        images: [NSImage] = [],
+        activeSkills: [AgentSkill] = [],
+        protocolType: String = "openai"
+    ) -> Int {
+        var total = 0
+        if !systemInstruction.isEmpty {
+            total += estimateTextTokens(systemInstruction) + 12
+        }
+        for msg in messages {
+            total += 4
+            if let text = msg.content, !text.isEmpty {
+                total += estimateTextTokens(text)
+            }
+            if let toolCalls = msg.toolCalls {
+                for call in toolCalls {
+                    total += call.name.count / 3 + 12
+                    total += estimateTextTokens(call.arguments)
                 }
             }
-            
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
+        }
+        for _ in images {
+            total += protocolType.lowercased() == "gemini" ? 258 : 765
+        }
+        for skill in activeSkills {
+            total += skill.name.count / 3 + skill.description.count / 3 + 24
+            for param in skill.parameters {
+                total += param.name.count / 3 + param.description.count / 3 + 16
             }
         }
+        return total
     }
     
-    // MARK: - 内部私有执行流水线 (集成工具避坑先验知识与去重执行协议)
-    private func runPipeline(
-        request: AgentExecutionRequest,
-        continuation: AsyncThrowingStream<AgentStep, Error>.Continuation
-    ) async throws {
-        let cleanPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanPrompt.isEmpty || !request.images.isEmpty || !request.fileURLs.isEmpty else {
-            return
-        }
+    /// 测算单段文本的高精度 Token 消耗 (CJK: 1.25x, ASCII 单词: 1/3.6, 标点: 0.6)
+    static func estimateTextTokens(_ text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        var cjkCount = 0
+        var asciiPunctCount = 0
+        var otherAsciiCount = 0
         
-        // 1. 单源数据统一：将初始请求上下文与 VM 黑板做权威合并
-        for (k, v) in request.sharedContext {
-            agentVM.sharedContext[k] = v
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3040 && v <= 0x30FF) || (v >= 0xAC00 && v <= 0xD7AF) {
+                cjkCount += 1
+            } else if scalar.properties.isASCIIHexDigit || (v >= 0x20 && v <= 0x7E) {
+                if "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".contains(Character(scalar)) {
+                    asciiPunctCount += 1
+                } else {
+                    otherAsciiCount += 1
+                }
+            } else {
+                cjkCount += 1
+            }
         }
-        
-        // 2. 解析当前唤醒的 Agent 实体
-        let currentAgent: AgentProfile
-        if let pID = request.personaID,
-           let persona = PersonaManager.shared.personas.first(where: { $0.id == pID }) {
-            let fallbackModel = ConfigManager.shared.app.agentProfiles.first?.baseModel ?? "gemini-2.0-flash"
-            
-            let hostEquippedIDs = request.agentID.flatMap { aID in
-                ConfigManager.shared.app.agentProfiles.first(where: { $0.id == aID })
-            }?.equippedSkillIDs ?? []
-            
-            let mergedSkillIDs = Array(Set(persona.equippedSkillIDs + hostEquippedIDs))
-            
-            currentAgent = AgentProfile(
-                name: persona.name,
-                icon: "theatermasks.fill",
-                baseModel: fallbackModel,
-                systemPrompt: PersonaManager.shared.compileStaticPersonaPrompt(for: persona.id),
-                bindKnowledgeCategory: persona.bindDedicatedCategory ?? "",
-                equippedSkillIDs: mergedSkillIDs,
-                enableAutonomy: true,
-                executionMode: .interactive,
-                maxSteps: 6,
-                maxAutoRuns: 3,
-                enableCircuitBreaker: true,
-                maxRepetitions: 3
-            )
-        } else if let aID = request.agentID,
-                  let agent = ConfigManager.shared.app.agentProfiles.first(where: { $0.id == aID }) {
-            currentAgent = agent
-        } else {
-            currentAgent = ConfigManager.shared.app.agentProfiles.first ?? AgentProfile(
-                name: "默认助手",
-                baseModel: "gemini-2.0-flash",
-                systemPrompt: "你是由系统调用的专家，请直接输出高质量专业解答。"
-            )
-        }
+        let cjkTokens = Double(cjkCount) * 1.25
+        let wordTokens = Double(otherAsciiCount) / 3.6
+        let punctTokens = Double(asciiPunctCount) * 0.6
+        return max(1, Int(ceil(cjkTokens + wordTokens + punctTokens)))
+    }
+}
 
-        // 3. 全量装配已启用的物理技能 (全阶段保持开放，杜绝探索期工具误杀)
-        var dynamicActiveSkills = agentVM.skills.filter { skill in
-            skill.isEnabled && currentAgent.equippedSkillIDs.contains(skill.id)
-        }
-        
-        // 4. 动态装配数字分身角色扮演工具
-        dynamicActiveSkills.removeAll(where: { $0.name == "call_digital_persona" })
-        let boundPersonas = PersonaManager.shared.personas.filter { currentAgent.allowedPersonaIDs.contains($0.id) }
-        if !boundPersonas.isEmpty {
-            dynamicActiveSkills.append(Skill_CallPersona(boundPersonas: boundPersonas))
-        }
-        
-        // 5. 任务黑板状态与 finish_task 工具联动
-        let hasBlackboardSkill = dynamicActiveSkills.contains(where: { $0.name == "task_planner" })
-        let isBlackboardActive = currentAgent.enableAutonomy && hasBlackboardSkill
-        
-        if isBlackboardActive {
-            if !dynamicActiveSkills.contains(where: { $0.name == "finish_task" }) {
-                if let finishSkill = agentVM.skills.first(where: { $0.name == "finish_task" }) {
-                    dynamicActiveSkills.append(finishSkill)
-                }
-            }
-        }
-        
-        dynamicActiveSkills.sort { $0.name.lowercased() < $1.name.lowercased() }
-        
-        let activeModelConfig = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(currentAgent.baseModel) })
-        let maxContextTokens = activeModelConfig?.maxContextTokens ?? 32000
-        
-        var loopMessages = await buildEnrichedContext(
-            request: request,
+// MARK: - ==================== 2. AgentContextOrchestrator (上下文编排与压缩) ====================
+
+enum AgentContextOrchestrator {
+    
+    /// 上下文装配流水线：通过安全传值与返回值消除跨 async 的 inout 隔离冲突
+    static func buildEnrichedContext(
+        request: AgentExecutionRequest,
+        currentAgent: AgentProfile,
+        activeSkills: [AgentSkill],
+        maxTokens: Int,
+        enrichers: [ChatContextEnricher],
+        sharedContext: [String: String]
+    ) async -> (messages: [ContextMessage], totalTokens: Int) {
+        let sanitizedQuery = ChatOrchestrator.sanitizeUserMessage(request.prompt)
+        let payload = ContextEnrichmentPayload(
+            query: sanitizedQuery,
             currentAgent: currentAgent,
-            activeSkills: dynamicActiveSkills,
-            maxTokens: maxContextTokens
+            activeSkills: activeSkills,
+            personaID: request.personaID,
+            sliceIndex: request.sliceIndex,
+            maxTokens: maxTokens,
+            messages: request.historyMessages,
+            sharedContext: sharedContext
         )
         
-        // 6. 知识库增强注入
-        if !currentAgent.enableAutonomy && !currentAgent.bindKnowledgeCategory.isEmpty {
-            continuation.yield(.status("正在检索私域知识库 [\(currentAgent.bindKnowledgeCategory)]..."))
-            let ragResult = await knowledgeVM.injectedRag(query: cleanPrompt, category: currentAgent.bindKnowledgeCategory, currentModel: currentAgent.baseModel)
-            if !ragResult.context.isEmpty {
-                if let lastUserIdx = loopMessages.lastIndex(where: { $0.role == .user }) {
-                    loopMessages.insert(.system("【知识库检索结果】:\n\(ragResult.context)"), at: lastUserIdx)
-                } else {
-                    loopMessages.append(.system("【知识库检索结果】:\n\(ragResult.context)"))
-                }
-                continuation.yield(.ragResult(logString: ragResult.logString))
+        var contextMsgs: [ContextMessage] = []
+        var totalTokens = TokenEstimationEngine.estimateTextTokens(sanitizedQuery)
+        
+        for enricher in enrichers.sorted(by: { $0.priority < $1.priority }) {
+            await enricher.enrich(payload: payload, messages: &contextMsgs, totalTokens: &totalTokens)
+        }
+        
+        if let pID = request.personaID {
+            let dynamicContext = PersonaManager.shared.compileDynamicRuntimeContext(for: pID, query: sanitizedQuery)
+            if !dynamicContext.isEmpty {
+                contextMsgs.append(.system(dynamicContext))
             }
         }
         
-        // 7. 避坑指南先验注入
-        let activeSkillNames = Set(dynamicActiveSkills.map { $0.name })
-        let toolLessons = await MemoryManager.shared.getToolLessons(for: activeSkillNames, topKPerTool: 3)
-        if !toolLessons.isEmpty {
-            let lessonSegment = "【历史工具调用避坑经验】:\n\(toolLessons)"
-            if let lastUserIdx = loopMessages.lastIndex(where: { $0.role == .user }) {
-                loopMessages.insert(.system(lessonSegment), at: lastUserIdx)
-            } else {
-                loopMessages.append(.system(lessonSegment))
-            }
-        }
+        contextMsgs.append(.user(sanitizedQuery))
         
-        // 8. 静态系统指令 (正向逻辑规约)
-        var systemInstruction = currentAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if dynamicActiveSkills.contains(where: { !$0.detailedInstruction.isEmpty && $0.isLocal }) && !systemInstruction.contains("<execution_protocol>") {
-            systemInstruction += """
-            
-            <execution_protocol>
-            1. 双拍输出：每次下发 Tool Call 时，正文流必须输出当前操作的意图说明，不输出空白回复。
-            2. 单次判定：同一环境检查或列表查询单次获取有效事实后即推进分支，避免下发相同指令。
-            3. 查阅自愈：指令返回语法帮助时，下一步优先查阅该指令的具体参数定义，完成参数修正后执行。
-            4. 规划闭环：获取到目标实体即创建任务黑板，全部节点完成后由 finish_task 结单。
-            </execution_protocol>
-            """
-        }
+        let accurateTotal = TokenEstimationEngine.estimateTokens(
+            messages: contextMsgs,
+            systemInstruction: currentAgent.systemPrompt,
+            images: request.images,
+            activeSkills: activeSkills,
+            protocolType: currentAgent.baseModel
+        )
+        return (contextMsgs, accurateTotal)
+    }
+    
+    /// 长上下文滑动智能压缩（头尾保真，折叠早期巨型观察输出）
+    static func compactContext(
+        messages: [ContextMessage],
+        keepRecentTurns: Int,
+        maxObservationLength: Int
+    ) -> [ContextMessage] {
+        let protectedMessageCount = max(2, keepRecentTurns * 2)
+        guard messages.count > protectedMessageCount else { return messages }
         
-        let initialStepBudget = currentAgent.enableAutonomy ? max(1, currentAgent.maxSteps) : 1
-        var maxIterations = initialStepBudget
-        var currentIteration = 0
-        var autoExtensionCount = 0
-        var isTaskFinished = false
-        var textOnlyRounds = 0
-        var consecutiveErrors = 0
-        var currentRoundImages: [NSImage] = request.images
-        var actionHistory: [String] = []
-        let parentSessionID = request.sessionLogID ?? LogManager.shared.activeContextID
+        var compacted: [ContextMessage] = []
+        let cutoffIndex = messages.count - protectedMessageCount
         
-        // 9. 多轮自主推理推演循环
-        while currentIteration < maxIterations && !isTaskFinished {
-            try Task.checkCancellation()
-            currentIteration += 1
-            
-            let roundLogID = LogManager.shared.startGroup(
-                title: "🌀 [Agent 迭代 \(currentIteration)/\(maxIterations)]",
-                detail: nil,
-                level: .info,
-                parentID: parentSessionID
-            )
-            LogManager.shared.setContext(roundLogID)
-            
-            var currentRoundMessages = loopMessages
-            
-            // 🌟 [Added] 动态阶段微提示词注入（根据黑板状态机实时切换）
-            if isBlackboardActive {
-                let currentPlan = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"]
-                let currentMemo = agentVM.sharedContext["AGENT_GLOBAL_MEMO"]
-                
-                var activePlanReminder = TaskBlackboardManager.shared.generateExecutionPrompt(planString: currentPlan)
-                if let memo = currentMemo, !memo.isEmpty { activePlanReminder += "\n\n【全局备忘录】:\n\(memo)" }
-                if !activePlanReminder.isEmpty {
-                    currentRoundMessages.append(.system("【系统黑板运行器状态快照】: \n" + activePlanReminder))
-                }
-                
-                if let stageMicroPrompt = AgentStagePromptEngine.resolveStageMicroPrompt(
-                    isAutonomy: currentAgent.enableAutonomy,
-                    hasBlackboard: isBlackboardActive,
-                    blackboardPlan: currentPlan
-                ) {
-                    currentRoundMessages.append(.system(stageMicroPrompt))
+        for (index, msg) in messages.enumerated() {
+            var newMsg = msg
+            if index < cutoffIndex {
+                if msg.role == .tool, let content = msg.content, content.count > maxObservationLength {
+                    let headLen = Int(Double(maxObservationLength) * 0.6)
+                    let tailLen = maxObservationLength - headLen
+                    let head = content.prefix(headLen)
+                    let tail = content.suffix(tailLen)
+                    newMsg.content = "\(head)\n\n...[早期数据已折叠，原始共 \(content.count) 字符]...\n\n\(tail)"
                 }
             }
-            
-            // 上下文滑动压缩
-            if currentAgent.enableCompaction {
-                currentRoundMessages = Self.compactContext(
-                    messages: currentRoundMessages,
-                    keepRecentTurns: currentAgent.keepRecentTurns,
-                    maxObservationLength: currentAgent.maxObservationLength
-                )
-            }
-            
-            let requestStartTime = Date()
-            var isFirstTokenReceived = false
-            var firstTokenLatency: TimeInterval = 0.0
+            compacted.append(newMsg)
+        }
+        return compacted
+    }
+    
+    /// 构建轻量可用技能名录（独立上下文注入，保护 System Prompt 缓存）
+    static func buildLightweightCatalog(for skills: [AgentSkill]) -> String {
+        guard !skills.isEmpty else { return "" }
+        var catalog = "<available_skills_directory>\n"
+        for s in skills {
+            catalog += "• \(s.name): \(s.description)\n"
+        }
+        catalog += """
+        使用指引：
+        1. 思考发现：在思考阶段自主识别所需技能。
+        2. 查阅手册：调用 read_skill_manual(target_skill_name: "技能名") 查阅具体命令与参数规范。
+        3. 具身执行：你可以直接调用该技能名称下发指令，或通过 execute_skill(skill_name: "技能名", input: "具体命令或参数") 进行物理执行。
+        </available_skills_directory>
+        """
+        return catalog
+    }
+    
+    /// 构造纯净正向的自主推演协议
+    static func buildAutonomousProtocol() -> String {
+        return """
+        
+        <autonomous_protocol>
+        为确保长任务推演的确定性与过程透明度，请严格遵循以下工作流：
+        1. 意图表达与过程透明 (Process Transparency)：
+           - 每次下发工具调用前，请务必先在正文中用一两句话简述你的推演逻辑或即将执行的动作意图。请始终保持“先说明，后调用”的习惯，以让用户及时知晓当前进度。
+        2. 强制内省与文档探索 (Explore & Read)：
+           - 在下发执行指令前，请优先调用 `read_skill_manual` 查阅工具说明。
+           - 若返回结果提示存在子文档 (doc_path) 索引，请务必继续调用 `read_skill_manual` 深入读取对应的子文档，直到获取到该命令的确切参数结构。
+        3. 忠实于手册的执行 (Faithful Execution)：
+           - 仅基于手册中明确给出的示例与语法结构来下发 `execute_skill` 参数。
+           - 若命令规范要求通过文件传递数据（如 `@data.json`），请直接将完整的 JSON 数据作为字符串形式写入执行参数，底层运行时会自动完成文件的桥接与替换。
+        4. 闭环物理核验 (Physical Verification)：
+           - 在完成写入、修改或创建操作后，请追加一步“读操作”（如 info, list, status 查询），提取最新系统状态以供客观看待。
+        5. 证据链交付 (Evidence-Based Completion)：
+           - 调用 `finish_task` 时，请将前序“读操作”返回的真实物理数据（原文或原始 JSON）填入 `verification_evidence` 字段，以供公证系统逻辑对账。
+        </autonomous_protocol>
+        """
+    }
+}
 
-            let stream = LLMService.shared.ask(
-                messages: currentRoundMessages,
-                model: currentAgent.baseModel,
-                images: currentRoundImages,
-                fileURLs: currentIteration == 1 ? request.fileURLs : [],
-                instruction: systemInstruction,
-                activeSkills: dynamicActiveSkills
-            )
-            
-            var hasToolCallInThisRound = false
-            var roundResponseText = ""
-            var roundReasoningText = ""
-            var currentToolCalls: [(id: String, name: String, args: [String: Any], thoughtSignature: String?)] = []
-            
-            do {
-                for try await step in stream {
-                    try Task.checkCancellation()
-                    
-                    switch step {
-                    case .textDelta(let t):
-                        if !isFirstTokenReceived {
-                            isFirstTokenReceived = true
-                            firstTokenLatency = Date().timeIntervalSince(requestStartTime)
-                            LogManager.shared.info(
-                                "⚡️ 收到首字响应 (TTFT: \(String(format: "%.2f", firstTokenLatency))s)",
-                                detail: "大模型连接顺畅，正在流式交付正文...",
-                                parentID: roundLogID
-                            )
-                        }
-                        roundResponseText += t
-                        continuation.yield(.textDelta(t))
-                        
-                    case .reasoningDelta(let r):
-                        if !isFirstTokenReceived {
-                            isFirstTokenReceived = true
-                            firstTokenLatency = Date().timeIntervalSince(requestStartTime)
-                            LogManager.shared.info(
-                                "⚡️ 收到首字响应 (TTFT: \(String(format: "%.2f", firstTokenLatency))s)",
-                                detail: "大模型连接顺畅，正在进行深度思考与推理 (<think>)...",
-                                parentID: roundLogID
-                            )
-                        }
-                        roundReasoningText += r
-                        continuation.yield(.reasoningDelta(r))
-                        
-                    case .reasoningDone:
-                        continuation.yield(.reasoningDone)
-                        
-                    case .toolCallInfo(let id, let name, let args, let thoughtSig):
-                        hasToolCallInThisRound = true
-                        let safeId = id.isEmpty ? "call_\(UUID().uuidString.prefix(6))" : id
-                        currentToolCalls.append((id: safeId, name: name, args: args, thoughtSignature: thoughtSig))
-                        
-                    case .usageUpdate(let count):
-                        continuation.yield(.usageUpdate(count))
-                        LogManager.shared.updateTokens(nodeID: roundLogID, tokens: count)
-                        
-                    default: break
-                    }
-                }
-                consecutiveErrors = 0
-            } catch {
-                let errorMsg = error.localizedDescription
-                let nsError = error as NSError
-                
-                LogManager.shared.error("❌ 模型响应异常", detail: errorMsg, parentID: roundLogID)
-                
-                let isServerOverload = errorMsg.contains("503") || errorMsg.contains("502") || errorMsg.contains("504") || errorMsg.contains("overloaded") || (nsError.domain == "HTTPError" && [502, 503, 504].contains(nsError.code))
-                if isServerOverload {
-                    consecutiveErrors += 1
-                    if consecutiveErrors >= 5 {
-                        continuation.yield(.textDelta("\n\n> ❌ **服务端高负载超时**: 重试多次未恢复。"))
-                        break
-                    }
-                    let delay = UInt64(1.5 * pow(2.0, Double(consecutiveErrors - 1)) * 1_000_000_000)
-                    try? await Task.sleep(nanoseconds: delay)
-                    currentIteration -= 1
-                    continue
-                }
-                
-                if errorMsg.contains("thought_signature") || (nsError.domain == "HTTPError" && nsError.code == 400) {
-                    consecutiveErrors += 1
-                    if consecutiveErrors >= 3 { break }
-                    loopMessages.append(.assistant(text: "我已感知到系统状态，正在重新推导任务方案。"))
-                    currentIteration -= 1
-                    continue
-                }
-                
-                if error is CancellationError { throw error }
-                
-                consecutiveErrors += 1
-                if consecutiveErrors >= 3 {
-                    continuation.yield(.textDelta("\n\n> ❌ **模型交互中断**: 连续重试失败: \(errorMsg)"))
-                    break
-                }
-                
-                let healingAdvice = Self.buildStructuredSelfHealingPrompt(errorMsg: errorMsg, toolName: "LLM_Inference", args: [:])
-                loopMessages.append(.system(healingAdvice))
-                continue
-            }
-            
-            // 伪调用智能挽救与看门狗自愈检查
-            if !hasToolCallInThisRound && roundResponseText.contains("call:") {
-                let rawCallPattern = #"(?s)call:(?:default_api:)?([a-zA-Z0-9_-]+)\s*(\{.*?\})"#
-                if let regex = try? NSRegularExpression(pattern: rawCallPattern),
-                   let match = regex.firstMatch(in: roundResponseText, range: NSRange(roundResponseText.startIndex..., in: roundResponseText)),
-                   let nameRange = Range(match.range(at: 1), in: roundResponseText),
-                   let jsonRange = Range(match.range(at: 2), in: roundResponseText) {
-                    
-                    let toolName = String(roundResponseText[nameRange])
-                    let jsonStr = String(roundResponseText[jsonRange])
-                    
-                    if let data = jsonStr.data(using: .utf8),
-                       let parsedArgs = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        hasToolCallInThisRound = true
-                        let autoCallID = "call_synthesized_\(UUID().uuidString.prefix(6))"
-                        currentToolCalls.append((id: autoCallID, name: toolName, args: parsedArgs, thoughtSignature: nil))
-                        
-                        if let fullMatchRange = Range(match.range(at: 0), in: roundResponseText) {
-                            roundResponseText.removeSubrange(fullMatchRange)
-                        }
-                        LogManager.shared.info("🛠️ 成功从正文中挽救并转化伪工具调用: [\(toolName)]", detail: jsonStr, parentID: roundLogID)
-                    }
-                }
-                
-                if !hasToolCallInThisRound && (roundResponseText.contains("call:default_api:") || roundResponseText.contains("{action:")) {
-                    roundResponseText = roundResponseText.replacingOccurrences(of: #"(?s)call:(?:default_api:)?.*$"#, with: "", options: .regularExpression)
-                    let healingPrompt = "【系统协议指引】: 检测到你在输出流中直接打印了调用代码片段。请不要在正文中书写 'call:...' 伪语法，必须使用标准 Tool Call 接口发送结构化参数以调用物理工具。"
-                    
-                    let isDuplicateWarning = loopMessages.suffix(2).contains(where: { msg in
-                        msg.role == .system && (msg.content!.contains("【系统协议指引】") == true)
-                    })
-                    if !isDuplicateWarning {
-                        loopMessages.append(.system(healingPrompt))
-                    }
-                    LogManager.shared.warning("⚠️ 拦截到残缺的伪工具调用文本，已自动注入自愈重试指令", parentID: roundLogID)
-                    continue
-                }
-            }
-            
-            // 深度思考推演后空正文与无动作拦截
-            let rawCleanText = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
-            if !hasToolCallInThisRound && rawCleanText.isEmpty && !roundReasoningText.isEmpty {
-                LogManager.shared.warning("⚠️ 检测到模型完成推演但未下发动作且正文为空，触发调度自愈", parentID: roundLogID)
-                loopMessages.append(.system("【系统指引】: 你已完成内部逻辑推演。请立即通过标准 Tool Call 接口调用对应的物理工具，或在正文中输出具体的业务解答。"))
-                continue
-            }
-            
-            // 统计全流程耗时并交付完整决策日志
-            let totalRoundDuration = Date().timeIntervalSince(requestStartTime)
-            let streamingDuration = max(0, totalRoundDuration - firstTokenLatency)
-            let metricsSummary = String(
-                format: "首字: %.2fs · 生成: %.1fs · 总计: %.1fs",
-                firstTokenLatency,
-                streamingDuration,
-                totalRoundDuration
-            )
-            
-            var decisionSummary = "【耗时指标】: \(metricsSummary)\n\n"
-            if !roundReasoningText.isEmpty {
-                decisionSummary += "【思考过程】:\n\(roundReasoningText.trimmingCharacters(in: .whitespacesAndNewlines))\n\n"
-            }
-            if !roundResponseText.isEmpty {
-                decisionSummary += "【模型回答】:\n\(roundResponseText.trimmingCharacters(in: .whitespacesAndNewlines))\n\n"
-            }
-            if !currentToolCalls.isEmpty {
-                let callList = currentToolCalls.map { tc in
-                    let argStr = (try? JSONSerialization.data(withJSONObject: tc.args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                    return "● 动作 [\(tc.name)]: \(argStr)"
-                }.joined(separator: "\n")
-                decisionSummary += "【决定下发动作】:\n\(callList)"
-            }
-            
-            LogManager.shared.info(
-                currentToolCalls.isEmpty ? "🧠 模型推理与正文交付 (\(metricsSummary))" : "🧠 模型推理与动作决策 (\(metricsSummary))",
-                detail: decisionSummary.isEmpty ? "(本轮无文本输出)" : decisionSummary,
-                parentID: roundLogID
-            )
-            
-            if hasToolCallInThisRound {
-                textOnlyRounds = 0
-                
-                let llmToolCalls = currentToolCalls.map { tc in
-                    let argStr = (try? JSONSerialization.data(withJSONObject: tc.args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                    return LLMToolCall(id: tc.id, name: tc.name, arguments: argStr, thoughtSignature: tc.thoughtSignature)
-                }
-                loopMessages.append(.assistant(text: roundResponseText.isEmpty ? nil : roundResponseText, toolCalls: llmToolCalls))
-                
-                // 周期性震荡死循环熔断检测
-                if currentAgent.enableCircuitBreaker {
-                    var triggeredCircuit = false
-                    for tc in currentToolCalls {
-                        let argData = (try? JSONSerialization.data(withJSONObject: tc.args, options: .sortedKeys)) ?? Data()
-                        let argStr = String(data: argData, encoding: .utf8) ?? ""
-                        let actionFingerprint = "\(tc.name)|\(argStr)"
-                        actionHistory.append(actionFingerprint)
-                    }
-                    
-                    let (isLoopDetected, loopPattern) = Self.detectOscillatingLoop(
-                        history: actionHistory,
-                        maxRepetitions: currentAgent.maxRepetitions
-                    )
-                    
-                    if isLoopDetected {
-                        triggeredCircuit = true
-                        let pauseID = UUID().uuidString
-                        let stepBudget = max(1, currentAgent.maxSteps)
-                        let patternDesc = loopPattern.map { $0.components(separatedBy: "|").first ?? $0 }.joined(separator: " -> ")
-                        let circuitNotice = "智能体检测到重复震荡调用模式 [\(patternDesc)]，已自动触发安全挂起。"
-                        
-                        continuation.yield(.status("⚠️ 触发重复震荡调用阻断，请求人工介入..."))
-                        continuation.yield(.pausedForHuman(
-                            id: pauseID,
-                            reason: circuitNotice,
-                            suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
-                        ))
-                        LogManager.shared.warning("🛑 触发周期震荡熔断并请求人工介入", detail: circuitNotice, parentID: roundLogID)
-                        
-                        let humanGuidance = await AgentInterventionUI.requestGuidance(
-                            agentName: currentAgent.name,
-                            reason: circuitNotice,
-                            suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
-                        )
-                        
-                        if let guidance = humanGuidance, !guidance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            loopMessages.append(.user("【人工介入指引】: \(guidance)\n请根据该指引调整执行策略。"))
-                            actionHistory.removeAll()
-                            maxIterations += stepBudget
-                            autoExtensionCount = 0
-                            triggeredCircuit = false
-                        } else {
-                            isTaskFinished = true
-                        }
-                    }
-                    if triggeredCircuit && isTaskFinished { break }
-                }
-                
-                // 执行工具并发调用
-                let executionResults = await withTaskGroup(of: (id: String, name: String, result: String, image: NSImage?, fileURL: URL?, isFinished: Bool).self) { group in
-                    for tc in currentToolCalls {
-                        group.addTask { @MainActor in
-                            return await self.executeSingleTool(
-                                tc: tc,
-                                currentAgent: currentAgent,
-                                dynamicActiveSkills: dynamicActiveSkills,
-                                autoApprove: request.autoApproveConfirmation,
-                                continuation: continuation
-                            )
-                        }
-                    }
-                    var collected: [(id: String, name: String, result: String, image: NSImage?, fileURL: URL?, isFinished: Bool)] = []
-                    for await res in group { collected.append(res) }
-                    return collected
-                }
-                
-                var newlyCapturedImages: [NSImage] = []
-                for res in executionResults {
-                    let isExecutionFailed = res.result.contains("❌") || res.result.contains("error") || res.result.contains("Exception") || res.result.contains("⚠️")
-                    let prunedResultText: String
-                    
-                    if isExecutionFailed {
-                        let diagnostic = ToolExecutionDiagnostic.analyze(errorMessage: res.result)
-                        let matchedLessons = await MemoryManager.shared.getToolLessons(for: [res.name], topKPerTool: 2)
-                        var reflection = diagnostic.structuredHealingPrompt
-                        if !matchedLessons.isEmpty {
-                            reflection += "\n\n💡 知识库历史调用规范参考:\n\(matchedLessons)"
-                        }
-                        prunedResultText = reflection
-                    } else {
-                        prunedResultText = res.result
-                    }
-                    
-                    loopMessages.append(.tool(id: res.id, name: res.name, result: prunedResultText))
-                    continuation.yield(.toolCallResult(name: res.name, result: res.result))
-                    
-                    LogManager.shared.log(
-                        level: isExecutionFailed ? .error : .success,
-                        title: "⚡️ 动作执行 [\(res.name)]",
-                        detail: "【执行反馈】:\n\(res.result)",
-                        parentID: roundLogID
-                    )
-                    
-                    if res.isFinished { isTaskFinished = true }
-                    if let img = res.image { newlyCapturedImages.append(img) }
-                }
-                
-                // 多工具物理聚合
-                let physicalResults = executionResults.filter { $0.name != "task_planner" && $0.name != "finish_task" && $0.name != "read_skill_manual" }
-                if !physicalResults.isEmpty {
-                    let memoSnippet = physicalResults.compactMap { "\([$0.name]): \($0.result.prefix(120))" }.joined(separator: "; ")
-                    agentVM.sharedContext["AGENT_LAST_PHYSICAL_MEMO"] = memoSnippet
-                }
-                
-                if !newlyCapturedImages.isEmpty {
-                    loopMessages.append(.user("【物理视觉雷达】: 以下是动作捕获的实况图像，请结合图像分析并推进下一步："))
-                    currentRoundImages = newlyCapturedImages
-                } else {
-                    currentRoundImages = []
-                }
-                
-            } else {
-                textOnlyRounds += 1
-                let cleanRound = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
-                
-                let hasUnfinished = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"].flatMap { TaskBlackboardManager.shared.hasUnfinishedTasks(planString: $0) } ?? false
-                let shouldIntercept = ContinuanceActionIntent.shouldInterceptEarlyExit(
-                    text: cleanRound,
-                    isBlackboardActive: isBlackboardActive,
-                    hasUnfinishedTasks: hasUnfinished,
-                    textOnlyRounds: textOnlyRounds
-                )
-                
-                if shouldIntercept {
-                    loopMessages.append(.system("【系统调度指引】: 物理操作尚未闭环。请直接发送对应指令的 Tool Call，推进当前活动节点到达物理终态。"))
-                    continue
-                }
-                
-                // 状态机常规推进与交付核验
-                if isBlackboardActive,
-                   let lp = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"],
-                   TaskBlackboardManager.shared.hasUnfinishedTasks(planString: lp) {
-                    
-                    let nodes = TaskBlackboardManager.shared.parsePlan(lp)
-                    if let currentActionableNode = TaskBlackboardManager.shared.findNextActionableTask(in: nodes) {
-                        let isRealReasoning = currentActionableNode.nodeType == .reasoning || (TaskBlackboardManager.inferNodeType(from: currentActionableNode.title) == .reasoning && nodes.count == 1)
-                        if isRealReasoning {
-                            let snippet = cleanRound.count > 200 ? String(cleanRound.prefix(200)) + "..." : cleanRound
-                            let textArtifact = AgentArtifact(name: "总结回答_\(currentActionableNode.title)", type: .text, content: cleanRound)
-                            let (updatedPlan, sysMsg) = TaskBlackboardManager.shared.autoAdvanceTaskToSuccess(planString: lp, resultMemo: "产出: \(snippet)", newArtifacts: [textArtifact])
-                            if let newPlan = updatedPlan {
-                                agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = newPlan
-                                if !TaskBlackboardManager.shared.hasUnfinishedTasks(planString: newPlan) {
-                                    isTaskFinished = true
-                                } else {
-                                    loopMessages.append(.system("【系统状态图通知】: " + sysMsg))
-                                }
-                            } else { isTaskFinished = true }
-                        } else {
-                            if textOnlyRounds < 3 {
-                                loopMessages.append(.system("当前聚焦节点【\(currentActionableNode.title)】需要调用物理工具执行，请直接下发对应的 Tool Call 推进当前步骤。"))
-                            } else {
-                                _ = TaskBlackboardManager.shared.markAllTasksSuccess(planString: lp, resultMemo: "文本已交付并平仓")
-                                isTaskFinished = true
-                            }
-                        }
-                    } else { isTaskFinished = true }
-                } else if isBlackboardActive && agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] == nil && textOnlyRounds < 3 {
-                    loopMessages.append(.system("【任务初始化】: 请调用 task_planner(action: \"create\", tasks: [...]) 完成任务规划。"))
-                } else {
-                    isTaskFinished = true
-                }
-            }
-            
-            // 步数耗尽调度
-            if currentIteration >= maxIterations && !isTaskFinished {
-                let stepBudget = max(1, currentAgent.maxSteps)
-                
-                if currentAgent.executionMode == .fullyAuto && autoExtensionCount < currentAgent.maxAutoRuns {
-                    autoExtensionCount += 1
-                    maxIterations += stepBudget
-                    let autoNotice = "⚡️ 步数已达预算上限，自动闭环机制已静默追加 \(stepBudget) 步推演 (第 \(autoExtensionCount)/\(currentAgent.maxAutoRuns) 轮)..."
-                    continuation.yield(.status(autoNotice))
-                    LogManager.shared.info("🔁 自动闭环静默续跑", detail: autoNotice, parentID: roundLogID)
-                } else {
-                    let pauseID = UUID().uuidString
-                    let isHardCapReached = currentAgent.executionMode == .fullyAuto && autoExtensionCount >= currentAgent.maxAutoRuns
-                    let stepExhaustedNotice = isHardCapReached
-                        ? "智能体已完成 \(autoExtensionCount) 轮自动续跑（累计 \(currentIteration) 步），已达系统安全上限，请人工复核进度。"
-                        : "智能体已完成 \(maxIterations) 步自主推演，检测到任务流程尚未结单。"
-                    
-                    continuation.yield(.status("⏳ 等待人工确认下一步指示..."))
-                    continuation.yield(.pausedForHuman(
-                        id: pauseID,
-                        reason: stepExhaustedNotice,
-                        suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
-                    ))
-                    LogManager.shared.warning("⏳ 触发人工接管挂起", detail: stepExhaustedNotice, parentID: roundLogID)
-                    
-                    let humanInput = await AgentInterventionUI.requestGuidance(
-                        agentName: currentAgent.name,
-                        reason: stepExhaustedNotice,
-                        suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
-                    )
-                    
-                    if let input = humanInput, !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        loopMessages.append(.user("【用户追加指示】: \(input)\n请继续推进并完成后续任务。"))
-                        maxIterations += stepBudget
-                        autoExtensionCount = 0
-                    } else {
-                        isTaskFinished = true
-                    }
-                }
-            }
-            
-            LogManager.shared.setContext(parentSessionID)
-        }
-    }
+// MARK: - ==================== 3. AgentToolDispatcher (物理工具分发与公证沙盒) ====================
+
+enum AgentToolDispatcher {
     
-    // MARK: - 结构化诊断式自愈提示构建器 (正向指导协议)
-    private static func detectOscillatingLoop(history: [String], maxRepetitions: Int) -> (isLoop: Bool, pattern: [String]) {
-        guard history.count >= maxRepetitions else { return (false, []) }
-        
-        // 1. 单动作死循环: A -> A -> A
-        let suffix1 = Array(history.suffix(maxRepetitions))
-        if suffix1.allSatisfy({ $0 == suffix1.first }) {
-            return (true, [suffix1.first ?? ""])
-        }
-        
-        // 2. 双动作震荡: A -> B -> A -> B
-        let cycle2Len = max(2, maxRepetitions) * 2
-        if history.count >= cycle2Len {
-            let suffix2 = Array(history.suffix(cycle2Len))
-            let p = Array(suffix2.prefix(2))
-            var isOscillating = true
-            for i in stride(from: 0, to: cycle2Len, by: 2) {
-                if Array(suffix2[i..<i+2]) != p {
-                    isOscillating = false
-                    break
-                }
-            }
-            if isOscillating { return (true, p) }
-        }
-        
-        // 3. 三动作震荡: A -> B -> C -> A -> B -> C
-        let cycle3Len = 2 * 3
-        if history.count >= cycle3Len {
-            let suffix3 = Array(history.suffix(cycle3Len))
-            let p = Array(suffix3.prefix(3))
-            var isOscillating = true
-            for i in stride(from: 0, to: cycle3Len, by: 3) {
-                if Array(suffix3[i..<i+3]) != p {
-                    isOscillating = false
-                    break
-                }
-            }
-            if isOscillating { return (true, p) }
-        }
-        
-        return (false, [])
-    }
-    
-    // MARK: - 结构化诊断式自愈提示构建器
-    private static func buildStructuredSelfHealingPrompt(
-        errorMsg: String,
-        toolName: String,
-        args: [String: Any] = [:]
-    ) -> String {
-        let lower = errorMsg.lowercased()
-        var guidance = "【系统自愈指导】: 动作 [\(toolName)] 上一次执行未达预期。"
-        
-        if lower.contains("未找到命令") || lower.contains("command not found") || lower.contains("找不到可执行") {
-            guidance += "\n- 诊断：可执行命令不存在或环境 PATH 尚未就绪。\n- 建议：调用 read_skill_manual 核对工具名称，或换用 Python/Shell 原生代码实现。"
-        } else if lower.contains("参数校验失败") || lower.contains("缺少必填参数") || lower.contains("json") {
-            guidance += "\n- 诊断：入参不满足工具要求。\n- 建议：检查参数定义中的必填字段，修正参数结构后重试。"
-        } else if lower.contains("找不到原始文件") || lower.contains("no such file") || lower.contains("不存在") {
-            guidance += "\n- 诊断：目标路径不存在。\n- 建议：先调用目录或文件检索工具核准物理路径。"
-        } else if lower.contains("权限") || lower.contains("denied") || lower.contains("permission") {
-            guidance += "\n- 诊断：访问受限或触发安全拦截。\n- 建议：切换至沙盒或用户下载目录。"
-        } else {
-            guidance += "\n- 报错摘要：\(errorMsg.prefix(240))\n- 建议：根据报错原因调整推演分支，避免下发相同参数。"
-        }
-        return guidance
-    }
-    
-    // MARK: - 升级 tc 为 4 元组声明并完整透传签名
-    private func executeSingleTool(
+    /// 单个工具物理执行中枢 (支持参数动态 Coerce、HITL 拦截、多模态解析与安全截断)
+    @MainActor
+    static func executeSingleTool(
         tc: (id: String, name: String, args: [String: Any], thoughtSignature: String?),
         currentAgent: AgentProfile,
         dynamicActiveSkills: [AgentSkill],
+        originalUserPrompt: String,
         autoApprove: Bool,
+        agentVM: AgentViewModel,
         continuation: AsyncThrowingStream<AgentStep, Error>.Continuation
     ) async -> (id: String, name: String, result: String, image: NSImage?, fileURL: URL?, isFinished: Bool) {
         let invokedToolId = tc.id
@@ -784,7 +281,7 @@ final class AgentManager: Sendable {
             
             if let subProfile = allowedAgents.first(where: { $0.name.localizedCaseInsensitiveContains(targetAgentName) }) {
                 continuation.yield(.status("正在移交专家 [\(subProfile.name)] 协作处理..."))
-                let subResult = await runSubAgentSandbox(profile: subProfile, taskInstruction: taskInstruction, continuation: continuation)
+                let subResult = await runSubAgentSandbox(profile: subProfile, taskInstruction: taskInstruction, agentVM: agentVM, continuation: continuation)
                 return (invokedToolId, invokedToolName, subResult, nil, nil, false)
             } else {
                 return (invokedToolId, invokedToolName, "{\"error\": \"指定的下属专家不存在\"}", nil, nil, false)
@@ -807,42 +304,90 @@ final class AgentManager: Sendable {
             return (invokedToolId, invokedToolName, personaResult, nil, nil, false)
         }
         
-        // 3. 终态结单与报告平仓分支
+        // 3. 终态结单与无头公证员纯逻辑对账 (Proof-Carrying Gate)
         if invokedToolName == "finish_task" {
-            let finalStatus = (invokedToolArgs["status"] as? String)?.lowercased() ?? "success"
             let finalAnswer = (invokedToolArgs["final_answer"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 ?? (invokedToolArgs["summary"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 ?? "任务已顺利完成。"
+            let evidence = (invokedToolArgs["verification_evidence"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             
-            if !finalAnswer.isEmpty {
+            continuation.yield(.status("🔍 正在拉起无头公证员进行交付物逻辑对账..."))
+            
+            let (isVerified, discrepancyReason) = await verifyClaimWithHeadlessCritic(
+                originalPrompt: originalUserPrompt,
+                evidence: evidence,
+                model: currentAgent.baseModel
+            )
+            
+            if isVerified {
                 continuation.yield(.textDelta(finalAnswer))
+                agentVM.sharedContext["LAST_TOOL_HAS_ERROR"] = "false"
+                return (invokedToolId, invokedToolName, "{\"status\": \"ok\", \"message\": \"公证核验通过，任务已结单归档\"}", nil, nil, true)
+            } else {
+                let rejectFeedback = """
+                【无头公证员核验未通过】:
+                - 缺失项诊断: \(discrepancyReason)
+                - 指引建议: 请调用相关物理工具补齐上述缺失配置，执行物理读回命令获取真实数据证据后，再次调用 finish_task 提交结单。
+                """
+                LogManager.shared.warning("🛑 交付物未通过无头公证员对账", detail: rejectFeedback, parentID: LogManager.shared.activeContextID)
+                return (invokedToolId, invokedToolName, rejectFeedback, nil, nil, false)
             }
-            
-            // 黑板任务终态归档平仓
-            let latestPlan = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"]
-            if let cp = latestPlan {
-                if let reconciledPlan = TaskBlackboardManager.shared.finalizeRemainingTasks(
-                    planString: cp,
-                    finalStatusStr: finalStatus,
-                    finalAnswer: finalAnswer
-                ) {
-                    agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = reconciledPlan
-                }
-            }
-            
-            // 终态结单时清理历史报错标记
-            agentVM.sharedContext["LAST_TOOL_HAS_ERROR"] = "false"
-            return (invokedToolId, invokedToolName, "{\"status\": \"ok\", \"message\": \"任务已结单平仓\"}", nil, nil, true)
         }
         
-        // 4. 匹配物理工具实体
-        guard let skill = dynamicActiveSkills.first(where: { $0.name == invokedToolName }) else {
-            return (invokedToolId, invokedToolName, "{\"error\": \"未找到工具 [\(invokedToolName)]\"}", nil, nil, false)
+        // 4. 匹配物理工具实体（自适应名称兼容与容错映射）
+        var matchedSkill: AgentSkill? = dynamicActiveSkills.first(where: {
+            $0.name.lowercased() == invokedToolName.lowercased()
+        })
+
+        let equippedSkills = agentVM.skills.filter { skill in
+            skill.isEnabled && currentAgent.equippedSkillIDs.contains(skill.id)
+        }
+
+        if matchedSkill == nil {
+            let normalizedName = invokedToolName.lowercased()
+                .replacingOccurrences(of: "-", with: "_")
+                .replacingOccurrences(of: "skill_", with: "")
+            
+            matchedSkill = equippedSkills.first(where: {
+                let sName = $0.name.lowercased()
+                    .replacingOccurrences(of: "-", with: "_")
+                    .replacingOccurrences(of: "skill_", with: "")
+                return sName == normalizedName || $0.displayName.localizedCaseInsensitiveContains(invokedToolName)
+            })
+            
+            if let fallback = matchedSkill {
+                LogManager.shared.info(
+                    "🪄 [智能容错] 模型直接调用了已勾选的技能实体 [\(invokedToolName)]，已自动映射至 [\(fallback.name)] 物理执行",
+                    parentID: LogManager.shared.activeContextID
+                )
+            }
+        }
+
+        guard let skill = matchedSkill else {
+            let isConfiguredInGlobal = agentVM.skills.contains(where: {
+                let sName = $0.name.lowercased().replacingOccurrences(of: "-", with: "_")
+                let iName = invokedToolName.lowercased().replacingOccurrences(of: "-", with: "_")
+                return sName == iName || sName == "skill_\(iName)" || iName == "skill_\(sName)"
+            })
+            
+            if isConfiguredInGlobal {
+                return (invokedToolId, invokedToolName, "{\"error\": \"技能 [\(invokedToolName)] 未在当前智能体分身中勾选配备。请先在分身配置面板中勾选该技能。\"}", nil, nil, false)
+            } else {
+                return (invokedToolId, invokedToolName, "{\"error\": \"未找到工具 [\(invokedToolName)]。请调用 read_skill_manual 核对可用技能名录。\"}", nil, nil, false)
+            }
         }
         
-        let safeArgs = coerceArguments(args: invokedToolArgs, skill: skill)
+        // 参数自适应 Coerce 装配
+        var rawArgs = invokedToolArgs
+        if (skill.type == .cli || skill.type == .shell) && rawArgs["raw_command"] == nil && rawArgs["command"] == nil {
+            if let inputStr = (rawArgs["input"] as? String) ?? (rawArgs["action"] as? String) {
+                rawArgs["command"] = inputStr
+                rawArgs["raw_command"] = inputStr
+            }
+        }
+        let safeArgs = coerceArguments(args: rawArgs, skill: skill)
         
-        // 5. 人类在环授权拦截 (Human-in-the-loop)
+        // 5. 人类在环授权拦截 (HITL)
         if skill.requiresConfirmation && !autoApprove {
             continuation.yield(.toolCallConfirmation(id: invokedToolId, name: invokedToolName, args: safeArgs))
             let isAllowed = await UserInteractionManager.shared.requestPermission(id: invokedToolId)
@@ -851,67 +396,28 @@ final class AgentManager: Sendable {
             }
         }
         
-        // 6. 执行物理工具并解析 Base64 多模态负载
-        continuation.yield(.toolCallInfo(id: invokedToolId, name: invokedToolName, args: safeArgs, thoughtSignature: invokedThoughtSignature))
+        // 6. UI 语义解包与状态通知
+        var displayToolName = skill.name
+        if (invokedToolName == "execute_skill"),
+           let realSkillName = (invokedToolArgs["skill_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !realSkillName.isEmpty {
+            displayToolName = realSkillName
+        }
+        
+        continuation.yield(.toolCallInfo(id: invokedToolId, name: displayToolName, args: safeArgs, thoughtSignature: invokedThoughtSignature))
+        
+        // 7. 执行底层引擎并解析 Base64 多模态负载
         let rawResult = await agentVM.executeTool(skill: skill, args: safeArgs, skipConfirmation: true)
         let (processedResult, extractedImg, savedURL) = rawResult.processBase64ImagePayload()
 
-        let isMetaTool = ["task_planner", "finish_task", "read_skill_manual", "call_sub_agent", "skill_memory_manager"].contains(invokedToolName)
+        let isMetaTool = ["finish_task", "read_skill_manual", "execute_skill", "call_sub_agent", "skill_memory_manager"].contains(invokedToolName)
 
-        // 7. 物理变异写操作核验探针 (Post-Mutation Verification)
-        if !isMetaTool {
-            let opType = SkillOperationGrammar.classify(toolName: invokedToolName, args: safeArgs)
-            let contract = SkillOperationGrammar.extractContract(toolName: invokedToolName, args: safeArgs)
-            
-            if opType == .mutation, let verificationContract = contract {
-                let currentPlan = agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"]
-                let nodes = TaskBlackboardManager.shared.parsePlan(currentPlan)
-                
-                if let activeNode = TaskBlackboardManager.shared.findNextActionableTask(in: nodes) {
-                    if let updatedPlan = TaskBlackboardManager.shared.updateValidationState(
-                        planString: currentPlan,
-                        taskId: activeNode.id,
-                        validationState: .verifying,
-                        contract: verificationContract
-                    ) {
-                        agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = updatedPlan
-                    }
-                    
-                    let (isVerified, artifact, diagnostic) = await executePostMutationVerification(
-                        contract: verificationContract,
-                        currentAgent: currentAgent,
-                        dynamicActiveSkills: dynamicActiveSkills,
-                        continuation: continuation
-                    )
-                    
-                    let finalState: MilestoneValidationState = isVerified ? .verifiedSuccess : .discrepancyFound
-                    let artifactsList = artifact.map { [$0] }
-                    
-                    if let reconciledPlan = TaskBlackboardManager.shared.updateValidationState(
-                        planString: agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"],
-                        taskId: activeNode.id,
-                        validationState: finalState,
-                        contract: verificationContract,
-                        resultMemo: diagnostic,
-                        artifacts: artifactsList
-                    ) {
-                        agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = reconciledPlan
-                    }
-                }
-            }
-        }
-
-        // 8. 物理报错上下文状态标记
         if !isMetaTool {
             let isExecutionFailed = PhysicalTruthVerifier.hasPhysicalError(output: processedResult)
             agentVM.sharedContext["LAST_TOOL_HAS_ERROR"] = isExecutionFailed ? "true" : "false"
-        } else if invokedToolName == "task_planner" {
-            if !processedResult.contains("❌") {
-                agentVM.sharedContext["LAST_TOOL_HAS_ERROR"] = "false"
-            }
         }
         
-        // 9. 输出内容安全截断（头尾保真压缩，防止爆 Token）
+        // 8. 安全截断保护（头尾保真压缩）
         let maxSafeChars = 30_000
         let execResult: String
         if processedResult.count > maxSafeChars {
@@ -919,17 +425,86 @@ final class AgentManager: Sendable {
             let tailLen = 12_000
             let head = processedResult.prefix(headLen)
             let tail = processedResult.suffix(tailLen)
-            execResult = "\(head)\n\n...[⚠️ 早期/异常大文件输出已执行头尾保真压缩，原始共 \(processedResult.count) 字符]...\n\n\(tail)"
+            execResult = "\(head)\n\n...[⚠️ 输出内容过长，已执行头尾保真压缩，原始共 \(processedResult.count) 字符]...\n\n\(tail)"
         } else {
             execResult = processedResult
         }
         
-        return (invokedToolId, invokedToolName, execResult, extractedImg, savedURL, execResult.hasPrefix("[AGENT_PIPELINE_TERMINATE]:"))
+        return (invokedToolId, displayToolName, execResult, extractedImg, savedURL, execResult.hasPrefix("[AGENT_PIPELINE_TERMINATE]:"))
     }
     
-    private func runSubAgentSandbox(
+    /// 无头公证员纯逻辑对账机制 (Zero-Tool Critic Agent)
+    static func verifyClaimWithHeadlessCritic(
+        originalPrompt: String,
+        evidence: String,
+        model: String
+    ) async -> (passed: Bool, reason: String) {
+        let cleanEvidence = evidence.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if cleanEvidence.isEmpty || cleanEvidence == "{}" || cleanEvidence == "[]" {
+            return (false, "缺少真实物理依据，请先调用相关查询指令提取系统真实反馈数据，再提交公证。")
+        }
+        
+        let lowerEvidence = cleanEvidence.lowercased()
+        if lowerEvidence.contains("blocked_by_quota") || lowerEvidence.contains("error") || lowerEvidence.contains("failed") || lowerEvidence.contains("exception") {
+            return (false, "物理证据显示底层执行遭遇异常，请处理报错并重新验证后再提交。")
+        }
+        
+        let criticInstruction = """
+        你是一名极其严谨的企业级交付质量公证员（Verifier）。
+        请对照【用户原始需求】与提供的【物理读回证据数据】，客观评判需求是否真正达成。
+        
+        【公证原则】：
+        - 请关注证据的“真实系统特征”（如环境特有的字段结构、非自然语言编排的冗余数据），若证据表现为高度概括的总结性话语或过于工整却缺乏特征的假 JSON，请判定为未通过。
+        - 仅依据物理证据中的客观字段/ID 进行对账验证。
+        - 请严格遵循以下 JSON 格式输出结果：
+        {"passed": true/false, "reason": "通过评价或具体的驳回原因与修正指引"}
+        """
+        
+        let criticPrompt = """
+        【用户原始需求】:
+        \(originalPrompt)
+        
+        【物理读回证据数据】:
+        \(cleanEvidence)
+        """
+        
+        do {
+            let stream = LLMService.shared.ask(
+                messages: [.user(criticPrompt)],
+                model: model,
+                images: [],
+                fileURLs: [],
+                instruction: criticInstruction,
+                activeSkills: []
+            )
+            
+            var criticResponse = ""
+            for try await step in stream {
+                if case .textDelta(let t) = step { criticResponse += t }
+            }
+            
+            let cleanJSON = criticResponse.extractJSON() ?? criticResponse
+            if let data = cleanJSON.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let passed = dict["passed"] as? Bool {
+                let reason = dict["reason"] as? String ?? "核验完成"
+                return (passed, reason)
+            }
+            
+            let isPassed = criticResponse.contains("\"passed\": true") || (criticResponse.contains("通过") && !criticResponse.contains("未通过"))
+            return (isPassed, isPassed ? "公证核验通过" : criticResponse)
+        } catch {
+            return (true, "公证通道网络波动，降级放行")
+        }
+    }
+    
+    /// Sub-Agent 专家沙盒独立推演
+    @MainActor
+    static func runSubAgentSandbox(
         profile: AgentProfile,
         taskInstruction: String,
+        agentVM: AgentViewModel,
         continuation: AsyncThrowingStream<AgentStep, Error>.Continuation
     ) async -> String {
         let subSkills = agentVM.skills.filter { skill in skill.isEnabled && profile.equippedSkillIDs.contains(skill.id) }
@@ -988,7 +563,6 @@ final class AgentManager: Sendable {
                     subMessages.append(.assistant(text: "\(roundText)\n[调用动作: \(bgToolName), 参数: \(jsonArgs)]\n[反馈]: \(res)"))
                 }
             } else {
-                // 没有工具调用时，纯文本即代表专家最终回复
                 finalResult = roundText
                 isTaskFinished = true
             }
@@ -996,8 +570,8 @@ final class AgentManager: Sendable {
         return finalResult.isEmpty ? "专家已完成处理" : finalResult
     }
     
-    // MARK: - 数字分身隔离心智演进沙盒
-    private func runPersonaSandbox(
+    /// 数字分身隔离心智演进沙盒
+    static func runPersonaSandbox(
         personaName: String,
         dialogueInput: String,
         sceneContext: String,
@@ -1006,7 +580,6 @@ final class AgentManager: Sendable {
     ) async -> String {
         let cleanName = personaName.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        // 严格鉴权：必须在已勾选允许的分身池中
         guard let persona = PersonaManager.shared.personas.first(where: {
             allowedPersonaIDs.contains($0.id) &&
             ($0.name.localizedCaseInsensitiveContains(cleanName) || cleanName.localizedCaseInsensitiveContains($0.name))
@@ -1016,13 +589,11 @@ final class AgentManager: Sendable {
         
         continuation.yield(.status("正在唤醒分身 [\(persona.name)] 入戏推演..."))
         
-        // 1. 动态编译包含 Ebbinghaus 记忆、世界观、防出戏与羁绊阶梯的专属 Prompt
         var compiledPrompt = PersonaManager.shared.compilePersonaPrompt(for: persona.id, query: dialogueInput)
         if !sceneContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             compiledPrompt += "\n【🎭 即时情境】:\n\(sceneContext)\n"
         }
         
-        // 2. 纯隔离会话流（不注入主控任务黑板与工具，严防穿模）
         let sandboxMessages: [ContextMessage] = [
             .system(compiledPrompt),
             .user(dialogueInput)
@@ -1050,7 +621,6 @@ final class AgentManager: Sendable {
             return "❌ 分身沙盒通信异常: \(error.localizedDescription)"
         }
         
-        // 3. 解析增量差分反哺心智状态（好感/情绪惯性/即时事实）
         if let deltaJSON = accumulatedResponse.extractPersonaDelta() {
             PersonaManager.shared.applyMentalDelta(for: persona.id, deltaJSON: deltaJSON)
         }
@@ -1060,57 +630,7 @@ final class AgentManager: Sendable {
         return cleanDialogue.isEmpty ? "（\(persona.name) 凝视着你，未作言语）" : cleanDialogue
     }
     
-    private func buildEnrichedContext(
-        request: AgentExecutionRequest,
-        currentAgent: AgentProfile,
-        activeSkills: [AgentSkill],
-        maxTokens: Int
-    ) async -> [ContextMessage] {
-        let sanitizedQuery = ChatOrchestrator.sanitizeUserMessage(request.prompt)
-        let payload = ContextEnrichmentPayload(
-            query: sanitizedQuery,
-            currentAgent: currentAgent,
-            activeSkills: activeSkills,
-            personaID: request.personaID,
-            sliceIndex: request.sliceIndex,
-            maxTokens: maxTokens,
-            messages: request.historyMessages,
-            sharedContext: agentVM.sharedContext
-        )
-        
-        var contextMsgs: [ContextMessage] = []
-        var totalTokens = TokenEstimationEngine.estimateTextTokens(sanitizedQuery)
-        
-        for enricher in enrichers.sorted(by: { $0.priority < $1.priority }) {
-            await enricher.enrich(payload: payload, messages: &contextMsgs, totalTokens: &totalTokens)
-        }
-        
-        // 若为数字分身，将动态心智状态（时钟、情绪、羁绊、已知事实）作为末尾环境封包注入
-        if let pID = request.personaID {
-            let dynamicContext = PersonaManager.shared.compileDynamicRuntimeContext(for: pID, query: sanitizedQuery)
-            if !dynamicContext.isEmpty {
-                contextMsgs.append(.system(dynamicContext))
-            }
-        }
-        
-        contextMsgs.append(.user(sanitizedQuery))
-        
-        let accurateTotal = TokenEstimationEngine.estimateTokens(
-            messages: contextMsgs,
-            systemInstruction: currentAgent.systemPrompt,
-            images: request.images,
-            activeSkills: activeSkills,
-            protocolType: currentAgent.baseModel
-        )
-        agentVM.sharedContext["AGENT_TOTAL_TOKENS"] = "\(accurateTotal)"
-        return contextMsgs
-    }
-    
-    private func estimateTokens(for text: String) -> Int {
-        text.isEmpty ? 0 : Int(Double(text.count) * 1.5)
-    }
-    
-    private func coerceArguments(args: [String: Any], skill: AgentSkill) -> [String: Any] {
+    private static func coerceArguments(args: [String: Any], skill: AgentSkill) -> [String: Any] {
         var corrected = args
         for param in skill.parameters {
             guard let val = args[param.name] else { continue }
@@ -1126,200 +646,637 @@ final class AgentManager: Sendable {
         }
         return corrected
     }
+}
+
+// MARK: - ==================== 4. AgentAutonomyEngine (多轮推演核心状态机) ====================
+
+enum AgentAutonomyEngine {
     
-    static func compactContext(
-        messages: [ContextMessage],
-        keepRecentTurns: Int,
-        maxObservationLength: Int
-    ) -> [ContextMessage] {
-        // 最近 N 轮的交互（Assistant + Tool 对）保持高保真无损
-        let protectedMessageCount = max(2, keepRecentTurns * 2)
-        guard messages.count > protectedMessageCount else { return messages }
-        
-        var compacted: [ContextMessage] = []
-        let cutoffIndex = messages.count - protectedMessageCount
-        
-        for (index, msg) in messages.enumerated() {
-            var newMsg = msg
-            if index < cutoffIndex {
-                // 对超出阈值的远期 Tool 结果采用 6:4 头尾保真折叠，保留核心定义与返回 ID
-                if msg.role == .tool, let content = msg.content, content.count > maxObservationLength {
-                    let headLen = Int(Double(maxObservationLength) * 0.6)
-                    let tailLen = maxObservationLength - headLen
-                    let head = content.prefix(headLen)
-                    let tail = content.suffix(tailLen)
-                    newMsg.content = "\(head)\n\n...[早期数据已折叠，原始共 \(content.count) 字符]...\n\n\(tail)"
-                }
-            }
-            compacted.append(newMsg)
-        }
-        return compacted
-    }
-    
-    /// 执行变异写操作后的物理反查探针与数据对账
-    private func executePostMutationVerification(
-        contract: VerificationContract,
-        currentAgent: AgentProfile,
-        dynamicActiveSkills: [AgentSkill],
+    /// 执行端到端推理流水线：基于多轮推演进行动态名录装配与原生自主推演
+    @MainActor
+    static func runPipeline(
+        request: AgentExecutionRequest,
+        agentManager: AgentManager,
         continuation: AsyncThrowingStream<AgentStep, Error>.Continuation
-    ) async -> (isVerified: Bool, artifact: AgentArtifact?, diagnostic: String?) {
-        continuation.yield(.status("🔍 正在执行物理状态反查核验 [\(contract.expectedMutationKey)]..."))
-        
-        // 1. 查找匹配的探针工具
-        guard let probeSkill = dynamicActiveSkills.first(where: { $0.name == contract.probeToolName }) else {
-            return (false, nil, "未找到指定的验收探针工具 [\(contract.probeToolName)]")
+    ) async throws {
+        let cleanPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanPrompt.isEmpty || !request.images.isEmpty || !request.fileURLs.isEmpty else {
+            return
         }
         
-        // 2. 构造探针执行参数
-        let probeArgs: [String: Any] = ["cmd": contract.probeCommandTemplate, "command": contract.probeCommandTemplate]
-        let safeProbeArgs = coerceArguments(args: probeArgs, skill: probeSkill)
-        
-        // 3. 静默下发探针工具执行
-        let rawProbeResult = await agentVM.executeTool(skill: probeSkill, args: safeProbeArgs, skipConfirmation: true)
-        let (cleanProbeResult, _, _) = rawProbeResult.processBase64ImagePayload()
-        
-        // 4. 物理真值校验与特征断言 (Diff Assertion)
-        let hasError = PhysicalTruthVerifier.hasPhysicalError(output: cleanProbeResult)
-        if hasError {
-            return (false, nil, "探针反查物理接口返回异常: \(cleanProbeResult.prefix(150))")
+        for (k, v) in request.sharedContext {
+            agentManager.agentVM.sharedContext[k] = v
         }
         
-        // 核验目标变异键是否已真实写入物理系统
-        let isKeyPresent = cleanProbeResult.contains(contract.expectedMutationKey)
-        
-        if isKeyPresent {
-            let diffDesc = "已核验物理实体 [ID: \(contract.targetResourceId)] 成功挂载 [\(contract.expectedMutationKey)]"
-            let artifact = AgentArtifact(
-                name: "物理核验证据_\(contract.expectedMutationKey)",
-                type: .diff,
-                content: "【反查探针】: \(contract.probeCommandTemplate)\n【生效断言】: 属性 [\(contract.expectedMutationKey)] 真实存在且结构有效\n【数据快照】:\n\(cleanProbeResult.prefix(800))"
+        // 1. 解析当前唤醒的 Agent 实体
+        let currentAgent: AgentProfile
+        if let pID = request.personaID,
+           let persona = PersonaManager.shared.personas.first(where: { $0.id == pID }) {
+            let fallbackModel = ConfigManager.shared.app.agentProfiles.first?.baseModel ?? "gemini-2.0-flash"
+            let hostEquippedIDs = request.agentID.flatMap { aID in
+                ConfigManager.shared.app.agentProfiles.first(where: { $0.id == aID })
+            }?.equippedSkillIDs ?? []
+            
+            let mergedSkillIDs = Array(Set(persona.equippedSkillIDs + hostEquippedIDs))
+            currentAgent = AgentProfile(
+                name: persona.name,
+                icon: "theatermasks.fill",
+                baseModel: fallbackModel,
+                systemPrompt: PersonaManager.shared.compileStaticPersonaPrompt(for: persona.id),
+                bindKnowledgeCategory: persona.bindDedicatedCategory ?? "",
+                equippedSkillIDs: mergedSkillIDs,
+                enableAutonomy: true,
+                executionMode: .interactive,
+                maxSteps: 8,
+                maxAutoRuns: 3,
+                enableCircuitBreaker: true,
+                maxRepetitions: 3
             )
-            return (true, artifact, diffDesc)
+        } else if let aID = request.agentID,
+                  let agent = ConfigManager.shared.app.agentProfiles.first(where: { $0.id == aID }) {
+            currentAgent = agent
         } else {
-            return (false, nil, "物理反查未发现预期属性 [\(contract.expectedMutationKey)]，系统数据尚未生效")
+            currentAgent = ConfigManager.shared.app.agentProfiles.first ?? AgentProfile(
+                name: "默认助手",
+                baseModel: "gemini-2.0-flash",
+                systemPrompt: "你是由系统调用的专家，请直接输出高质量专业解答。"
+            )
         }
-    }
-}
 
-// MARK: - ==================== 0.1 精准 Token 计量与多模态估算引擎 ====================
+        // 2. 静态常驻元工具装配 (100% 保护 Prompt Cache)
+        let allConfiguredSkills = agentManager.agentVM.skills.filter { skill in
+            skill.isEnabled && currentAgent.equippedSkillIDs.contains(skill.id)
+        }
 
-struct TokenEstimationEngine {
-    /// 精准多模态与结构化上下文 Token 估算
-    static func estimateTokens(
-        messages: [ContextMessage],
-        systemInstruction: String = "",
-        images: [NSImage] = [],
-        activeSkills: [AgentSkill] = [],
-        protocolType: String = "openai"
-    ) -> Int {
-        var total = 0
+        let skillsBasePath = ConfigManager.shared.skillsPath?.path ?? ""
+        var dynamicActiveSkills: [AgentSkill] = []
         
-        // 1. 系统指令与元数据开销
-        if !systemInstruction.isEmpty {
-            total += estimateTextTokens(systemInstruction) + 12
+        dynamicActiveSkills.removeAll(where: { $0.name == "call_digital_persona" })
+        let boundPersonas = PersonaManager.shared.personas.filter { currentAgent.allowedPersonaIDs.contains($0.id) }
+        if !boundPersonas.isEmpty {
+            dynamicActiveSkills.append(Skill_CallPersona(boundPersonas: boundPersonas))
         }
         
-        // 2. 消息体 Token 统计 (中英/代码/结构加权)
-        for msg in messages {
-            total += 4 // 角色标记与边界开销
-            if let text = msg.content, !text.isEmpty {
-                total += estimateTextTokens(text)
+        dynamicActiveSkills.sort { $0.name.lowercased() < $1.name.lowercased() }
+
+        // 3. 构造轻量可用技能名录
+        let hasExecuteSkill = allConfiguredSkills.contains(where: { $0.name == "execute_skill" })
+        let staticMetaNames: Set<String> = ["read_skill_manual", "execute_skill", "finish_task", "call_digital_persona", "call_sub_agent"]
+        let equippedBusinessSkills = allConfiguredSkills.filter { !staticMetaNames.contains($0.name) }
+        
+        var lightweightCatalog = ""
+        if hasExecuteSkill && !equippedBusinessSkills.isEmpty {
+            if let manualSkill = agentManager.agentVM.skills.first(where: { $0.name == "read_skill_manual" }) {
+                dynamicActiveSkills.append(manualSkill)
+            } else {
+                dynamicActiveSkills.append(Skill_ReadManual(skillsBasePath: skillsBasePath))
             }
-            if let toolCalls = msg.toolCalls {
-                for call in toolCalls {
-                    total += call.name.count / 3 + 12
-                    total += estimateTextTokens(call.arguments)
+            
+            if let execSkill = agentManager.agentVM.skills.first(where: { $0.name == "execute_skill" }) {
+                dynamicActiveSkills.append(execSkill)
+            } else {
+                dynamicActiveSkills.append(Skill_ExecuteSkill())
+            }
+            
+            if let finishSkill = agentManager.agentVM.skills.first(where: { $0.name == "finish_task" }) {
+                dynamicActiveSkills.append(finishSkill)
+            }
+            
+            lightweightCatalog = AgentContextOrchestrator.buildLightweightCatalog(for: equippedBusinessSkills)
+        } else {
+            dynamicActiveSkills = equippedBusinessSkills
+        }
+        
+        let activeModelConfig = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(currentAgent.baseModel) })
+        let maxContextTokens = activeModelConfig?.maxContextTokens ?? 32000
+        
+        let (enrichedMsgs, totalTokens) = await AgentContextOrchestrator.buildEnrichedContext(
+            request: request,
+            currentAgent: currentAgent,
+            activeSkills: dynamicActiveSkills,
+            maxTokens: maxContextTokens,
+            enrichers: agentManager.enrichers,
+            sharedContext: agentManager.agentVM.sharedContext
+        )
+        agentManager.agentVM.sharedContext["AGENT_TOTAL_TOKENS"] = "\(totalTokens)"
+        var loopMessages = enrichedMsgs
+        
+        if !lightweightCatalog.isEmpty {
+            loopMessages.insert(.system(lightweightCatalog), at: 0)
+        }
+        
+        // 4. 纯净静态系统指令注入
+        var systemInstruction = currentAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !systemInstruction.contains("<autonomous_protocol>") && hasExecuteSkill && !equippedBusinessSkills.isEmpty {
+            systemInstruction += AgentContextOrchestrator.buildAutonomousProtocol()
+        }
+        
+        // 5. 初始化推演状态机
+        let initialStepBudget = currentAgent.enableAutonomy ? max(1, currentAgent.maxSteps) : 1
+        var maxIterations = initialStepBudget
+        var currentIteration = 0
+        var autoExtensionCount = 0
+        var isTaskFinished = false
+        var textOnlyRounds = 0
+        var consecutiveErrors = 0
+        var currentRoundImages: [NSImage] = request.images
+        var historicalToolExecutionMap: [String: [String: String]] = [:]
+        let parentSessionID = request.sessionLogID ?? LogManager.shared.activeContextID
+        
+        // 6. 多轮自主推演核心循环
+        while currentIteration < maxIterations && !isTaskFinished {
+            try Task.checkCancellation()
+            currentIteration += 1
+            
+            let roundLogID = LogManager.shared.startGroup(
+                title: "🌀 [Agent 迭代 \(currentIteration)/\(maxIterations)]",
+                detail: nil,
+                level: .info,
+                parentID: parentSessionID
+            )
+            LogManager.shared.setContext(roundLogID)
+            
+            var currentRoundMessages = loopMessages
+            
+            if currentAgent.enableCompaction {
+                currentRoundMessages = AgentContextOrchestrator.compactContext(
+                    messages: currentRoundMessages,
+                    keepRecentTurns: currentAgent.keepRecentTurns,
+                    maxObservationLength: currentAgent.maxObservationLength
+                )
+            }
+            
+            let requestStartTime = Date()
+            var isFirstTokenReceived = false
+            var firstTokenLatency: TimeInterval = 0.0
+
+            let stream = LLMService.shared.ask(
+                messages: currentRoundMessages,
+                model: currentAgent.baseModel,
+                images: currentRoundImages,
+                fileURLs: currentIteration == 1 ? request.fileURLs : [],
+                instruction: systemInstruction,
+                activeSkills: dynamicActiveSkills
+            )
+            
+            var hasToolCallInThisRound = false
+            var roundResponseText = ""
+            var roundReasoningText = ""
+            var currentToolCalls: [(id: String, name: String, args: [String: Any], thoughtSignature: String?)] = []
+            
+            do {
+                for try await step in stream {
+                    try Task.checkCancellation()
+                    
+                    switch step {
+                    case .textDelta(let t):
+                        if !isFirstTokenReceived {
+                            isFirstTokenReceived = true
+                            firstTokenLatency = Date().timeIntervalSince(requestStartTime)
+                            LogManager.shared.info(
+                                "⚡️ 收到首字响应 (TTFT: \(String(format: "%.2f", firstTokenLatency))s)",
+                                detail: "大模型连接正常，流式交付正文...",
+                                parentID: roundLogID
+                            )
+                        }
+                        roundResponseText += t
+                        continuation.yield(.textDelta(t))
+                        
+                    case .reasoningDelta(let r):
+                        if !isFirstTokenReceived {
+                            isFirstTokenReceived = true
+                            firstTokenLatency = Date().timeIntervalSince(requestStartTime)
+                            LogManager.shared.info(
+                                "⚡️ 收到首字响应 (TTFT: \(String(format: "%.2f", firstTokenLatency))s)",
+                                detail: "大模型连接顺畅，正在进行深度推演 (<think>)...",
+                                parentID: roundLogID
+                            )
+                        }
+                        roundReasoningText += r
+                        continuation.yield(.reasoningDelta(r))
+                        
+                    case .reasoningDone:
+                        continuation.yield(.reasoningDone)
+                        
+                    case .toolCallInfo(let id, let name, let args, let thoughtSig):
+                        hasToolCallInThisRound = true
+                        let safeId = id.isEmpty ? "call_\(UUID().uuidString.prefix(6))" : id
+                        currentToolCalls.append((id: safeId, name: name, args: args, thoughtSignature: thoughtSig))
+                        
+                    case .usageUpdate(let count):
+                        continuation.yield(.usageUpdate(count))
+                        LogManager.shared.updateTokens(nodeID: roundLogID, tokens: count)
+                        
+                    default: break
+                    }
+                }
+                consecutiveErrors = 0
+            } catch {
+                let errorMsg = error.localizedDescription
+                let nsError = error as NSError
+                let lowerError = errorMsg.lowercased()
+                
+                LogManager.shared.error("❌ 模型响应异常", detail: errorMsg, parentID: roundLogID)
+                
+                if error is CancellationError { throw error }
+                
+                // 429 账户额度耗尽 / 欠费拦截
+                let isQuotaExceeded = lowerError.contains("quota") || lowerError.contains("billing") || lowerError.contains("exceeded your current quota") || lowerError.contains("insufficient_quota")
+                if isQuotaExceeded {
+                    let quotaNotice = """
+                    
+                    > ❌ **API 账户额度耗尽 / 配额超限 (HTTP 429)**:
+                    > 当前服务商 API Key 的可用额度已耗尽或已达到计费上限。
+                    > 请前往对应模型服务商后台充值或检查账单与配额设置。任务推演已安全终止。
+                    """
+                    continuation.yield(.textDelta(quotaNotice))
+                    LogManager.shared.error("🛑 触发账户额度硬上限，终止推演", detail: errorMsg, parentID: roundLogID)
+                    break
+                }
+                
+                // 502/503/504 服务端瞬时过载或并发限流自动指数退避重试
+                let isRateLimit = lowerError.contains("rate limit") || lowerError.contains("resource_exhausted") || lowerError.contains("429")
+                let isServerOverload = errorMsg.contains("503") || errorMsg.contains("502") || errorMsg.contains("504") || lowerError.contains("overloaded") || (nsError.domain == "HTTPError" && [429, 502, 503, 504].contains(nsError.code))
+                
+                if isServerOverload || isRateLimit {
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 5 {
+                        let timeoutNotice = "\n\n> ❌ **服务端高负载 / 速率限制重试超时**: 多次自动重试未恢复 (\(errorMsg))，推演已停止。"
+                        continuation.yield(.textDelta(timeoutNotice))
+                        break
+                    }
+                    
+                    let retryDelaySeconds = 2.0 * pow(1.5, Double(consecutiveErrors - 1))
+                    continuation.yield(.status("⏳ 服务端限流或瞬时过载，将在 \(String(format: "%.1f", retryDelaySeconds))s 后自动重试 (第 \(consecutiveErrors)/5 次)..."))
+                    
+                    try? await Task.sleep(nanoseconds: UInt64(retryDelaySeconds * 1_000_000_000))
+                    currentIteration -= 1
+                    continue
+                }
+                
+                // Gemini thought_signature 丢失容错重试
+                if errorMsg.contains("thought_signature") || (nsError.domain == "HTTPError" && nsError.code == 400) {
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 3 {
+                        continuation.yield(.textDelta("\n\n> ❌ **模型交互协议异常**: 无法建立上下文签名 (\(errorMsg))。"))
+                        break
+                    }
+                    loopMessages.append(.assistant(text: "我已感知到系统状态，正在重新规划方案。"))
+                    currentIteration -= 1
+                    continue
+                }
+                
+                consecutiveErrors += 1
+                if consecutiveErrors >= 3 {
+                    continuation.yield(.textDelta("\n\n> ❌ **模型通信中断**: 连续重试失败: \(errorMsg)"))
+                    break
+                }
+                
+                let retryDelay = UInt64(1.0 * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: retryDelay)
+                currentIteration -= 1
+                continue
+            }
+            
+            let rawCleanText = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hasToolCallInThisRound && rawCleanText.isEmpty && !roundReasoningText.isEmpty {
+                LogManager.shared.warning("⚠️ 检测到推演完成但正文为空且无动作，触发正向自愈", parentID: roundLogID)
+                loopMessages.append(.system("【系统指引】: 逻辑推演已就绪，请通过标准 Tool Call 接口调用物理工具，或直接在正文中输出解答。"))
+                continue
+            }
+            
+            let totalRoundDuration = Date().timeIntervalSince(requestStartTime)
+            let streamingDuration = max(0, totalRoundDuration - firstTokenLatency)
+            let metricsSummary = String(
+                format: "首字: %.2fs · 生成: %.1fs · 总计: %.1fs",
+                firstTokenLatency,
+                streamingDuration,
+                totalRoundDuration
+            )
+            
+            var decisionSummary = "【耗时指标】: \(metricsSummary)\n\n"
+            if !roundReasoningText.isEmpty {
+                decisionSummary += "【思考过程】:\n\(roundReasoningText.trimmingCharacters(in: .whitespacesAndNewlines))\n\n"
+            }
+            if !roundResponseText.isEmpty {
+                decisionSummary += "【模型回答】:\n\(roundResponseText.trimmingCharacters(in: .whitespacesAndNewlines))\n\n"
+            }
+            if !currentToolCalls.isEmpty {
+                let callList = currentToolCalls.map { tc in
+                    let argStr = (try? JSONSerialization.data(withJSONObject: tc.args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                    return "● 动作 [\(tc.name)]: \(argStr)"
+                }.joined(separator: "\n")
+                decisionSummary += "【决定下发动作】:\n\(callList)"
+            }
+            
+            LogManager.shared.info(
+                currentToolCalls.isEmpty ? "🧠 模型推理与正文交付 (\(metricsSummary))" : "🧠 模型推理与动作决策 (\(metricsSummary))",
+                detail: decisionSummary.isEmpty ? "(本轮无文本输出)" : decisionSummary,
+                parentID: roundLogID
+            )
+            
+            if hasToolCallInThisRound {
+                textOnlyRounds = 0
+                
+                let llmToolCalls = currentToolCalls.map { tc in
+                    let argStr = (try? JSONSerialization.data(withJSONObject: tc.args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                    return LLMToolCall(id: tc.id, name: tc.name, arguments: argStr, thoughtSignature: tc.thoughtSignature)
+                }
+                loopMessages.append(.assistant(text: roundResponseText.isEmpty ? nil : roundResponseText, toolCalls: llmToolCalls))
+                
+                let executionResults = await withTaskGroup(of: (id: String, name: String, result: String, image: NSImage?, fileURL: URL?, isFinished: Bool).self) { group in
+                    for tc in currentToolCalls {
+                        group.addTask { @MainActor in
+                            return await AgentToolDispatcher.executeSingleTool(
+                                tc: tc,
+                                currentAgent: currentAgent,
+                                dynamicActiveSkills: dynamicActiveSkills,
+                                originalUserPrompt: cleanPrompt,
+                                autoApprove: request.autoApproveConfirmation,
+                                agentVM: agentManager.agentVM,
+                                continuation: continuation
+                            )
+                        }
+                    }
+                    var collected: [(id: String, name: String, result: String, image: NSImage?, fileURL: URL?, isFinished: Bool)] = []
+                    for await res in group { collected.append(res) }
+                    return collected
+                }
+                
+                var newlyCapturedImages: [NSImage] = []
+                for res in executionResults {
+                    let isManualRead = (res.name == "read_skill_manual")
+                    let isExecutionFailed: Bool
+                    if isManualRead {
+                        isExecutionFailed = res.result.hasPrefix("❌") || res.result.hasPrefix("● 执行诊断：")
+                    } else {
+                        isExecutionFailed = res.result.hasPrefix("❌")
+                            || res.result.contains("⚠️ CLI 命令异常退出")
+                            || res.result.contains("⚠️ Shell 脚本异常退出")
+                            || res.result.hasPrefix("● 执行诊断：")
+                    }
+
+                    var prunedResultText: String
+                    if isExecutionFailed {
+                        let diagnostic = ToolExecutionDiagnostic.analyze(errorMessage: res.result)
+                        let matchedLessons = await MemoryManager.shared.getToolLessons(for: [res.name], topKPerTool: 2)
+                        var reflection = diagnostic.structuredHealingPrompt
+                        
+                        // 确保原始报错未在 healingPrompt 中出现时进行安全补全保真
+                        if !reflection.contains(res.result) && !res.result.isEmpty {
+                            reflection = "⚠️ 执行报错:\n\(res.result)\n\n\(reflection)"
+                        }
+                        
+                        if !matchedLessons.isEmpty {
+                            reflection += "\n\n💡 知识库历史调用规范参考:\n\(matchedLessons)"
+                        }
+                        prunedResultText = reflection
+                    } else {
+                        prunedResultText = res.result
+                    }
+                    
+                    let toolName = res.name
+                    let trimmedResult = prunedResultText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let currentArgsDict = currentToolCalls.first(where: { $0.id == res.id })?.args ?? [:]
+                    let currentArgsSummary = (try? JSONSerialization.data(withJSONObject: currentArgsDict, options: [.sortedKeys]))
+                        .flatMap { String(data: $0, encoding: .utf8) } ?? "\(currentArgsDict)"
+
+                    if hasExecuteSkill && !trimmedResult.isEmpty && !isExecutionFailed {
+                        if let previousInput = historicalToolExecutionMap[toolName]?[trimmedResult] {
+                            prunedResultText = """
+                            【系统强阻断 · 状态一致与命令未命中】:
+                            你下发的指令 [\(currentArgsSummary)] 产生的结果与历史调用 [\(previousInput)] 完全相同（返回了通用帮助或重复数据），表明当前命令或参数系凭空猜测，未命中有效物理功能。
+
+                            【强制行动指引】:
+                            1. 立即停止下发 execute_skill 尝试盲猜命令。
+                            2. 你的下一个 Tool Call 必须调用 `read_skill_manual(target_skill_name: "\(toolName)", doc_path: "...")` 精读对应业务子文档。
+                            3. 掌握手册中记载的真实子命令与参数格式后，方可继续下发物理执行。
+                            """
+                            LogManager.shared.warning(
+                                "🛑 捕捉到工具 [\(toolName)] 盲猜并重复输出，已注入强阻断深潜指令",
+                                parentID: roundLogID
+                            )
+                        } else {
+                            if historicalToolExecutionMap[toolName] == nil { historicalToolExecutionMap[toolName] = [:] }
+                            historicalToolExecutionMap[toolName]?[trimmedResult] = currentArgsSummary
+                        }
+                    }
+                    
+                    loopMessages.append(.tool(id: res.id, name: res.name, result: prunedResultText))
+                    continuation.yield(.toolCallResult(name: res.name, result: res.result))
+                    
+                    LogManager.shared.log(
+                        level: isExecutionFailed ? .error : .success,
+                        title: "⚡️ 动作执行 [\(res.name)]",
+                        detail: "【执行反馈】:\n\(res.result)",
+                        parentID: roundLogID
+                    )
+                    
+                    if res.isFinished { isTaskFinished = true }
+                    if let img = res.image { newlyCapturedImages.append(img) }
+                }
+                
+                if !newlyCapturedImages.isEmpty {
+                    loopMessages.append(.user("【视觉感知】: 以下是动作捕获的实况图像，请结合图像继续推进下一步："))
+                    currentRoundImages = newlyCapturedImages
+                } else {
+                    currentRoundImages = []
+                }
+                
+            } else {
+                textOnlyRounds += 1
+                let cleanRound = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
+                let isExplicitGivingUp = cleanRound.contains("无法继续") || cleanRound.contains("已终止") || cleanRound.contains("放弃任务")
+                
+                if isExplicitGivingUp && textOnlyRounds >= 2 {
+                    isTaskFinished = true
+                    LogManager.shared.info("🛑 检测到模型明确表达终止意图，平仓退出推演", parentID: roundLogID)
+                } else if currentAgent.enableAutonomy && currentIteration < maxIterations && textOnlyRounds <= 2 && hasExecuteSkill {
+                    let isFailedLast = isExecutionFailedInLastRound(loopMessages)
+                    let promptGuidance = isFailedLast
+                        ? "【系统纠偏指引】: 前序命令未命中有效功能。请调用 read_skill_manual 精读对应子文档获取确切语法后，再下发 Tool Call 推进。"
+                        : "【系统推进指引】: 规划与阶段探查已就绪，请继续通过 Tool Call 下发确切的物理执行或读回验证命令。"
+                    
+                    let lastMessageContent = loopMessages.last?.content ?? ""
+                    if !lastMessageContent.contains("系统推进指引") && !lastMessageContent.contains("系统纠偏指引") {
+                        loopMessages.append(.system(promptGuidance))
+                        LogManager.shared.info("🔄 拦截到纯文本停顿，已注入单次推进指令驱动模型继续执行", parentID: roundLogID)
+                    }
+                    continue
+                } else {
+                    isTaskFinished = true
                 }
             }
-        }
-        
-        // 3. 多模态视觉补偿 (按厂商真实计费标准)
-        for _ in images {
-            if protocolType.lowercased() == "gemini" {
-                total += 258 // Gemini 官方固定图片 Token 消耗
-            } else {
-                total += 765 // OpenAI / 通用高清切片均值
+            
+            // 步数预算调度
+            if currentIteration >= maxIterations && !isTaskFinished {
+                let stepBudget = max(1, currentAgent.maxSteps)
+                
+                if currentAgent.executionMode == .fullyAuto && autoExtensionCount < currentAgent.maxAutoRuns {
+                    autoExtensionCount += 1
+                    maxIterations += stepBudget
+                    let autoNotice = "⚡️ 步数已达预算上限，自动闭环机制已静默追加 \(stepBudget) 步推演 (第 \(autoExtensionCount)/\(currentAgent.maxAutoRuns) 轮)..."
+                    continuation.yield(.status(autoNotice))
+                    LogManager.shared.info("🔁 自动闭环静默续跑", detail: autoNotice, parentID: roundLogID)
+                } else {
+                    let pauseID = UUID().uuidString
+                    let isHardCapReached = currentAgent.executionMode == .fullyAuto && autoExtensionCount >= currentAgent.maxAutoRuns
+                    let stepExhaustedNotice = isHardCapReached
+                        ? "智能体已完成 \(autoExtensionCount) 轮自动续跑（累计 \(currentIteration) 步），已达安全上限，请人工复核进度。"
+                        : "智能体已完成 \(maxIterations) 步自主推演，任务流程尚未结单。"
+                    
+                    continuation.yield(.status("⏳ 等待人工确认下一步指示..."))
+                    continuation.yield(.pausedForHuman(
+                        id: pauseID,
+                        reason: stepExhaustedNotice,
+                        suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
+                    ))
+                    LogManager.shared.warning("⏳ 触发人工接管挂起", detail: stepExhaustedNotice, parentID: roundLogID)
+                    
+                    let humanInput = await AgentInterventionUI.requestGuidance(
+                        agentName: currentAgent.name,
+                        reason: stepExhaustedNotice,
+                        suggestedActions: ["追加 \(stepBudget) 步推演", "交付当前结论"]
+                    )
+                    
+                    if let input = humanInput, !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        loopMessages.append(.user("【用户追加指示】: \(input)\n请继续推进并完成后续任务。"))
+                        maxIterations += stepBudget
+                        autoExtensionCount = 0
+                    } else {
+                        isTaskFinished = true
+                    }
+                }
             }
+            
+            LogManager.shared.setContext(parentSessionID)
         }
-        
-        // 4. Tool Schema 声明结构体开销
-        for skill in activeSkills {
-            total += skill.name.count / 3 + skill.description.count / 3 + 24
-            for param in skill.parameters {
-                total += param.name.count / 3 + param.description.count / 3 + 16
-            }
-        }
-        
-        return total
     }
     
-    /// 启发式分词计量：对 CJK 汉字、英文词组、代码标点符号分别加权
-    static func estimateTextTokens(_ text: String) -> Int {
-        guard !text.isEmpty else { return 0 }
-        var cjkCount = 0
-        var asciiPunctCount = 0
-        var otherAsciiCount = 0
-        
-        for scalar in text.unicodeScalars {
-            let v = scalar.value
-            // CJK 统一表意文字、平假名、片假名、韩文字符
-            if (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3040 && v <= 0x30FF) || (v >= 0xAC00 && v <= 0xD7AF) {
-                cjkCount += 1
-            } else if scalar.properties.isASCIIHexDigit || (v >= 0x20 && v <= 0x7E) {
-                if "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".contains(Character(scalar)) {
-                    asciiPunctCount += 1
-                } else {
-                    otherAsciiCount += 1
+    private static func isExecutionFailedInLastRound(_ messages: [ContextMessage]) -> Bool {
+        guard let lastMsg = messages.last(where: { $0.role == .tool }) else { return false }
+        let content = lastMsg.content ?? ""
+        return content.contains("❌") || content.contains("⚠️") || content.contains("未就绪") || content.contains("No such file") || content.contains("error")
+    }
+}
+
+// MARK: - ==================== 5. AgentManager (全局通用无头调度门面) ====================
+
+@Observable
+@MainActor
+final class AgentManager: Sendable {
+    static let shared = AgentManager()
+    
+    var agentVM: AgentViewModel
+    var knowledgeVM: KnowledgeViewModel
+    
+    var enrichers: [ChatContextEnricher] = [
+        StickyPrivateQAEnricher(),
+        HistorySlidingWindowEnricher()
+    ]
+    
+    private init() {
+        self.agentVM = AgentViewModel()
+        self.knowledgeVM = KnowledgeViewModel()
+    }
+    
+    /// 打开并置前 Agent 智能体配置中心独立窗口
+    func show() {
+        AgentWindowManager.shared.show()
+    }
+    
+    func registerEnricher(_ enricher: ChatContextEnricher) {
+        enrichers.append(enricher)
+        enrichers.sort { $0.priority < $1.priority }
+    }
+    
+    func executeStream(request: AgentExecutionRequest) -> AsyncThrowingStream<AgentStep, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await AgentAutonomyEngine.runPipeline(
+                        request: request,
+                        agentManager: self,
+                        continuation: continuation
+                    )
+                    continuation.yield(.done)
+                    continuation.finish()
+                } catch {
+                    if !(error is CancellationError) {
+                        continuation.yield(.error(error.localizedDescription))
+                    }
+                    continuation.finish(throwing: error)
                 }
-            } else {
-                cjkCount += 1
+            }
+            
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
-        
-        // CJK: ~1.25 T/字; ASCII 词组: ~1 T / 3.6 字母; 代码/标点: ~0.6 T/符号
-        let cjkTokens = Double(cjkCount) * 1.25
-        let wordTokens = Double(otherAsciiCount) / 3.6
-        let punctTokens = Double(asciiPunctCount) * 0.6
-        
-        return max(1, Int(ceil(cjkTokens + wordTokens + punctTokens)))
     }
 }
 
-// MARK: - ==================== 0.2 阶段动态微提示词生成器 ====================
-
-// MARK: - 阶段动态微提示词生成器 (Stage-Aware Micro-Prompt Engine)
-struct AgentStagePromptEngine {
-    static func resolveStageMicroPrompt(
-        isAutonomy: Bool,
-        hasBlackboard: Bool,
-        blackboardPlan: String?
-    ) -> String? {
-        guard isAutonomy && hasBlackboard else { return nil }
-        
-        let hasNoPlan = (blackboardPlan == nil || blackboardPlan!.isEmpty || blackboardPlan == "[]")
-        
-        // 阶段 1 & 2：未创建黑板 -> 引导快速定位实体、同步输出意图并创建规划
-        if hasNoPlan {
-            return "【当前阶段：探索与规划】下发工具时请在正文中同步 1 句意图说明。定位到目标实体后，请调用 task_planner(action: 'create', tasks: [...]) 创建具体任务节点。"
+@MainActor
+final class AgentWindowManager: NSObject, NSWindowDelegate {
+    static let shared = AgentWindowManager()
+    private var window: NSWindow?
+    
+    var isVisible: Bool {
+        guard let w = window else { return false }
+        return w.isVisible && !w.isMiniaturized
+    }
+    
+    private override init() {
+        super.init()
+    }
+    
+    func show() {
+        if let existingWindow = window {
+            if existingWindow.isMiniaturized {
+                existingWindow.deminiaturize(nil)
+            }
+            existingWindow.makeKeyAndOrderFront(nil)
+            existingWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
         
-        let nodes = TaskBlackboardManager.shared.parsePlan(blackboardPlan!)
+        let view = AgentManagerView(
+            agentVM: AgentManager.shared.agentVM,
+            knowledgeVM: AgentManager.shared.knowledgeVM
+        )
         
-        // 阶段 3：存在待推进活动节点 -> 引导单步对账
-        if let activeNode = TaskBlackboardManager.shared.findNextActionableTask(in: nodes) {
-            return "【当前阶段：单步推进与契约核验】请同步正文意图并推进实体节点【\(activeNode.title)】。执行后核对数据契约，通过 result_memo 沉淀核心参数并流转状态。"
-        }
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        newWindow.title = "Agent 配置中心"
+        newWindow.center()
+        newWindow.isReleasedWhenClosed = false
+        newWindow.delegate = self
+        newWindow.isOpaque = false
+        newWindow.backgroundColor = .clear
+        newWindow.hasShadow = true
+        newWindow.titlebarAppearsTransparent = true
+        newWindow.titleVisibility = .hidden
+        newWindow.contentView = NSHostingView(rootView: view)
         
-        // 阶段 4：全部实体节点已成功闭环 -> 引导总结结单
-        if !TaskBlackboardManager.shared.hasUnfinishedTasks(planString: blackboardPlan!) {
-            return "【当前阶段：终态交付】所有实体任务已成功闭环，请调用 finish_task 提交三段式标准化总结报告并结单。"
-        }
-        
-        return nil
+        self.window = newWindow
+        newWindow.makeKeyAndOrderFront(nil)
+        newWindow.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        MainWindowManager.syncDockIconPolicy()
+    }
+    
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+        MainWindowManager.syncDockIconPolicy()
     }
 }
 
-// MARK: - ==================== 1. Agent 核心业务与状态管理器 (Facade 门面模式) ====================
+// MARK: - ==================== 6. AgentViewModel & Legacy (视图门面与推理适配器) ====================
 
 @Observable
 @MainActor
@@ -1357,8 +1314,6 @@ class AgentViewModel {
     }
 }
 
-// MARK: - ==================== 2. 后台物理推理引擎 (完全桥接 AgentManager) ====================
-
 @Observable
 @MainActor
 class AgentExecutionEngine {
@@ -1389,8 +1344,9 @@ class AgentExecutionEngine {
     }
 }
 
-// MARK: - ==================== 3. 基础视图与布局扩展 ====================
+// MARK: - ==================== 7. AgentUI Components (拟真装配工坊与模型面板) ====================
 
+/// 全局通用的左对齐表单标签行组件
 @MainActor
 struct LeftAlignedRow<Content: View>: View {
     let title: String
@@ -1414,55 +1370,16 @@ struct LeftAlignedRow<Content: View>: View {
     }
 }
 
-// MARK: - ==================== 4. 独立窗口管理器与主容器 ====================
-
-@MainActor
-class AgentWindowManager: NSObject, NSWindowDelegate {
-    static let shared = AgentWindowManager()
-    private var window: NSWindow?
-    var isVisible: Bool { return window != nil }
-    private override init() { super.init() }
-    
-    func show() {
-        if let window = window {
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
-            if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-            return
-        }
-        
-        let view = AgentManagerView(agentVM: AgentManager.shared.agentVM, knowledgeVM: AgentManager.shared.knowledgeVM)
-        let newWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1020, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
-        newWindow.title = "Agent 配置中心"
-        newWindow.center()
-        newWindow.isReleasedWhenClosed = false
-        newWindow.delegate = self
-        newWindow.isOpaque = false
-        newWindow.backgroundColor = .clear
-        newWindow.hasShadow = true
-        newWindow.titlebarAppearsTransparent = true
-        newWindow.titleVisibility = .hidden
-        newWindow.contentView = NSHostingView(rootView: view)
-        
-        self.window = newWindow
-        newWindow.makeKeyAndOrderFront(nil)
-        newWindow.orderFrontRegardless()
-        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        MainWindowManager.syncDockIconPolicy()
-    }
-    
-    func windowWillClose(_ notification: Notification) {
-        window = nil
-        MainWindowManager.syncDockIconPolicy()
-    }
-}
-
 @MainActor
 struct AgentManagerView: View {
     @State private var selectedTab: Int? = 0
     var agentVM: AgentViewModel
     var knowledgeVM: KnowledgeViewModel
+    
+    init(agentVM: AgentViewModel, knowledgeVM: KnowledgeViewModel) {
+        self.agentVM = agentVM
+        self.knowledgeVM = knowledgeVM
+    }
     
     var body: some View {
         NavigationSplitView {
@@ -1510,8 +1427,6 @@ struct AgentManagerView: View {
     }
 }
 
-// MARK: - ==================== 5. Agent 档案核心编排面板 ====================
-
 @MainActor
 struct AgentProfilesPanel: View {
     @Bindable var agentVM: AgentViewModel
@@ -1521,6 +1436,11 @@ struct AgentProfilesPanel: View {
     @State private var selectedProfileID: UUID?
     @State private var isCreating: Bool = false
     @State private var defaultAgentID: UUID? = ConfigManager.shared.app.generalConfig.defaultAgentID
+    
+    init(agentVM: AgentViewModel, knowledgeVM: KnowledgeViewModel) {
+        self.agentVM = agentVM
+        self.knowledgeVM = knowledgeVM
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -1537,7 +1457,7 @@ struct AgentProfilesPanel: View {
                 Button {
                     guard !isCreating else { return }; isCreating = true
                     let fallbackModel = ConfigManager.shared.app.aiConfigs.flatMap { $0.models }.first ?? ""
-                    let newAgent = AgentProfile(name: "新建智能体", baseModel: fallbackModel, systemPrompt: "你是一个高效、严谨的智能助手。请使用中文提供简洁、结构化且可执行的解答，拒绝废话与臆测。")
+                    let newAgent = AgentProfile(name: "新建智能体", baseModel: fallbackModel, systemPrompt: "你是一个高效、严谨的智能助手。请使用中文提供简洁、结构化且可执行的解答。")
                     withAnimation {
                         profiles.append(newAgent)
                         saveProfiles()
@@ -1651,8 +1571,6 @@ struct AgentProfilesPanel: View {
     }
 }
 
-// MARK: - ==================== 6. 拟人化 Stage 阶段卡片式编辑器 ====================
-
 @MainActor
 struct AgentProfileEditor: View {
     @Binding var profile: AgentProfile
@@ -1667,16 +1585,25 @@ struct AgentProfileEditor: View {
     let onSave: () -> Void
     
     @State private var showQAManagerSheet = false
-    @State private var showSaveToManagerPopover = false
-    
     private let icons = ["sparkles", "brain.head.profile", "wrench.and.screwdriver", "terminal", "doc.text.magnifyingglass", "globe", "chart.bar.doc.horizontal", "theatermasks.fill", "cpu", "network", "lock.shield.fill", "paintpalette.fill"]
+    
+    init(profile: Binding<AgentProfile>, isDefault: Bool, aiConfigs: [AiConfig], availableCategories: [String], dedicatedCategories: [String], availableSkills: [AgentSkill], onMakeDefault: @escaping () -> Void, onSave: @escaping () -> Void) {
+        self._profile = profile
+        self.isDefault = isDefault
+        self.aiConfigs = aiConfigs
+        self.availableCategories = availableCategories
+        self.dedicatedCategories = dedicatedCategories
+        self.availableSkills = availableSkills
+        self.onMakeDefault = onMakeDefault
+        self.onSave = onSave
+    }
     
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 editorHeroHeader
                 
-                // 🔷 STAGE 1：核心身份与引擎底座
+                // STAGE 1：核心身份与引擎底座
                 assemblyStageCard(
                     stageBadge: "STAGE 1",
                     stageTitle: "核心身份与引擎底座",
@@ -1756,7 +1683,7 @@ struct AgentProfileEditor: View {
                     }
                 }
                 
-                // 🔶 STAGE 2：认知中枢与系统指令
+                // STAGE 2：认知中枢与系统指令
                 assemblyStageCard(
                     stageBadge: "STAGE 2",
                     stageTitle: "认知中枢与系统指令",
@@ -1777,7 +1704,7 @@ struct AgentProfileEditor: View {
                             .cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(NSColor.separatorColor), lineWidth: 1))
                         
-                        Text("💡 提示：系统会自动提取首行作为【路由说明】(对主控公开)，请在首行简述其核心能力。底层执行纪律请在第二行之后书写，以免污染主控。")
+                        Text("💡 提示：系统会自动提取首行作为【路由说明】(对主控公开)，请在首行简述其核心能力。底层执行纪律请在第二行之后书写。")
                             .font(.caption)
                             .foregroundColor(.blue)
                             .padding(.top, 2)
@@ -1786,7 +1713,7 @@ struct AgentProfileEditor: View {
                     }
                 }
                 
-                // 🔴 STAGE 3：自主推理与安全策略 (意图驱动收敛设计)
+                // STAGE 3：自主推理与安全策略
                 assemblyStageCard(
                     stageBadge: "STAGE 3",
                     stageTitle: "自主推理与安全策略",
@@ -1794,7 +1721,6 @@ struct AgentProfileEditor: View {
                     themeColor: .red
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
-                        // 1. 主控推演开关
                         Toggle(isOn: $profile.enableAutonomy) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("开启多轮自主推演 (Autonomy Loop)")
@@ -1809,7 +1735,6 @@ struct AgentProfileEditor: View {
                         if profile.enableAutonomy {
                             ModernDivider(style: .fade(0.12))
                             
-                            // 2. 核心调度意图分段器
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("推演调度模式")
                                     .font(.system(size: 11, weight: .bold))
@@ -1822,7 +1747,6 @@ struct AgentProfileEditor: View {
                                 }
                                 .pickerStyle(.segmented)
                                 .onChange(of: profile.executionMode) { _, newMode in
-                                    // 自动闭环模式下强制激活熔断器
                                     if newMode == .fullyAuto {
                                         profile.enableCircuitBreaker = true
                                     }
@@ -1834,7 +1758,6 @@ struct AgentProfileEditor: View {
                                     .padding(.top, 2)
                             }
                             
-                            // 3. 单轮步数预算调节
                             HStack {
                                 Text("⚡️ 单轮推演预算")
                                     .font(.system(size: 11.5, weight: .semibold))
@@ -1851,10 +1774,8 @@ struct AgentProfileEditor: View {
                             .cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.red.opacity(0.15), lineWidth: 1))
                             
-                            // 4. 高级防御与上下文折叠 (渐进式抽屉)
                             DisclosureGroup {
                                 VStack(alignment: .leading, spacing: 12) {
-                                    // 熔断保护设置
                                     HStack {
                                         VStack(alignment: .leading, spacing: 2) {
                                             HStack(spacing: 4) {
@@ -1893,7 +1814,6 @@ struct AgentProfileEditor: View {
                                         }
                                     }
                                     
-                                    // 自动闭环续跑硬顶
                                     if profile.executionMode == .fullyAuto {
                                         HStack {
                                             Text("自动续跑最大硬顶")
@@ -1908,7 +1828,6 @@ struct AgentProfileEditor: View {
                                     
                                     Divider().opacity(0.3)
                                     
-                                    // 上下文滑动压缩设置
                                     Toggle(isOn: $profile.enableCompaction) {
                                         Text("长上下文滑动智能压缩")
                                             .font(.system(size: 11, weight: .semibold))
@@ -1945,7 +1864,7 @@ struct AgentProfileEditor: View {
                     }
                 }
                 
-                // 🟢 STAGE 4：知识图谱与私域记忆
+                // STAGE 4：知识图谱与私域记忆
                 assemblyStageCard(
                     stageBadge: "STAGE 4",
                     stageTitle: "知识图谱与私域记忆",
@@ -2002,7 +1921,7 @@ struct AgentProfileEditor: View {
                     }
                 }
                 
-                // 🟣 STAGE 5：武器库挂载与团队协作矩阵
+                // STAGE 5：武器库挂载与团队协作矩阵
                 assemblyStageCard(
                     stageBadge: "STAGE 5",
                     stageTitle: "武器库挂载与团队协作矩阵",
@@ -2010,8 +1929,6 @@ struct AgentProfileEditor: View {
                     themeColor: .purple
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
-                        
-                        // 1. 物理技能链
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("配备技能链 (Tools)").font(.system(size: 11, weight: .bold)).foregroundColor(.purple)
@@ -2028,7 +1945,6 @@ struct AgentProfileEditor: View {
                         
                         ModernDivider(style: .fade(0.12))
                         
-                        // 2. 专家智能体协作
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("专家团队协作矩阵 (Sub-Agents)").font(.system(size: 11, weight: .bold)).foregroundColor(.indigo)
@@ -2048,7 +1964,6 @@ struct AgentProfileEditor: View {
                         
                         ModernDivider(style: .fade(0.12))
                         
-                        // 3. 数字分身角色扮演矩阵
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 HStack(spacing: 5) {
@@ -2331,14 +2246,14 @@ struct AgentProfileEditor: View {
     }
 }
 
-// MARK: - ==================== 7. 全局 AI 模型引擎管理中心 ====================
-
 @MainActor
 struct AiModelConfigPanel: View {
     @State private var aiConfigs: [AiConfig] = ConfigManager.shared.app.aiConfigs
     @State private var expandedStates: [UUID: Bool] = [:]
     
     private let protocols = ["openai", "gemini", "chatgpt", "anthropic", "ollama"]
+    
+    init() {}
     
     var body: some View {
         VStack(spacing: 0) {
@@ -2527,12 +2442,12 @@ struct AiModelConfigPanel: View {
     }
 }
 
-// MARK: - ==================== 8. 高级语法指引视图 ====================
-
 @MainActor
 struct ActionChipSyntaxGuideView: View {
     @State private var isCopied: Bool = false
     @State private var isExpanded: Bool = false
+    
+    init() {}
     
     private let promptTemplate = """
     【交互按钮语法】

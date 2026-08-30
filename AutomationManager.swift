@@ -1,13 +1,14 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：AutomationManager.swift
-// 文件说明：适用于 macOS 14+ 的全局自动化引擎与触发器管理
-// 核心架构：
-// 1. 触发器引擎：定时、文件监控、App状态、剪贴板正则、快捷键、划词选中(AXUIElement)
-// 2. 双轨执行路由：支持唤醒智能体 (Agent) 与 多技能流水线直调 (Skill Pipeline)
-// 3. 上下文注入引擎：支持不同触发器类型专属的动态变量智能插入
-// 4. 极客悬浮窗：动态标题反馈、原地 Loading 动画、合理避让选中词
-// 5. 内存级日志中心：执行记录不落盘，退出即焚，轻量高效
-// 🚀 本次重大升级：增加 Fn 键触发划词管控；全盘拥抱 Swift 6 Async/Await 彻底解决严格并发警告(MainActor isolation)；异步化剪贴板休眠防止UI阻塞
+// 文件说明：适用于 macOS 14+ 的全局自动化引擎与触发器管理中枢 (Swift 6 Ready)
+//
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. AutomationModels          : 触发器类型、执行动作路由、展示模式与自动化规则模型
+// ├── 2. AutomationTemplateEngine  : 动态变量上下文注入与字典递归渲染引擎
+// ├── 3. AutomationFloatingPanel   : 划词避让、原地加载与极客悬浮微气泡交互系统 (QuickActionPanel)
+// ├── 4. AutomationFileMonitor     : 基于 FSEvents 的递归目录变动实时监听器 (过滤缓存与隐藏文件)
+// ├── 5. AutomationEngine (Core)   : 核心自动化触发器总控 (AXUIElement 划词提取/快捷键/定时/应用状态)
+// └── 6. AutomationUI Components   : 自动化管理面板、运行记录控制台、快捷键录制器与编辑表单
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -17,9 +18,9 @@ import UniformTypeIdentifiers
 import CoreServices
 import ApplicationServices
 
-// MARK: - ==================== 1. 数据模型 ====================
+// MARK: - ==================== 1. AutomationModels (数据模型与规则实体) ====================
 
-public enum TriggerType: String, CaseIterable, Codable {
+enum TriggerType: String, CaseIterable, Codable, Sendable {
     case timer = "定时循环"
     case fileSystem = "文件夹监控"
     case appState = "应用状态"
@@ -41,50 +42,50 @@ public enum TriggerType: String, CaseIterable, Codable {
     }
 }
 
-public enum ActionType: String, CaseIterable, Codable {
+enum ActionType: String, CaseIterable, Codable, Sendable {
     case callAgent = "唤醒智能体 (对话)"
     case callSkill = "静默调用技能 (后台)"
 }
 
-public enum ResultDisplayMode: String, CaseIterable, Codable {
+enum ResultDisplayMode: String, CaseIterable, Codable, Sendable {
     case none = "不显示"
     case island = "灵动岛通知"
     case dialog = "对话框显示"
     case floatingPanel = "划词下方显示"
 }
 
-public struct SkillAction: Identifiable, Codable, Equatable {
-    public var id = UUID()
-    public var skillName: String
-    public var shortName: String
-    public var argsJSON: String
+struct SkillAction: Identifiable, Codable, Equatable, Sendable {
+    var id = UUID()
+    var skillName: String
+    var shortName: String
+    var argsJSON: String
     
-    public init(skillName: String, shortName: String, argsJSON: String) {
+    init(skillName: String, shortName: String, argsJSON: String) {
         self.skillName = skillName
         self.shortName = shortName
         self.argsJSON = argsJSON
     }
 }
 
-public struct AutomationRule: Identifiable, Codable, Equatable {
-    public var id: UUID
-    public var name: String
-    public var isEnabled: Bool
+struct AutomationRule: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID
+    var name: String
+    var isEnabled: Bool
     
-    public var triggerType: TriggerType
-    public var triggerConfig: [String: String]
+    var triggerType: TriggerType
+    var triggerConfig: [String: String]
     
-    public var actionType: ActionType
-    public var targetAgentID: UUID?
-    public var taskPrompt: String
+    var actionType: ActionType
+    var targetAgentID: UUID?
+    var taskPrompt: String
     
-    public var targetSkills: [SkillAction]
-    public var targetSkillName: String
-    public var skillArgsJSON: String
+    var targetSkills: [SkillAction]
+    var targetSkillName: String
+    var skillArgsJSON: String
     
-    public var displayMode: ResultDisplayMode
+    var displayMode: ResultDisplayMode
     
-    public init(
+    init(
         id: UUID = UUID(),
         name: String,
         isEnabled: Bool = true,
@@ -112,42 +113,39 @@ public struct AutomationRule: Identifiable, Codable, Equatable {
         self.displayMode = displayMode
     }
     
-    public init(from decoder: Decoder) throws {
+    init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        
         self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         self.name = try container.decodeIfPresent(String.self, forKey: .name) ?? "未知规则"
         self.isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
-        
         self.triggerType = try container.decodeIfPresent(TriggerType.self, forKey: .triggerType) ?? .selectedTextMatch
         self.triggerConfig = try container.decodeIfPresent([String: String].self, forKey: .triggerConfig) ?? [:]
-        
         self.actionType = try container.decodeIfPresent(ActionType.self, forKey: .actionType) ?? .callAgent
         self.targetAgentID = try container.decodeIfPresent(UUID.self, forKey: .targetAgentID)
         self.taskPrompt = try container.decodeIfPresent(String.self, forKey: .taskPrompt) ?? ""
-        
         self.targetSkills = try container.decodeIfPresent([SkillAction].self, forKey: .targetSkills) ?? []
         self.targetSkillName = try container.decodeIfPresent(String.self, forKey: .targetSkillName) ?? ""
         self.skillArgsJSON = try container.decodeIfPresent(String.self, forKey: .skillArgsJSON) ?? "{}"
-        
         self.displayMode = try container.decodeIfPresent(ResultDisplayMode.self, forKey: .displayMode) ?? .island
     }
 }
 
-public struct AutomationRunLog: Identifiable {
-    public let id = UUID()
-    public let ruleId: UUID
-    public let ruleName: String
-    public let timestamp: Date
-    public let inputContext: String
-    public let result: String
-    public let isError: Bool
+struct AutomationRunLog: Identifiable, Sendable {
+    let id: UUID = UUID()
+    let ruleId: UUID
+    let ruleName: String
+    let timestamp: Date
+    let inputContext: String
+    let result: String
+    let isError: Bool
 }
 
-// MARK: - ==================== 2. 动态模板渲染引擎 ====================
+// MARK: - ==================== 2. AutomationTemplateEngine (动态上下文渲染引擎) ====================
 
-public struct TemplateEngine {
-    public static func render(text: String, context: [String: Any]) -> String {
+struct TemplateEngine: Sendable {
+    
+    /// 渲染文本中的动态变量 (如 {{clipboard}}, {{front_app}}, {{datetime}} 及自定义上下文)
+    static func render(text: String, context: [String: Any]) -> String {
         var rendered = text
         if rendered.contains("{{clipboard}}") {
             let clipText = NSPasteboard.general.string(forType: .string) ?? ""
@@ -169,7 +167,8 @@ public struct TemplateEngine {
         return rendered
     }
     
-    public static func renderDictionary(dict: [String: Any], context: [String: Any]) -> [String: Any] {
+    /// 深度递归渲染参数字典中的占位符
+    static func renderDictionary(dict: [String: Any], context: [String: Any]) -> [String: Any] {
         var result = dict
         for (key, value) in dict {
             if let strValue = value as? String {
@@ -186,22 +185,42 @@ public struct TemplateEngine {
     }
 }
 
-// MARK: - ==================== 3. 极客微型交互与结果面板 ====================
+// MARK: - ==================== 3. AutomationFloatingPanel (极客悬浮窗系统) ====================
 
-struct MenuActionItem: Identifiable { let id = UUID(); let title: String; let action: () -> Void }
+struct MenuActionItem: Identifiable {
+    let id = UUID()
+    let title: String
+    let action: () -> Void
+}
+
 struct QuickActionHoverButton: View {
-    let item: MenuActionItem; let isExecuting: Bool; let action: () -> Void; @State private var isHovered = false
+    let item: MenuActionItem
+    let isExecuting: Bool
+    let action: () -> Void
+    @State private var isHovered = false
+    
     var body: some View {
         Button(action: { if !isExecuting { action() } }) {
             HStack(spacing: 4) {
                 if isExecuting { ProgressView().controlSize(.small).scaleEffect(0.75) }
                 Text(isExecuting ? "稍等..." : item.title).font(.system(size: 11, weight: .medium))
-            }.foregroundColor((isHovered || isExecuting) ? .white : .primary).padding(.horizontal, 8).padding(.vertical, 4).background((isHovered || isExecuting) ? Color.accentColor : Color.clear).clipShape(Capsule()).contentShape(Capsule())
-        }.buttonStyle(.plain).onHover { isHovered = $0 }
+            }
+            .foregroundColor((isHovered || isExecuting) ? .white : .primary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background((isHovered || isExecuting) ? Color.accentColor : Color.clear)
+            .clipShape(Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
     }
 }
+
 struct QuickActionMenuView: View {
-    let items: [MenuActionItem]; @State private var executingId: UUID? = nil
+    let items: [MenuActionItem]
+    @State private var executingId: UUID? = nil
+    
     var body: some View {
         HStack(spacing: 0) {
             ForEach(items) { item in
@@ -212,49 +231,186 @@ struct QuickActionMenuView: View {
                     }
                 }
             }
-        }.padding(3).background(VisualEffectView(material: .popover, blendingMode: .behindWindow).opacity(0.95)).clipShape(Capsule()).overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5)).shadow(color: Color.black.opacity(0.12), radius: 5, x: 0, y: 2).background(GeometryReader { geo in Color.clear.onChange(of: geo.size) { _, newSize in DispatchQueue.main.async { QuickActionPanelManager.shared.resizePanel(to: newSize) } } })
-    }
-}
-struct QuickActionResultView: View {
-    let title: String; let resultText: String; var onCopy: () -> Void; var onClose: () -> Void
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack { Text(title).font(.system(size: 10, weight: .bold)).foregroundColor(.secondary); Spacer(); Button(action: onCopy) { Image(systemName: "doc.on.doc").font(.system(size: 10)) }.buttonStyle(.plain); Button(action: onClose) { Image(systemName: "xmark").font(.system(size: 10)) }.buttonStyle(.plain) }
-            ScrollView { Text(resultText).font(.system(size: 12)).foregroundColor(.primary).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }.frame(maxHeight: 200)
-        }.padding(12).frame(width: 300).background(VisualEffectView(material: .popover, blendingMode: .behindWindow).opacity(0.98)).cornerRadius(12).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.1), lineWidth: 0.5)).shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 5)
-    }
-}
-@MainActor
-class QuickActionPanelManager: NSObject {
-    static let shared = QuickActionPanelManager(); private var panel: NSPanel?; private var clickMonitors: [Any] = []; private var notificationObservers: [NSObjectProtocol] = []; var panelFrame: NSRect? { return panel?.frame }; private var currentSessionID: UUID = UUID()
-    func show(rules: [AutomationRule], context: [String: Any], at point: NSPoint) {
-        hide(); let sessionID = UUID(); self.currentSessionID = sessionID; var items: [MenuActionItem] = []
-        for rule in rules {
-            if rule.actionType == .callAgent { items.append(MenuActionItem(title: rule.name) { var ctx = context; ctx["floatingSessionID"] = sessionID; AutomationEngine.shared.execute(rule: rule, context: ctx) }) } else { for skill in rule.targetSkills { let displayName = skill.shortName.isEmpty ? skill.skillName : skill.shortName; items.append(MenuActionItem(title: displayName) { var ctx = context; ctx["floatingSessionID"] = sessionID; AutomationEngine.shared.execute(rule: rule, specificSkill: skill, context: ctx) }) } }
         }
-        guard !items.isEmpty else { return }; setupPanel(view: AnyView(QuickActionMenuView(items: items)), at: point)
+        .padding(3)
+        .background(VisualEffectView(material: .popover, blendingMode: .behindWindow).opacity(0.95))
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .shadow(color: Color.black.opacity(0.12), radius: 5, x: 0, y: 2)
+        .background(GeometryReader { geo in
+            Color.clear.onChange(of: geo.size) { _, newSize in
+                DispatchQueue.main.async { QuickActionPanelManager.shared.resizePanel(to: newSize) }
+            }
+        })
     }
-    func showResult(title: String, text: String, at point: NSPoint, sessionID: UUID?) {
-        if let sid = sessionID, sid != currentSessionID { ___triggerBreathing(text: "静默执行完毕", icon: "checkmark.seal.fill"); DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { ___dynamicIslandEscape(isEscape: true) }; return }
-        hide(); self.currentSessionID = UUID(); let resultView = QuickActionResultView(title: title, resultText: text, onCopy: { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string); ___triggerBreathing(text: "结果已复制", icon: "doc.on.doc.fill"); DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { ___dynamicIslandEscape(isEscape: true) } }, onClose: { [weak self] in self?.hide() })
-        setupPanel(view: AnyView(resultView), at: point)
-    }
-    func resizePanel(to size: CGSize) { guard let panel = panel else { return }; var frame = panel.frame; let oldWidth = frame.width; let oldHeight = frame.height; frame.size = size; frame.origin.x += (oldWidth - size.width) / 2.0; frame.origin.y += (oldHeight - size.height); panel.setFrame(frame, display: true, animate: true) }
-    func hideIfSessionMatches(_ sessionID: UUID) { if currentSessionID == sessionID { hide() } }
-    private func setupPanel(view: AnyView, at point: NSPoint) {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false); panel.level = .popUpMenu; panel.backgroundColor = .clear; panel.isOpaque = false; panel.hasShadow = false
-        let hostingView = NSHostingView(rootView: view); panel.contentView = hostingView; let size = hostingView.fittingSize; panel.setContentSize(size)
-        let x = point.x - size.width / 2; let y = point.y - size.height - 18; panel.setFrameOrigin(NSPoint(x: max(10, x), y: max(10, y))); panel.alphaValue = 0; panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { context in context.duration = 0.15; panel.animator().alphaValue = 1.0 }; self.panel = panel
-        let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in if let p = self?.panel, event.window == p { return event }; self?.hide(); return event }
-        let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] _ in Task { @MainActor in self?.hide() } }
-        if let l = local { clickMonitors.append(l) }; if let g = global { clickMonitors.append(g) }
-        let resignActiveObserver = NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.hide() }; notificationObservers.append(resignActiveObserver)
-    }
-    func hide() { panel?.close(); panel = nil; clickMonitors.forEach { NSEvent.removeMonitor($0) }; clickMonitors.removeAll(); notificationObservers.forEach { NotificationCenter.default.removeObserver($0) }; notificationObservers.removeAll() }
 }
 
-// MARK: - ==================== 4. FSEvents 递归监控 ====================
+struct QuickActionResultView: View {
+    let title: String
+    let resultText: String
+    var onCopy: () -> Void
+    var onClose: () -> Void
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title).font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
+                Spacer()
+                Button(action: onCopy) { Image(systemName: "doc.on.doc").font(.system(size: 10)) }.buttonStyle(.plain)
+                Button(action: onClose) { Image(systemName: "xmark").font(.system(size: 10)) }.buttonStyle(.plain)
+            }
+            ScrollView {
+                Text(resultText)
+                    .font(.system(size: 12))
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(maxHeight: 200)
+        }
+        .padding(12)
+        .frame(width: 300)
+        .background(VisualEffectView(material: .popover, blendingMode: .behindWindow).opacity(0.98))
+        .cornerRadius(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.1), lineWidth: 0.5))
+        .shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 5)
+    }
+}
+
+@MainActor
+class QuickActionPanelManager: NSObject {
+    static let shared = QuickActionPanelManager()
+    
+    private var panel: NSPanel?
+    private var clickMonitors: [Any] = []
+    private var notificationObservers: [NSObjectProtocol] = []
+    var panelFrame: NSRect? { return panel?.frame }
+    private var currentSessionID: UUID = UUID()
+    
+    func show(rules: [AutomationRule], context: [String: Any], at point: NSPoint) {
+        hide()
+        let sessionID = UUID()
+        self.currentSessionID = sessionID
+        var items: [MenuActionItem] = []
+        
+        for rule in rules {
+            if rule.actionType == .callAgent {
+                items.append(MenuActionItem(title: rule.name) {
+                    var ctx = context
+                    ctx["floatingSessionID"] = sessionID
+                    AutomationEngine.shared.execute(rule: rule, context: ctx)
+                })
+            } else {
+                for skill in rule.targetSkills {
+                    let displayName = skill.shortName.isEmpty ? skill.skillName : skill.shortName
+                    items.append(MenuActionItem(title: displayName) {
+                        var ctx = context
+                        ctx["floatingSessionID"] = sessionID
+                        AutomationEngine.shared.execute(rule: rule, specificSkill: skill, context: ctx)
+                    })
+                }
+            }
+        }
+        guard !items.isEmpty else { return }
+        setupPanel(view: AnyView(QuickActionMenuView(items: items)), at: point)
+    }
+    
+    func showResult(title: String, text: String, at point: NSPoint, sessionID: UUID?) {
+        if let sid = sessionID, sid != currentSessionID {
+            ___triggerBreathing(text: "静默执行完毕", icon: "checkmark.seal.fill")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { ___dynamicIslandEscape(isEscape: true) }
+            return
+        }
+        hide()
+        self.currentSessionID = UUID()
+        let resultView = QuickActionResultView(
+            title: title,
+            resultText: text,
+            onCopy: {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                ___triggerBreathing(text: "结果已复制", icon: "doc.on.doc.fill")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { ___dynamicIslandEscape(isEscape: true) }
+            },
+            onClose: { [weak self] in self?.hide() }
+        )
+        setupPanel(view: AnyView(resultView), at: point)
+    }
+    
+    func resizePanel(to size: CGSize) {
+        guard let panel = panel else { return }
+        var frame = panel.frame
+        let oldWidth = frame.width
+        let oldHeight = frame.height
+        frame.size = size
+        frame.origin.x += (oldWidth - size.width) / 2.0
+        frame.origin.y += (oldHeight - size.height)
+        panel.setFrame(frame, display: true, animate: true)
+    }
+    
+    func hideIfSessionMatches(_ sessionID: UUID) {
+        if currentSessionID == sessionID { hide() }
+    }
+    
+    private func setupPanel(view: AnyView, at point: NSPoint) {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .popUpMenu
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        
+        let hostingView = NSHostingView(rootView: view)
+        panel.contentView = hostingView
+        let size = hostingView.fittingSize
+        panel.setContentSize(size)
+        
+        let x = point.x - size.width / 2
+        let y = point.y - size.height - 18
+        panel.setFrameOrigin(NSPoint(x: max(10, x), y: max(10, y)))
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            panel.animator().alphaValue = 1.0
+        }
+        self.panel = panel
+        
+        let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            if let p = self?.panel, event.window == p { return event }
+            self?.hide()
+            return event
+        }
+        let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] _ in
+            Task { @MainActor in self?.hide() }
+        }
+        if let l = local { clickMonitors.append(l) }
+        if let g = global { clickMonitors.append(g) }
+        
+        let resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in self?.hide() }
+        notificationObservers.append(resignActiveObserver)
+    }
+    
+    func hide() {
+        panel?.close()
+        panel = nil
+        clickMonitors.forEach { NSEvent.removeMonitor($0) }
+        clickMonitors.removeAll()
+        notificationObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        notificationObservers.removeAll()
+    }
+}
+
+// MARK: - ==================== 4. AutomationFileMonitor (FSEvents 递归目录监控) ====================
 
 class RecursiveDirectoryMonitor {
     private var stream: FSEventStreamRef?
@@ -285,33 +441,25 @@ class RecursiveDirectoryMonitor {
             var hasValidChange = false
             var targetPath = monitor.path
             
-            // 遍历这批次发生的所有 FSEvents
             for i in 0..<numEvents {
                 let currentPath = paths[i]
                 let currentFlag = flagsBuffer[i]
-                
                 let fileName = URL(fileURLWithPath: currentPath).lastPathComponent
                 
-                // 🛡️ 核心防线 1：过滤系统隐藏文件、缓存文件 (如 .DS_Store, 临时文件等)
-                if fileName.hasPrefix(".") || fileName.hasSuffix("~") {
-                    continue
-                }
+                if fileName.hasPrefix(".") || fileName.hasSuffix("~") { continue }
                 
-                // 🛡️ 核心防线 2：精准识别真实变动，过滤纯元数据(Metadata)或属性修改
                 let isCreated = (currentFlag & UInt32(kFSEventStreamEventFlagItemCreated)) != 0
                 let isModified = (currentFlag & UInt32(kFSEventStreamEventFlagItemModified)) != 0
                 let isRemoved = (currentFlag & UInt32(kFSEventStreamEventFlagItemRemoved)) != 0
                 let isRenamed = (currentFlag & UInt32(kFSEventStreamEventFlagItemRenamed)) != 0
                 
-                // 仅当文件实质性新增、改内容、删除、重命名时才算作有效触发
                 if isCreated || isModified || isRemoved || isRenamed {
                     targetPath = currentPath
                     hasValidChange = true
-                    break // 在该批次中只要发现一个有效变动，就足够触发回调了，避免批量操作时的重复触发
+                    break
                 }
             }
             
-            // 只有存在有效变动时，才将最终路径派发给防抖引擎
             if hasValidChange {
                 monitor.callback(targetPath)
             }
@@ -325,7 +473,7 @@ class RecursiveDirectoryMonitor {
             &context,
             [path] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            1.5, // 稍微增加系统底层的延迟聚合时间 (从 1.0 改为 1.5)，减少 IO 碎片的连续触发
+            1.5,
             flags
         )
         
@@ -345,19 +493,18 @@ class RecursiveDirectoryMonitor {
     }
 }
 
-// MARK: - ==================== 5. 核心自动化执行引擎 ====================
+// MARK: - ==================== 5. AutomationEngine (核心自动化执行中枢) ====================
 
 @Observable
 @MainActor
-public class AutomationEngine {
-    public static let shared = AutomationEngine()
+final class AutomationEngine {
+    static let shared = AutomationEngine()
     
     internal private(set) var cachedAgentVM: AgentViewModel?
-    public var sessionLogs: [AutomationRunLog] = []
+    var sessionLogs: [AutomationRunLog] = []
     
     private var fileMonitors: [UUID: RecursiveDirectoryMonitor] = [:]
     private var timers: [UUID: AnyCancellable] = [:]
-    
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
     
     private var workspaceObservers: [UUID: [NSObjectProtocol]] = [:]
@@ -367,14 +514,12 @@ public class AutomationEngine {
     
     private let globalSelectionUUID = UUID()
     internal var lastMouseDownLocation: NSPoint?
-    
-    // 容错防抖与键盘记录
     internal var mouseDownTime: Date?
     internal var wasShiftDown: Bool = false
     
     private init() {}
     
-    public func startEngine() {
+    func startEngine() {
         if cachedAgentVM == nil { cachedAgentVM = AgentViewModel() } else { cachedAgentVM?.loadSkills() }
         stopAll()
         LogManager.shared.info("🚀 AutomationEngine: 正在重载自动化引擎...")
@@ -384,7 +529,7 @@ public class AutomationEngine {
         for rule in rules where rule.triggerType != .selectedTextMatch { setupTrigger(for: rule) }
     }
     
-    public func stopAll() {
+    func stopAll() {
         timers.values.forEach { $0.cancel() }; timers.removeAll()
         fileMonitors.values.forEach { $0.stop() }; fileMonitors.removeAll()
         debounceTasks.values.forEach { $0.cancel() }; debounceTasks.removeAll()
@@ -394,11 +539,9 @@ public class AutomationEngine {
         selectionMonitors.values.forEach { if let g = $0.global { NSEvent.removeMonitor(g) }; if let l = $0.local { NSEvent.removeMonitor(l) } }; selectionMonitors.removeAll()
     }
     
-    // MARK: - 5. 核心自动化执行引擎中的监听器重构
-        
+    // MARK: - 划词选中多维监听器
+    
     private func setupSelectionMonitor(for rules: [AutomationRule]) {
-        
-        // 1. 鼠标按下事件回调 (消除 assumeIsolated 崩溃，提取 ModifierFlags 异步入队)
         let downHandler: @Sendable (NSEvent) -> Void = { [weak self] event in
             let flags = event.modifierFlags
             Task { @MainActor [weak self] in
@@ -411,7 +554,6 @@ public class AutomationEngine {
                     return
                 }
                 
-                // 核心防线 1：源头掐断 (Fn 键规则过滤)
                 let selectionRules = rules.filter { $0.triggerType == .selectedTextMatch }
                 let allRequireFn = !selectionRules.isEmpty && selectionRules.allSatisfy { $0.triggerConfig["requireFnKey"] == "true" }
                 let isFnDown = flags.contains(.function)
@@ -427,7 +569,6 @@ public class AutomationEngine {
             }
         }
         
-        // 2. 鼠标抬起事件回调 (划词位移计算与触发分发)
         let upHandler: @Sendable (NSEvent) -> Void = { [weak self] event in
             let clickCount = event.clickCount
             let flags = event.modifierFlags
@@ -456,7 +597,6 @@ public class AutomationEngine {
                 
                 guard isTextSelectionIntent else { return }
                 
-                // 核心防线 2：精准过滤
                 let isFnDown = flags.contains(.function)
                 let validRules = rules.filter { rule in
                     if rule.triggerType == .selectedTextMatch {
@@ -467,12 +607,10 @@ public class AutomationEngine {
                 }
                 
                 guard !validRules.isEmpty else { return }
-                
                 self.processTextSelectionIntent(at: upLoc, with: validRules, flags: flags)
             }
         }
         
-        // 3. 修饰键状态变动回调 (Shift 连选释放监听)
         let flagsHandler: @Sendable (NSEvent) -> Void = { [weak self] event in
             let flags = event.modifierFlags
             Task { @MainActor [weak self] in
@@ -481,7 +619,6 @@ public class AutomationEngine {
                 let loc = NSEvent.mouseLocation
                 
                 if self.wasShiftDown && !isShiftDown {
-                    // 核心防线 3：Shift 释放时二次校验 Fn 条件
                     let isFnDown = flags.contains(.function)
                     let validRules = rules.filter { rule in
                         if rule.triggerType == .selectedTextMatch {
@@ -499,7 +636,6 @@ public class AutomationEngine {
             }
         }
         
-        // 4. 挂载系统全局与应用内局部事件监视器
         let globalUp = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: upHandler)
         let localUp = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { e in upHandler(e); return e }
         
@@ -514,13 +650,11 @@ public class AutomationEngine {
         selectionMonitors[UUID()] = (globalFlags, localFlags)
     }
     
-    // 统一防抖：通过提取和分析 Fn 修饰键管控触发行为
     private func processTextSelectionIntent(at location: NSPoint, with rules: [AutomationRule], flags: NSEvent.ModifierFlags) {
         let isFnPressed = flags.contains(.function)
         
         self.debounce(id: self.globalSelectionUUID, delay: 0.5) { [weak self] in
             guard let self = self else { return }
-            // 异步提取文字，避免阻塞主线程
             guard let text = await self.getSystemSelectedText(), !text.isEmpty else { return }
             
             let range = NSRange(location: 0, length: text.utf16.count)
@@ -533,7 +667,6 @@ public class AutomationEngine {
                 
                 if regex.firstMatch(in: text, options: [], range: range) != nil {
                     if rule.triggerConfig["showFloatingMenu"] != "false" {
-                        // Fn 键核心拦截逻辑
                         if rule.triggerConfig["requireFnKey"] == "true" {
                             if isFnPressed { matchedFloating.append(rule) }
                         } else {
@@ -556,7 +689,6 @@ public class AutomationEngine {
         }
     }
     
-    // nonisolated + async：保证调用层可以在后台极速提取且不污染并发队列
     nonisolated private func getSystemSelectedText() async -> String? {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         guard AXIsProcessTrustedWithOptions(options) else { return nil }
@@ -567,65 +699,35 @@ public class AutomationEngine {
         let frontAppID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         let isBrowser = ["com.google.Chrome", "com.microsoft.edgemac", "company.thebrowser.Browser", "com.brave.Browser", "org.mozilla.firefox", "com.apple.Safari"].contains(frontAppID)
 
-        // 1. 尝试获取焦点元素 (不要用 guard 强行拦截，因为 Chrome 划词时经常没有焦点)
         let hasFocusedElement = AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedUIElementAttribute as CFString, &focusedElementRef) == .success
         
         if hasFocusedElement, let ref = focusedElementRef, CFGetTypeID(ref) == AXUIElementGetTypeID() {
             let focusedElement = ref as! AXUIElement
 
-            // 优先尝试原生 AX API 提取
             var selectedTextValue: CFTypeRef?
             if AXUIElementCopyAttributeValue(focusedElement, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success,
                let text = selectedTextValue as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return text.trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
-            // 检查 Role，防止在桌面/Finder 等非文本区乱发 Cmd+C
             var roleRef: CFTypeRef?
             AXUIElementCopyAttributeValue(focusedElement, kAXRoleAttribute as CFString, &roleRef)
             
             if let role = roleRef as? String {
                 let standardRoles = ["AXTextField", "AXTextArea", "AXStaticText", "AXWebArea", "AXDocument", "AXGroup", "AXWindow", "AXScrollArea", "AXUnknown"]
-                
-                // 如果不是浏览器，屏蔽掉 ScrollArea 和 Unknown，防止系统桌面拖拽文件触发
-                if !isBrowser && (role == "AXScrollArea" || role == "AXUnknown") {
-                    return nil
-                }
-                
-                if !standardRoles.contains(role) {
-                    return nil
-                }
+                if !isBrowser && (role == "AXScrollArea" || role == "AXUnknown") { return nil }
+                if !standardRoles.contains(role) { return nil }
             }
         } else {
-            // 核心突破口：没有焦点元素时（Chrome 常态）
-            // 如果不在 Finder（桌面环境）下，直接放行！把信任交给按住 Fn 键的用户
             if frontAppID == "com.apple.finder" { return nil }
         }
 
-        // 3. 终极降级策略：发送 Cmd+C
         return await getSelectedTextViaCopy()
     }
     
-    nonisolated private func getSelectedTextViaAX() -> String? {
-        let systemWideElement = AXUIElementCreateSystemWide()
-        var focusedElement: CFTypeRef?
-        if AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success, let element = focusedElement {
-            var selectedTextValue: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success, let text = selectedTextValue as? String {
-                let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !cleanText.isEmpty { return cleanText }
-            }
-        }
-        return nil
-    }
-    
-    // 2：引入异步剪贴板的智能轮询
     nonisolated private func getSelectedTextViaCopy() async -> String? {
         ClipboardMonitorService.shared.pauseMonitoring()
-        
-        defer {
-            ClipboardMonitorService.shared.resumeMonitoring()
-        }
+        defer { ClipboardMonitorService.shared.resumeMonitoring() }
         
         let pasteboard = NSPasteboard.general
         let oldItems = pasteboard.pasteboardItems?.map { item -> NSPasteboardItem in
@@ -637,8 +739,6 @@ public class AutomationEngine {
         pasteboard.clearContents()
         pasteboard.setString("___LIN_EMPTY___", forType: .string)
         
-        // 核心防吞键：必须使用 HID 系统状态源，并在按下和抬起之间留出 20ms 停顿
-        // 否则 Chromium 庞大的事件循环经常会把连在一起的 Down 和 Up 视为无效杂讯过滤掉
         let source = CGEventSource(stateID: .hidSystemState)
         let cmdC_down = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
         let cmdC_up = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
@@ -646,10 +746,9 @@ public class AutomationEngine {
         cmdC_up?.flags = .maskCommand
         
         cmdC_down?.post(tap: .cghidEventTap)
-        try? await Task.sleep(nanoseconds: 20_000_000) // 模拟人类按键按压停顿 20 毫秒
+        try? await Task.sleep(nanoseconds: 20_000_000)
         cmdC_up?.post(tap: .cghidEventTap)
         
-        // 智能轮询：每 20ms 查一次，最多等 15 次 (300ms)
         var grabbedText: String? = nil
         for _ in 0..<15 {
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -661,7 +760,6 @@ public class AutomationEngine {
         
         pasteboard.clearContents()
         if let items = oldItems { pasteboard.writeObjects(items) }
-        
         return grabbedText?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
@@ -682,7 +780,8 @@ public class AutomationEngine {
                         }
                     }
                 }
-                fileMonitors[rule.id] = monitor; monitor.start()
+                fileMonitors[rule.id] = monitor
+                monitor.start()
             }
         case .appState:
             if let appName = rule.triggerConfig["appName"], !appName.isEmpty {
@@ -767,14 +866,13 @@ public class AutomationEngine {
         return char == key
     }
     
-    // Swift 6 Async Debounce：零阻塞，零隔离警告
     private func debounce(id: UUID, delay: TimeInterval, action: @escaping @Sendable () async -> Void) {
         debounceTasks[id]?.cancel()
         let task = Task {
             do {
                 try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 if !Task.isCancelled {
-                    await action() // 自由穿梭在后台队列执行计算与提取
+                    await action()
                 }
             } catch { }
         }
@@ -788,8 +886,12 @@ public class AutomationEngine {
             ___triggerBreathing(text: title, icon: "checkmark.seal.fill")
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { ___dynamicIslandEscape(isEscape: true) }
         case .dialog:
-            let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail; alert.alertStyle = .informational
-            NSApp.activate(ignoringOtherApps: true); alert.runModal()
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = detail
+            alert.alertStyle = .informational
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         case .floatingPanel:
             let point = context["mouseLocation"] as? NSPoint ?? NSEvent.mouseLocation
             let sessionID = context["floatingSessionID"] as? UUID
@@ -799,13 +901,12 @@ public class AutomationEngine {
     }
     
     // MARK: - 路由执行分发
-    public func execute(rule: AutomationRule, specificSkill: SkillAction? = nil, context: [String: Any] = [:]) {
+    func execute(rule: AutomationRule, specificSkill: SkillAction? = nil, context: [String: Any] = [:]) {
         ___triggerBreathing(text: "正在执行: \(rule.name)", icon: "bolt.fill")
         switch rule.actionType {
         case .callAgent:
             guard let agentID = rule.targetAgentID else { return }
             let renderedPrompt = TemplateEngine.render(text: rule.taskPrompt, context: context)
-            //if rule.displayMode == .island { ___triggerBreathing(text: "正在执行: \(rule.name)", icon: "bolt.fill") }
             
             Task {
                 guard let profile = ConfigManager.shared.app.agentProfiles.first(where: { $0.id == agentID }) else { return }
@@ -832,7 +933,6 @@ public class AutomationEngine {
                 var allInputContexts = ""
                 var hasError = false
                 let skillsToExecute = specificSkill != nil ? [specificSkill!] : rule.targetSkills
-                //if rule.displayMode == .island { ___triggerBreathing(text: "正在执行技能...", icon: "gearshape.fill") }
                 
                 for skill in skillsToExecute {
                     var finalArgs: [String: Any] = [:]
@@ -842,7 +942,6 @@ public class AutomationEngine {
                     for (k, v) in context { if finalArgs[k] == nil { finalArgs[k] = v } }
                     
                     let skillDisplayName = skill.shortName.isEmpty ? skill.skillName : skill.shortName
-                    
                     let inputContextStr = (try? String(data: JSONSerialization.data(withJSONObject: finalArgs, options: .prettyPrinted), encoding: .utf8)) ?? "{}"
                     allInputContexts += "[\(skillDisplayName) 参数]: \n\(inputContextStr)\n"
                     
@@ -880,7 +979,7 @@ public class AutomationEngine {
     }
 }
 
-// MARK: - ==================== 5. UI 视图组件 ====================
+// MARK: - ==================== 6. AutomationUI Components (界面与交互视窗) ====================
 
 struct AutomationLogsView: View {
     @Environment(\.dismiss) var dismiss
@@ -894,7 +993,8 @@ struct AutomationLogsView: View {
                 Spacer()
                 Button("清空记录") { AutomationEngine.shared.sessionLogs.removeAll() }.buttonStyle(.bordered)
                 Button("关闭") { dismiss() }.buttonStyle(.borderedProminent)
-            }.padding().background(Color(NSColor.windowBackgroundColor)); Divider()
+            }.padding().background(Color(NSColor.windowBackgroundColor))
+            Divider()
             
             List(AutomationEngine.shared.sessionLogs) { log in
                 VStack(alignment: .leading, spacing: 6) {
@@ -946,7 +1046,7 @@ struct AutomationManagementPanel: View {
                 Spacer()
                 Button { showLogs = true } label: { Label("运行记录", systemImage: "list.bullet.clipboard") }.buttonStyle(.bordered)
                 Button { selectedRule = AutomationRule(name: "新任务", triggerType: .selectedTextMatch) } label: { Label("添加触发器", systemImage: "plus") }.buttonStyle(.borderedProminent)
-            }.padding().background(Color.clear);
+            }.padding().background(Color.clear)
             
             ModernDivider(style: .fade(0.18))
             
@@ -994,8 +1094,6 @@ struct AutomationCard: View {
     let rule: AutomationRule
     var onToggle: (Bool) -> Void
     var onEdit: () -> Void
-    
-    // 状态控制：点击测试时的瞬间反馈
     @State private var isTesting = false
     
     var body: some View {
@@ -1046,7 +1144,6 @@ struct AutomationCard: View {
                 
                 Spacer()
                 
-                // 🚀 新增：手动触发测试按钮
                 Button {
                     runManualTest()
                 } label: {
@@ -1079,22 +1176,15 @@ struct AutomationCard: View {
         .animation(.spring(), value: isTesting)
     }
     
-    /// 执行手动测试逻辑
     private func runManualTest() {
         isTesting = true
-        
-        // 构造模拟上下文
         let mockContext: [String: Any] = [
             "isManualTest": true,
             "selectedText": "这是手动触发的测试文本",
             "clipboard": NSPasteboard.general.string(forType: .string) ?? "剪贴板为空",
             "datetime": Date().description
         ]
-        
-        // 调用引擎执行
         AutomationEngine.shared.execute(rule: rule, context: mockContext)
-        
-        // 1秒后恢复按钮状态（执行过程在后台异步进行，灵动岛会持续反馈）
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             self.isTesting = false
         }
@@ -1147,7 +1237,7 @@ struct HotkeyRecorderView: View {
             
             if let char = event.charactersIgnoringModifiers?.lowercased(), !char.isEmpty {
                 if char == " " || event.keyCode == 49 { keys.append("space") }
-                else if char == "\r" || event.keyCode == 36 { keys.append("enter") }
+                else if char == "\r" || char == "\n" || event.keyCode == 36 { keys.append("enter") }
                 else { keys.append(char) }
                 
                 if !keys.isEmpty { hotkeyString = keys.joined(separator: "+") }
@@ -1180,7 +1270,7 @@ struct AutomationEditView: View {
     @State private var hotkeyString: String = ""
     
     @State private var showFloatingMenu: Bool = true
-    @State private var requireFnKey: Bool = false // 新增：Fn 键限制状态
+    @State private var requireFnKey: Bool = false
     
     init(initialRule: AutomationRule, onSave: @escaping (AutomationRule) -> Void, onDelete: @escaping (AutomationRule) -> Void) {
         self.initialRule = initialRule
@@ -1345,7 +1435,6 @@ struct AutomationEditView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack { Text("匹配正则").font(.system(size: 13, weight: .medium)).frame(width: 80, alignment: .leading).foregroundStyle(.secondary); TextField("如：^[0-9]+$", text: $regexPattern).textFieldStyle(.roundedBorder).fontDesign(.monospaced); regexHelperMenu }
                 
-                // Fn 键控制 UI
                 VStack(alignment: .leading, spacing: 6) {
                     Toggle("显示微型交互气泡 (失去焦点时自动销毁)", isOn: $showFloatingMenu).toggleStyle(.checkbox).font(.system(size: 13)).foregroundColor(.primary)
                     if showFloatingMenu {
@@ -1390,12 +1479,17 @@ struct AutomationEditView: View {
     }
     
     private func unpackConfig() {
-        timerInterval = rule.triggerConfig["interval"] ?? "3600"; watchPath = rule.triggerConfig["path"] ?? ""; targetAppName = rule.triggerConfig["appName"] ?? "Xcode"; regexPattern = rule.triggerConfig["regex"] ?? ""; hotkeyString = rule.triggerConfig["hotkey"] ?? ""
+        timerInterval = rule.triggerConfig["interval"] ?? "3600"
+        watchPath = rule.triggerConfig["path"] ?? ""
+        targetAppName = rule.triggerConfig["appName"] ?? "Xcode"
+        regexPattern = rule.triggerConfig["regex"] ?? ""
+        hotkeyString = rule.triggerConfig["hotkey"] ?? ""
         showFloatingMenu = rule.triggerConfig["showFloatingMenu"] != "false"
-        // 恢复 Fn 键读取
         requireFnKey = rule.triggerConfig["requireFnKey"] == "true"
         
-        if rule.targetSkills.isEmpty && !rule.targetSkillName.isEmpty { rule.targetSkills = [SkillAction(skillName: rule.targetSkillName, shortName: rule.targetSkillName, argsJSON: rule.skillArgsJSON)] }
+        if rule.targetSkills.isEmpty && !rule.targetSkillName.isEmpty {
+            rule.targetSkills = [SkillAction(skillName: rule.targetSkillName, shortName: rule.targetSkillName, argsJSON: rule.skillArgsJSON)]
+        }
     }
     
     private func packConfig() {
@@ -1408,7 +1502,6 @@ struct AutomationEditView: View {
         case .selectedTextMatch:
             rule.triggerConfig["regex"] = regexPattern
             rule.triggerConfig["showFloatingMenu"] = showFloatingMenu ? "true" : "false"
-            // 封存 Fn 键状态
             rule.triggerConfig["requireFnKey"] = requireFnKey ? "true" : "false"
         case .hotkey: rule.triggerConfig["hotkey"] = hotkeyString
         default: break

@@ -1,14 +1,15 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：AiChatView.swift
-// 文件说明：适用于 macOS 14+ 的 Ai 对话窗口 UI 渲染方法
-// 专属优化：修复状态机越界崩溃、防错杀自愈引擎、全面兼容 macOS 原生深浅模式
-// 架构大纲：
-// 1. 基础扩展与数据模型 (Models & Extensions)
-// 2. 全局状态与业务编排引擎 (State & Orchestrator)
-// 3. 流式解析与预处理引擎 (Stream & Markdown Parsers)
-// 4. 基础富文本与消息块组件 (Base UI Components)
-// 5. 统一交互式卡片与时间轴组件 (Unified Interactive Cards & Timeline)
-// 6. 消息行与主视图装配 (Message Row & Main View)
+// 文件说明：适用于 macOS 14+ 的 AI 对话窗口 UI 渲染与交互组件群 (Swift 6 Ready)
+//
+// 核心解构架构拓扑 (Domain-Driven Architecture):
+// ├── 1. ChatModels             : 消息实体、RAG 命中、技能执行日志与会话持久化模型
+// ├── 2. ChatParsers            : Markdown 增量渲染缓存、AST 块级解析器与流式提取器
+// ├── 3. ChatStore & Managers   : 响应式全局会话状态池 (AiChatStore) 与语音识别服务
+// ├── 4. ChatBlockViews         : 块级 Markdown 渲染组件群 (Header, Code, Table, Think, Divider)
+// ├── 5. ChatInteractiveCards   : 具身工具时间轴、HITL 授权卡片、任务结单与 RAG 切片查看器
+// ├── 6. ChatInputComponents    : 光标物理感知输入框 (NativeMacTextView)、@ 专家与 # 选项浮窗
+// └── 7. ChatMainView           : 主对话窗口容器、消息气泡行 (RowView) 与 Siri 活跃流光背景
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -18,7 +19,7 @@ import Combine
 import Speech
 import AVFoundation
 
-// MARK: - ==================== 1. 基础扩展与数据模型 ====================
+// MARK: - ==================== 1. ChatModels (数据模型与持久化实体) ====================
 
 extension NSParagraphStyle: @retroactive @unchecked Sendable {}
 
@@ -26,14 +27,14 @@ extension NSColor {
     var color: Color { Color(self) }
 }
 
-struct RAGHitLog: Identifiable, Equatable {
+struct RAGHitLog: Identifiable, Equatable, Sendable {
     let id = UUID()
     let title: String
     let path: String
     let content: String
 }
 
-struct SkillExecutionLog: Identifiable, Equatable {
+struct SkillExecutionLog: Identifiable, Equatable, Sendable {
     let id: UUID
     let skillName: String
     var displayName: String
@@ -43,7 +44,16 @@ struct SkillExecutionLog: Identifiable, Equatable {
     var uiTemplate: String
     var executorName: String?
     
-    init(id: UUID = UUID(), skillName: String, displayName: String? = nil, args: [String: Any] = [:], resultOutput: String, confirmationId: String? = nil, executorName: String? = nil, uiTemplate: String = "") {
+    init(
+        id: UUID = UUID(),
+        skillName: String,
+        displayName: String? = nil,
+        args: [String: Any] = [:],
+        resultOutput: String,
+        confirmationId: String? = nil,
+        executorName: String? = nil,
+        uiTemplate: String = ""
+    ) {
         self.id = id
         self.skillName = skillName
         self.displayName = displayName ?? skillName
@@ -65,13 +75,13 @@ struct SkillExecutionLog: Identifiable, Equatable {
     }
 }
 
-enum MessageFeedback: String, Codable {
+enum MessageFeedback: String, Codable, Sendable {
     case none
     case liked
     case disliked
 }
 
-struct ChatMessage: Identifiable, Equatable {
+struct ChatMessage: Identifiable, Equatable, Sendable {
     var id = UUID()
     var isUser: Bool
     var text: String
@@ -81,7 +91,16 @@ struct ChatMessage: Identifiable, Equatable {
     var skillLogs: [SkillExecutionLog] = []
     var feedback: MessageFeedback = .none
     
-    init(id: UUID = UUID(), isUser: Bool, text: String, images: [NSImage] = [], fileURLs: [URL] = [], ragHits: [RAGHitLog] = [], skillLogs: [SkillExecutionLog] = [], feedback: MessageFeedback = .none) {
+    init(
+        id: UUID = UUID(),
+        isUser: Bool,
+        text: String,
+        images: [NSImage] = [],
+        fileURLs: [URL] = [],
+        ragHits: [RAGHitLog] = [],
+        skillLogs: [SkillExecutionLog] = [],
+        feedback: MessageFeedback = .none
+    ) {
         self.id = id
         self.isUser = isUser
         self.text = text
@@ -93,8 +112,7 @@ struct ChatMessage: Identifiable, Equatable {
     }
 }
 
-// MARK: - 扩充 PartType：支持原生的块级 Markdown 标题
-enum PartType: Equatable {
+enum PartType: Equatable, Sendable {
     case text
     case header(level: Int)
     case code(language: String)
@@ -103,14 +121,21 @@ enum PartType: Equatable {
     case divider
 }
 
-struct MessagePart: Equatable {
+struct MessagePart: Equatable, Sendable {
     let type: PartType
     let text: String
 }
 
-// MARK: - ==================== 历史记录数据持久化实体 ====================
+struct LLMBeaconAlert: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let message: String
+    let isWarning: Bool
+    let timestamp: Date = Date()
+}
 
-struct ChatSession: Identifiable, Codable, Equatable {
+// MARK: - 历史会话持久化模型
+
+struct ChatSession: Identifiable, Codable, Equatable, Sendable {
     var id: UUID = UUID()
     var title: String
     var updatedAt: Date = Date()
@@ -165,7 +190,7 @@ struct ChatSession: Identifiable, Codable, Equatable {
     }
 }
 
-struct SavedChatMessage: Identifiable, Codable, Equatable {
+struct SavedChatMessage: Identifiable, Codable, Equatable, Sendable {
     var id: UUID
     var isUser: Bool
     var text: String
@@ -176,13 +201,13 @@ struct SavedChatMessage: Identifiable, Codable, Equatable {
     var feedback: MessageFeedback?
 }
 
-struct SavedRAGHitLog: Codable, Equatable {
+struct SavedRAGHitLog: Codable, Equatable, Sendable {
     var title: String
     var path: String
     var content: String
 }
 
-struct SavedSkillExecutionLog: Codable, Equatable {
+struct SavedSkillExecutionLog: Codable, Equatable, Sendable {
     var id: UUID
     var skillName: String
     var displayName: String
@@ -253,260 +278,7 @@ extension ChatMessage {
     }
 }
 
-// MARK: - ==================== 2. 全局状态与业务编排引擎 ====================
-
-@MainActor
-class AiChatStore: ObservableObject {
-    static let shared = AiChatStore()
-    
-    @Published var messages: [ChatMessage] = []
-    @Published var isLoading: Bool = false
-    @Published var isContextEnabled: Bool = true
-    @Published var selectedImages: [NSImage] = []
-    @Published var selectedFiles: [URL] = []
-    @Published var currentSessionID: UUID = UUID()
-    @Published var previewImage: NSImage? = nil
-    @Published var selectedPersonaID: UUID? = nil
-    @Published var blackboardPlan: String? = nil
-    
-    var activatedPrivateQAIDs: Set<UUID> = []
-    var currentContextTokenCount: Int = 0
-    
-    @Published var inputText: String = ""
-    @Published var editingTargetMessageID: UUID? = nil
-    
-    @Published var selectedAgentID: UUID = {
-        let profiles = ConfigManager.shared.app.agentProfiles
-        let defaultID = ConfigManager.shared.app.generalConfig.defaultAgentID
-        if let id = defaultID, profiles.contains(where: { $0.id == id }) {
-            return id
-        }
-        return profiles.first?.id ?? UUID()
-    }()
-    
-    @MainActor static var globalPreviewImage: NSImage? {
-        get { shared.previewImage }
-        set { shared.previewImage = newValue }
-    }
-    
-    var currentAgent: AgentProfile {
-        ConfigManager.shared.app.agentProfiles.first(where: { $0.id == selectedAgentID })
-        ?? ConfigManager.shared.app.agentProfiles.first!
-    }
-    
-    let onClearEvent = PassthroughSubject<Void, Never>()
-    var currentGenerationTask: Task<Void, Never>?
-    
-    private init() {
-        NotificationCenter.default.addObserver(forName: NSNotification.Name("AgentProfilesExternallyUpdated"), object: nil, queue: .main) { [weak self] _ in
-            self?.objectWillChange.send()
-        }
-    }
-    
-    func stopGeneration() {
-        currentGenerationTask?.cancel()
-        currentGenerationTask = nil
-        isLoading = false
-        
-        if var lastMsg = messages.last, !lastMsg.isUser, lastMsg.text.isEmpty == false {
-            lastMsg.text += " 🛑 *(已手动中止)*"
-            if let idx = messages.firstIndex(where: { $0.id == lastMsg.id }) {
-                messages[idx] = lastMsg
-            }
-        }
-        saveCurrentState()
-    }
-    
-    func clearChat() {
-        messages.removeAll()
-        isLoading = false
-        selectedImages.removeAll()
-        selectedFiles.removeAll()
-        currentSessionID = UUID()
-        selectedPersonaID = nil
-        activatedPrivateQAIDs.removeAll()
-        
-        // 清理黑板并彻底同步至权威上下文
-        blackboardPlan = nil
-        AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-        AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_GLOBAL_MEMO")
-        
-        onClearEvent.send()
-    }
-    
-    func loadSession(_ session: ChatSession) {
-        self.currentSessionID = session.id
-        self.messages = session.messages.map { ChatMessage.fromSaved($0) }
-        self.activatedPrivateQAIDs.removeAll()
-        
-        // 正确复原黑板状态并注入共享上下文
-        self.blackboardPlan = session.blackboardPlan
-        if let plan = session.blackboardPlan, !plan.isEmpty {
-            AgentManager.shared.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = plan
-        } else {
-            AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-        }
-
-        if ConfigManager.shared.app.agentProfiles.contains(where: { $0.id == session.agentID }) {
-            self.selectedAgentID = session.agentID
-        }
-        
-        if let pID = session.personaID, PersonaManager.shared.personas.contains(where: { $0.id == pID }) {
-            self.selectedPersonaID = pID
-        } else {
-            self.selectedPersonaID = nil
-        }
-        
-        self.isLoading = false
-        self.selectedImages.removeAll()
-        self.selectedFiles.removeAll()
-        self.isContextEnabled = true
-        onClearEvent.send()
-    }
-    
-    func deleteMessage(id: UUID) {
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            messages.removeAll { $0.id == id }
-        }
-        saveCurrentState()
-    }
-    
-    func updateMessage(id: UUID, action: (inout ChatMessage) -> Void) {
-        if let idx = messages.firstIndex(where: { $0.id == id }) {
-            action(&messages[idx])
-        }
-    }
-    
-    func saveCurrentState() {
-        guard !messages.isEmpty else { return }
-        let title = messages.first(where: { $0.isUser })?.text.prefix(15) ?? "新对话"
-        
-        ChatHistoryManager.shared.saveSession(
-            id: currentSessionID,
-            title: String(title),
-            agentID: selectedAgentID,
-            messages: messages,
-            personaID: selectedPersonaID
-        )
-    }
-    
-    func enterEditMode(for message: ChatMessage) {
-        self.editingTargetMessageID = message.id
-        self.inputText = message.text
-        self.selectedImages = message.images
-        self.selectedFiles = message.fileURLs
-    }
-    
-    func cancelEditMode() {
-        self.editingTargetMessageID = nil
-        self.inputText = ""
-        self.selectedImages.removeAll()
-        self.selectedFiles.removeAll()
-    }
-    
-    func prepareForEditedSend(agentVM: AgentViewModel) {
-        guard let targetID = editingTargetMessageID else { return }
-        if let targetIndex = messages.firstIndex(where: { $0.id == targetID }) {
-            withAnimation(.easeInOut(duration: 0.3)) {
-                messages.removeSubrange(targetIndex...)
-            }
-        }
-        agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-        self.blackboardPlan = nil
-        self.editingTargetMessageID = nil
-    }
-}
-
-@MainActor
-public class AiChatManager: NSObject, NSWindowDelegate {
-    public static let shared = AiChatManager()
-    private var window: NSWindow?
-    var isVisible: Bool { return window != nil }
-    private override init() { super.init() }
-    
-    public func show() {
-        if let existingWindow = window {
-            if existingWindow.isMiniaturized { existingWindow.deminiaturize(nil) }
-            existingWindow.makeKeyAndOrderFront(nil)
-            existingWindow.orderFrontRegardless()
-            if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-            return
-        }
-        
-        let contentView = AiChatView(knowledgeVM: AgentManager.shared.knowledgeVM, agentVM: AgentManager.shared.agentVM)
-        let hostingController = NSHostingController(rootView: contentView)
-        let newWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 262, height: 750),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered, defer: false
-        )
-        newWindow.title = "AI对话"
-        newWindow.contentViewController = hostingController
-        newWindow.center()
-        newWindow.setFrameAutosaveName("LinTools_AICHAT_Window")
-        newWindow.isReleasedWhenClosed = false
-        newWindow.delegate = self
-        self.window = newWindow
-        newWindow.makeKeyAndOrderFront(nil)
-        newWindow.orderFrontRegardless()
-        
-        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        MainWindowManager.syncDockIconPolicy()
-    }
-    public func windowWillClose(_ notification: Notification) {
-        window = nil
-        MainWindowManager.syncDockIconPolicy()
-    }
-}
-
-@MainActor
-class SpeechRecognizerManager: ObservableObject {
-    @Published var isRecording = false
-    @Published var isAuthorized = false
-    
-    private var audioEngine: AVAudioEngine?
-    private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    
-    func toggleRecording(baseText: String, onUpdate: @escaping (String) -> Void) {
-        if isRecording { stopRecording() }
-        else {
-            if SFSpeechRecognizer.authorizationStatus() != .authorized { SFSpeechRecognizer.requestAuthorization { _ in }; return }
-            startRecording(baseText: baseText, onUpdate: onUpdate)
-        }
-    }
-    
-    private func startRecording(baseText: String, onUpdate: @escaping (String) -> Void) {
-        audioEngine = AVAudioEngine()
-        guard let audioEngine = audioEngine else { return }
-        let inputNode = audioEngine.inputNode
-        let recordingFormat = inputNode.inputFormat(forBus: 0)
-        
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else { return }
-        recognitionRequest.shouldReportPartialResults = true
-        
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
-            if let result = result {
-                let recognizedText = result.bestTranscription.formattedString
-                onUpdate(baseText + (baseText.isEmpty ? "" : " ") + recognizedText)
-            }
-            if error != nil || result?.isFinal == true { self.stopRecording() }
-        }
-        
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in self.recognitionRequest?.append(buffer) }
-        audioEngine.prepare(); try? audioEngine.start(); isRecording = true
-    }
-    
-    func stopRecording() {
-        audioEngine?.stop(); audioEngine?.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio(); recognitionTask?.cancel()
-        audioEngine = nil; recognitionRequest = nil; recognitionTask = nil; isRecording = false
-    }
-}
-
-// MARK: - ==================== 3. 流式解析与预处理引擎 ====================
+// MARK: - ==================== 2. ChatParsers (AST 解析与渲染缓存引擎) ====================
 
 final class MessageASTCache: @unchecked Sendable {
     static let shared = MessageASTCache()
@@ -529,6 +301,7 @@ final class MessageASTCache: @unchecked Sendable {
     }
 }
 
+// MARK: - 原生 macOS 极致排版 MarkdownRenderCache
 class MarkdownRenderCache: @unchecked Sendable {
     static let shared = MarkdownRenderCache()
     
@@ -541,6 +314,7 @@ class MarkdownRenderCache: @unchecked Sendable {
     private init() { cache.countLimit = 2000 }
     
     private static let newlineRegex = try! NSRegularExpression(pattern: #"\n{3,}"#)
+    private static let inlineCodeRegex = try! NSRegularExpression(pattern: #"(?<!`)`([^`\n\r]+)`(?!`)"#)
     private static let highlightRegex = try! NSRegularExpression(pattern: #"(?<!=)==([^=\n\r\t]+)==(?!=)"#)
     private static let errorRegex     = try! NSRegularExpression(pattern: #"(?<!\!)\!\!([^!\n\r\t]+)\!\!(?!\!)"#)
     private static let infoRegex      = try! NSRegularExpression(pattern: #"(?<!\?)\?\?([^?\n\r\t]+)\?\?(?!\?)"#)
@@ -550,7 +324,7 @@ class MarkdownRenderCache: @unchecked Sendable {
     private static let listItemRegex   = try! NSRegularExpression(pattern: #"(?m)^(?:\*|-)\s+(.*)$"#)
     private static let latexSymbolRegex = try! NSRegularExpression(pattern: #"\$?\\([a-zA-Z]+)\$?"#)
     
-    nonisolated(unsafe) private static let latexSymbolMap: [String: String] = [
+    private static let latexSymbolMap: [String: String] = [
         "rightarrow": "→", "to": "→", "rightarrowtail": "↣", "leftarrow": "←", "toleft": "←",
         "leftrightarrow": "↔", "Leftrightarrow": "⇔", "Rightarrow": "⇒", "Leftarrow": "⇐",
         "uparrow": "↑", "downarrow": "↓", "Delta": "Δ", "delta": "δ", "alpha": "α", "beta": "β",
@@ -559,20 +333,20 @@ class MarkdownRenderCache: @unchecked Sendable {
         "in": "∈", "notin": "∉", "infty": "∞", "approx": "≈", "dots": "…", "forall": "∀", "exists": "∃"
     ]
     
-    nonisolated(unsafe) private static let sharedQuoteParagraphStyle: NSParagraphStyle = {
+    private static let sharedQuoteParagraphStyle: NSParagraphStyle = {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.firstLineHeadIndent = 12
-        paragraph.headIndent = 12
-        paragraph.paragraphSpacingBefore = 6
-        paragraph.paragraphSpacing = 6
+        paragraph.firstLineHeadIndent = 10
+        paragraph.headIndent = 10
+        paragraph.paragraphSpacingBefore = 4
+        paragraph.paragraphSpacing = 4
         return paragraph.copy() as! NSParagraphStyle
     }()
     
-    nonisolated(unsafe) private static let sharedListParagraphStyle: NSParagraphStyle = {
+    private static let sharedListParagraphStyle: NSParagraphStyle = {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.firstLineHeadIndent = 6
-        paragraph.headIndent = 16
-        paragraph.paragraphSpacing = 4
+        paragraph.firstLineHeadIndent = 4
+        paragraph.headIndent = 14
+        paragraph.paragraphSpacing = 3
         return paragraph.copy() as! NSParagraphStyle
     }()
     
@@ -583,6 +357,7 @@ class MarkdownRenderCache: @unchecked Sendable {
         var safeText = text.replacingOccurrences(of: "\r\n", with: "\n")
         safeText = safeText.replacingOccurrences(of: "\u{00A0}", with: " ")
         
+        // 1. 替换 LaTeX 常用特殊字符
         let latexMatches = Self.latexSymbolRegex.matches(in: safeText, options: [], range: NSRange(safeText.startIndex..., in: safeText))
         for match in latexMatches.reversed() {
             guard let totalRange = Range(match.range, in: safeText),
@@ -593,10 +368,20 @@ class MarkdownRenderCache: @unchecked Sendable {
             }
         }
         
+        // 2. 注入微空格 (\u{200A}) 形成行内代码呼吸感
+        safeText = Self.inlineCodeRegex.stringByReplacingMatches(
+            in: safeText,
+            options: [],
+            range: scRange(safeText),
+            withTemplate: "`\u{200A}$1\u{200A}`"
+        )
+        
+        // 3. 结构化标记规范化
         safeText = Self.newlineRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "\n\n")
         safeText = Self.listItemRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[•](style://listitem) $1")
         safeText = Self.blockquoteRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[▎](style://blockquote) $1")
         
+        // 4. 自定义高亮标签样式映射
         safeText = Self.highlightRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://highlight)")
         safeText = Self.errorRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://error)")
         safeText = Self.infoRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://info)")
@@ -610,45 +395,93 @@ class MarkdownRenderCache: @unchecked Sendable {
         options.failurePolicy = .returnPartiallyParsedIfPossible
         
         var result = (try? AttributedString(markdown: safeText, options: options)) ?? AttributedString(text)
+        
+        // 5. 正文基准字体
         var baseAttr = AttributeContainer()
         baseAttr.font = Font.system(size: 14, weight: .regular)
+        baseAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor).opacity(0.92)
         result.mergeAttributes(baseAttr, mergePolicy: .keepNew)
         
+        // 6. 遍历 Run 进行精细排版
         for run in result.runs {
             var runAttr = AttributeContainer()
-            if let inlineIntent = run.inlinePresentationIntent, inlineIntent.contains(.code) {
-                runAttr.font = Font.system(size: 13, weight: .regular, design: .monospaced)
-                runAttr.backgroundColor = .clear
-                runAttr.foregroundColor = .pink
-                result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
-            } else if let url = run.link, url.scheme == "style", let host = url.host {
+            
+            if let inlineIntent = run.inlinePresentationIntent {
+                if inlineIntent.contains(.code) {
+                    runAttr.font = Font.system(size: 12.0, weight: .medium, design: .monospaced)
+                    runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.88)
+                    runAttr.backgroundColor = isUser ? Color.white.opacity(0.18) : Color.primary.opacity(0.048)
+                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                } else if inlineIntent.contains(.stronglyEmphasized) && inlineIntent.contains(.emphasized) {
+                    // 粗斜体 (***text***)
+                    runAttr.font = Font.system(size: 14.0, weight: .bold).italic()
+                    runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
+                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                } else if inlineIntent.contains(.stronglyEmphasized) {
+                    // 粗体 (**text**)
+                    runAttr.font = Font.system(size: 14.0, weight: .bold)
+                    runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
+                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                } else if inlineIntent.contains(.emphasized) {
+                    // 斜体/轻量强调 (*text*)：字阶加权 + 原生斜体倾斜，解决中文无原生斜体字库问题
+                    runAttr.font = Font.system(size: 14.0, weight: .semibold).italic()
+                    runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.96)
+                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                }
+            } else if let url = run.link, let scheme = url.scheme, let host = url.host {
                 runAttr.underlineStyle = nil
                 
-                switch host {
-                case "highlight":
-                    runAttr.font = Font.system(size: 14.5, weight: .bold, design: .rounded)
-                    runAttr.foregroundColor = Color.orange
-                case "error":
-                    runAttr.font = Font.system(size: 14.5, weight: .bold, design: .rounded)
-                    runAttr.foregroundColor = Color.red
-                case "info":
-                    runAttr.font = Font.system(size: 14.5, weight: .bold, design: .rounded)
-                    runAttr.foregroundColor = Color.blue
-                case "success":
-                    runAttr.font = Font.system(size: 14.5, weight: .bold, design: .rounded)
-                    runAttr.foregroundColor = Color(hex: "#00897B")
-                case "spark":
-                    runAttr.font = Font.system(size: 14.5, weight: .bold, design: .rounded)
-                    runAttr.foregroundColor = Color.purple
-                case "blockquote":
-                    runAttr.font = Font.system(size: 14, weight: .bold)
-                    runAttr.foregroundColor = Color.cyan.opacity(0.8)
-                    runAttr.paragraphStyle = Self.sharedQuoteParagraphStyle
-                case "listitem":
-                    runAttr.font = Font.system(size: 14, weight: .bold)
+                // 工具角标
+                if scheme == "action" && host == "inspect_tool" {
+                    runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
+                    runAttr.baselineOffset = 3.0
+                    runAttr.backgroundColor = .clear
+                    
+                    let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                    let status = queryParams?.first(where: { $0.name == "status" })?.value ?? "running"
+                    
+                    switch status {
+                    case "success":
+                        runAttr.foregroundColor = Color(hex: "#10B981")
+                    case "failed":
+                        runAttr.foregroundColor = Color(hex: "#EF4444")
+                    case "waiting":
+                        runAttr.foregroundColor = Color.orange
+                    default:
+                        runAttr.foregroundColor = Color.purple.opacity(0.9)
+                    }
+                } else if scheme == "action" && host == "inspect_rag" {
+                    runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
+                    runAttr.baselineOffset = 3.0
+                    runAttr.backgroundColor = .clear
                     runAttr.foregroundColor = Color.cyan
-                    runAttr.paragraphStyle = Self.sharedListParagraphStyle
-                default: break
+                } else if scheme == "style" {
+                    switch host {
+                    case "highlight":
+                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                        runAttr.foregroundColor = Color.orange
+                    case "error":
+                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                        runAttr.foregroundColor = Color.red
+                    case "info":
+                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                        runAttr.foregroundColor = Color.blue
+                    case "success":
+                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                        runAttr.foregroundColor = Color(hex: "#00897B")
+                    case "spark":
+                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                        runAttr.foregroundColor = Color.purple
+                    case "blockquote":
+                        runAttr.font = Font.system(size: 14, weight: .bold)
+                        runAttr.foregroundColor = Color.cyan.opacity(0.8)
+                        runAttr.paragraphStyle = Self.sharedQuoteParagraphStyle
+                    case "listitem":
+                        runAttr.font = Font.system(size: 14, weight: .bold)
+                        runAttr.foregroundColor = Color.cyan
+                        runAttr.paragraphStyle = Self.sharedListParagraphStyle
+                    default: break
+                    }
                 }
                 result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
             }
@@ -676,7 +509,9 @@ struct AgentStreamParser {
                 for match in matches.reversed() {
                     if let titleRange = Range(match.range(at: 1), in: text), let contentRange = Range(match.range(at: 3), in: text) {
                         var filePath = ""
-                        if match.range(at: 2).location != NSNotFound, let pathRange = Range(match.range(at: 2), in: text) { filePath = String(text[pathRange]).trimmingCharacters(in: .whitespacesAndNewlines) }
+                        if match.range(at: 2).location != NSNotFound, let pathRange = Range(match.range(at: 2), in: text) {
+                            filePath = String(text[pathRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
                         ragHits.append(RAGHitLog(title: String(text[titleRange]).trimmingCharacters(in: .whitespacesAndNewlines), path: filePath, content: String(text[contentRange]).trimmingCharacters(in: .whitespacesAndNewlines)))
                     }
                     if let fr = Range(match.range(at: 0), in: text) { text.removeSubrange(fr) }
@@ -704,7 +539,6 @@ struct AgentStreamParser {
     }
 }
 
-// MARK: - 增强版 AST 块级解析引擎 (消灭 ###，提取结构化块)
 struct MessageParser {
     static func parse(_ rawText: String) -> [MessagePart] {
         var parts: [MessagePart] = []
@@ -794,7 +628,6 @@ struct MessageParser {
         return parts
     }
     
-    // MARK: - 识别 Markdown 标题、分割线与表格
     private static func parseTablesAndHeaders(from text: String) -> [MessagePart] {
         var parts: [MessagePart] = []
         let lines = text.components(separatedBy: .newlines)
@@ -816,7 +649,6 @@ struct MessageParser {
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             
-            // 1. 标题行检测 (#, ##, ###)
             if trimmed.hasPrefix("#") {
                 let hashes = trimmed.prefix(while: { $0 == "#" })
                 if hashes.count >= 1 && hashes.count <= 6 && trimmed.dropFirst(hashes.count).hasPrefix(" ") {
@@ -829,19 +661,14 @@ struct MessageParser {
                 }
             }
             
-            // 2. 表格行检测
             if trimmed.hasPrefix("|") && trimmed.hasSuffix("|") {
                 if !textLines.isEmpty { flushTextLines() }
                 tableLines.append(trimmed)
-            }
-            // 3. 分割线检测
-            else if isHorizontalRule(trimmed) {
+            } else if isHorizontalRule(trimmed) {
                 if !tableLines.isEmpty { parts.append(createTablePart(from: tableLines)); tableLines.removeAll() }
                 if !textLines.isEmpty { flushTextLines() }
                 parts.append(MessagePart(type: .divider, text: ""))
-            }
-            // 4. 普通文本
-            else {
+            } else {
                 if !tableLines.isEmpty { parts.append(createTablePart(from: tableLines)); tableLines.removeAll() }
                 textLines.append(line)
             }
@@ -876,9 +703,320 @@ struct MessageParser {
     }
 }
 
-// MARK: - ==================== 4. 基础富文本与消息块组件 ====================
+// MARK: - ==================== 3. ChatStore & Managers (状态中枢与系统服务) ====================
 
-// MARK: - [Added] 原生 Markdown 块级标题组件
+@MainActor
+class AiChatStore: ObservableObject {
+    static let shared = AiChatStore()
+    
+    @Published var messages: [ChatMessage] = []
+    @Published var isLoading: Bool = false
+    @Published var isContextEnabled: Bool = true
+    @Published var selectedImages: [NSImage] = []
+    @Published var selectedFiles: [URL] = []
+    @Published var currentSessionID: UUID = UUID()
+    @Published var previewImage: NSImage? = nil
+    @Published var selectedPersonaID: UUID? = nil
+    @Published var blackboardPlan: String? = nil
+    
+    var activatedPrivateQAIDs: Set<UUID> = []
+    var currentContextTokenCount: Int = 0
+    
+    @Published var inputText: String = ""
+    @Published var editingTargetMessageID: UUID? = nil
+    
+    @Published var activeBeaconAlert: LLMBeaconAlert? = nil
+    private var beaconDismissTask: Task<Void, Never>? = nil
+    
+    @Published var selectedAgentID: UUID = {
+        let profiles = ConfigManager.shared.app.agentProfiles
+        let defaultID = ConfigManager.shared.app.generalConfig.defaultAgentID
+        if let id = defaultID, profiles.contains(where: { $0.id == id }) {
+            return id
+        }
+        return profiles.first?.id ?? UUID()
+    }()
+    
+    @MainActor static var globalPreviewImage: NSImage? {
+        get { shared.previewImage }
+        set { shared.previewImage = newValue }
+    }
+    
+    var currentAgent: AgentProfile {
+        ConfigManager.shared.app.agentProfiles.first(where: { $0.id == selectedAgentID })
+        ?? ConfigManager.shared.app.agentProfiles.first!
+    }
+    
+    let onClearEvent = PassthroughSubject<Void, Never>()
+    var currentGenerationTask: Task<Void, Never>?
+    
+    private init() {
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("AgentProfilesExternallyUpdated"), object: nil, queue: .main) { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
+    
+    func stopGeneration() {
+        currentGenerationTask?.cancel()
+        currentGenerationTask = nil
+        isLoading = false
+        
+        if var lastMsg = messages.last, !lastMsg.isUser, lastMsg.text.isEmpty == false {
+            lastMsg.text += " 🛑 *(已手动中止)*"
+            if let idx = messages.firstIndex(where: { $0.id == lastMsg.id }) {
+                messages[idx] = lastMsg
+            }
+        }
+        saveCurrentState()
+    }
+    
+    func clearChat() {
+        messages.removeAll()
+        isLoading = false
+        selectedImages.removeAll()
+        selectedFiles.removeAll()
+        currentSessionID = UUID()
+        selectedPersonaID = nil
+        activatedPrivateQAIDs.removeAll()
+        
+        blackboardPlan = nil
+        AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
+        AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_GLOBAL_MEMO")
+        
+        onClearEvent.send()
+    }
+    
+    func loadSession(_ session: ChatSession) {
+        self.currentSessionID = session.id
+        self.messages = session.messages.map { ChatMessage.fromSaved($0) }
+        self.activatedPrivateQAIDs.removeAll()
+        
+        self.blackboardPlan = session.blackboardPlan
+        if let plan = session.blackboardPlan, !plan.isEmpty {
+            AgentManager.shared.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = plan
+        } else {
+            AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
+        }
+
+        if ConfigManager.shared.app.agentProfiles.contains(where: { $0.id == session.agentID }) {
+            self.selectedAgentID = session.agentID
+        }
+        
+        if let pID = session.personaID, PersonaManager.shared.personas.contains(where: { $0.id == pID }) {
+            self.selectedPersonaID = pID
+        } else {
+            self.selectedPersonaID = nil
+        }
+        
+        self.isLoading = false
+        self.selectedImages.removeAll()
+        self.selectedFiles.removeAll()
+        self.isContextEnabled = true
+        onClearEvent.send()
+    }
+    
+    func deleteMessage(id: UUID) {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            messages.removeAll { $0.id == id }
+        }
+        saveCurrentState()
+    }
+    
+    func updateMessage(id: UUID, action: (inout ChatMessage) -> Void) {
+        if let idx = messages.firstIndex(where: { $0.id == id }) {
+            action(&messages[idx])
+        }
+    }
+    
+    func saveCurrentState() {
+        guard !messages.isEmpty else { return }
+        let title = messages.first(where: { $0.isUser })?.text.prefix(15) ?? "新对话"
+        
+        ChatHistoryManager.shared.saveSession(
+            id: currentSessionID,
+            title: String(title),
+            agentID: selectedAgentID,
+            messages: messages,
+            personaID: selectedPersonaID
+        )
+    }
+    
+    func enterEditMode(for message: ChatMessage) {
+        self.editingTargetMessageID = message.id
+        self.inputText = message.text
+        self.selectedImages = message.images
+        self.selectedFiles = message.fileURLs
+    }
+    
+    func cancelEditMode() {
+        self.editingTargetMessageID = nil
+        self.inputText = ""
+        self.selectedImages.removeAll()
+        self.selectedFiles.removeAll()
+    }
+    
+    func prepareForEditedSend(agentVM: AgentViewModel) {
+        guard let targetID = editingTargetMessageID else { return }
+        if let targetIndex = messages.firstIndex(where: { $0.id == targetID }) {
+            withAnimation(.easeInOut(duration: 0.3)) {
+                messages.removeSubrange(targetIndex...)
+            }
+        }
+        agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
+        self.blackboardPlan = nil
+        self.editingTargetMessageID = nil
+    }
+    
+    func showLLMIndicator(message: String, isWarning: Bool = true, duration: TimeInterval = 4.0) {
+        beaconDismissTask?.cancel()
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+            self.activeBeaconAlert = LLMBeaconAlert(message: message, isWarning: isWarning)
+        }
+        beaconDismissTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            if !Task.isCancelled {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    self.activeBeaconAlert = nil
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+public class AiChatManager: NSObject, NSWindowDelegate {
+    public static let shared = AiChatManager()
+    private var window: NSWindow?
+    var isVisible: Bool { return window != nil }
+    private override init() { super.init() }
+    
+    public func show() {
+        if let existingWindow = window {
+            if existingWindow.isMiniaturized { existingWindow.deminiaturize(nil) }
+            existingWindow.makeKeyAndOrderFront(nil)
+            existingWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        
+        let contentView = AiChatView(knowledgeVM: AgentManager.shared.knowledgeVM, agentVM: AgentManager.shared.agentVM)
+        let hostingController = NSHostingController(rootView: contentView)
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 262, height: 750),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false
+        )
+        newWindow.title = "AI对话"
+        newWindow.contentViewController = hostingController
+        newWindow.center()
+        newWindow.setFrameAutosaveName("LinTools_AICHAT_Window")
+        newWindow.isReleasedWhenClosed = false
+        newWindow.delegate = self
+        self.window = newWindow
+        newWindow.makeKeyAndOrderFront(nil)
+        newWindow.orderFrontRegardless()
+        
+        NSApp.activate(ignoringOtherApps: true)
+        MainWindowManager.syncDockIconPolicy()
+    }
+    public func windowWillClose(_ notification: Notification) {
+        window = nil
+        MainWindowManager.syncDockIconPolicy()
+    }
+}
+
+@MainActor
+class SpeechRecognizerManager: ObservableObject {
+    @Published var isRecording = false
+    @Published var isAuthorized = false
+    
+    private var audioEngine: AVAudioEngine?
+    private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    
+    func toggleRecording(baseText: String, onUpdate: @escaping (String) -> Void) {
+        if isRecording { stopRecording() }
+        else {
+            if SFSpeechRecognizer.authorizationStatus() != .authorized { SFSpeechRecognizer.requestAuthorization { _ in }; return }
+            startRecording(baseText: baseText, onUpdate: onUpdate)
+        }
+    }
+    
+    private func startRecording(baseText: String, onUpdate: @escaping (String) -> Void) {
+        audioEngine = AVAudioEngine()
+        guard let audioEngine = audioEngine else { return }
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.inputFormat(forBus: 0)
+        
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let recognitionRequest = recognitionRequest else { return }
+        recognitionRequest.shouldReportPartialResults = true
+        
+        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
+            if let result = result {
+                let recognizedText = result.bestTranscription.formattedString
+                onUpdate(baseText + (baseText.isEmpty ? "" : " ") + recognizedText)
+            }
+            if error != nil || result?.isFinal == true { self.stopRecording() }
+        }
+        
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in self.recognitionRequest?.append(buffer) }
+        audioEngine.prepare(); try? audioEngine.start(); isRecording = true
+    }
+    
+    func stopRecording() {
+        audioEngine?.stop(); audioEngine?.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio(); recognitionTask?.cancel()
+        audioEngine = nil; recognitionRequest = nil; recognitionTask = nil; isRecording = false
+    }
+}
+
+@MainActor
+func openSystemImagePreview(image: NSImage, fileURL: URL? = nil) {
+    if let url = fileURL, FileManager.default.fileExists(atPath: url.path) {
+        NSWorkspace.shared.open(url)
+        return
+    }
+    
+    let tempDir = FileManager.default.temporaryDirectory
+    let tempURL = tempDir.appendingPathComponent("preview_\(UUID().uuidString.prefix(8)).png")
+    
+    if let tiff = image.tiffRepresentation,
+       let bitmap = NSBitmapImageRep(data: tiff),
+       let pngData = bitmap.representation(using: .png, properties: [:]) {
+        try? pngData.write(to: tempURL, options: .atomic)
+        NSWorkspace.shared.open(tempURL)
+    }
+}
+
+nonisolated func scanLocalImageFromText(_ text: String) -> (image: NSImage, url: URL)? {
+    guard text.contains("screenshot_") || text.contains(".png") || text.contains(".jpg") || text.contains(".jpeg") || text.contains(".webp") else {
+        return nil
+    }
+    
+    let tokens = text.components(separatedBy: CharacterSet.whitespacesAndNewlines)
+    for token in tokens {
+        if (token.contains("screenshot_") || token.contains("/")) &&
+           (token.hasSuffix(".png") || token.hasSuffix(".jpg") || token.hasSuffix(".jpeg") || token.hasSuffix(".webp")) {
+            
+            var cleanPath = token.trimmingCharacters(in: CharacterSet.punctuationCharacters.subtracting(CharacterSet(charactersIn: "/")))
+            if let userRange = cleanPath.range(of: "/Users/") {
+                cleanPath = String(cleanPath[userRange.lowerBound...])
+            }
+            
+            let url = URL(fileURLWithPath: cleanPath)
+            if FileManager.default.fileExists(atPath: cleanPath),
+               let image = NSImage(contentsOfFile: cleanPath) {
+                return (image, url)
+            }
+        }
+    }
+    return nil
+}
+
+// MARK: - ==================== 4. ChatBlockViews (基础 Markdown 块级组件) ====================
+
 struct HeaderBlockView: View {
     let level: Int
     let text: String
@@ -914,6 +1052,55 @@ struct HeaderBlockView: View {
     }
 }
 
+struct CodeSyntaxHighlighter {
+    private static let keywordsRegex = try! NSRegularExpression(
+        pattern: #"\b(func|def|import|class|struct|enum|let|var|if|else|guard|return|switch|case|for|while|try|catch|async|await|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|GROUP|BY|ORDER|LIMIT|true|false|nil|null|None)\b"#
+    )
+    private static let stringRegex = try! NSRegularExpression(pattern: #""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#)
+    private static let commentRegex = try! NSRegularExpression(pattern: #"(?m)(//.*$|#.*$)"#)
+    private static let numberRegex = try! NSRegularExpression(pattern: #"\b\d+(\.\d+)?\b"#)
+
+    static func highlight(code: String) -> AttributedString {
+        var attr = AttributedString(code)
+        attr.font = Font.system(size: 12.5, weight: .regular, design: .monospaced)
+        attr.foregroundColor = Color(NSColor.labelColor).opacity(0.90)
+        
+        let nsCode = code as NSString
+        let fullRange = NSRange(location: 0, length: nsCode.length)
+        
+        // 1. 数字 (蓝色)
+        for match in numberRegex.matches(in: code, range: fullRange) {
+            if let range = Range(match.range, in: attr) {
+                attr[range].foregroundColor = Color(hex: "#3B82F6")
+            }
+        }
+        
+        // 2. 关键字 (紫色)
+        for match in keywordsRegex.matches(in: code, range: fullRange) {
+            if let range = Range(match.range, in: attr) {
+                attr[range].foregroundColor = Color(hex: "#8B5CF6")
+                attr[range].font = Font.system(size: 12.5, weight: .semibold, design: .monospaced)
+            }
+        }
+        
+        // 3. 字符串 (橙黄色)
+        for match in stringRegex.matches(in: code, range: fullRange) {
+            if let range = Range(match.range, in: attr) {
+                attr[range].foregroundColor = Color(hex: "#D97706")
+            }
+        }
+        
+        // 4. 注释 (灰色，覆盖其它着色)
+        for match in commentRegex.matches(in: code, range: fullRange) {
+            if let range = Range(match.range, in: attr) {
+                attr[range].foregroundColor = Color.secondary.opacity(0.7)
+            }
+        }
+        
+        return attr
+    }
+}
+
 struct CodeBlockView: View {
     var code: String
     var language: String
@@ -921,29 +1108,62 @@ struct CodeBlockView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // 头部三色窗体与语言指示条
             HStack {
                 HStack(spacing: 6) {
-                    Circle().fill(Color.red.opacity(0.8)).frame(width: 10, height: 10)
-                    Circle().fill(Color.yellow.opacity(0.8)).frame(width: 10, height: 10)
-                    Circle().fill(Color.green.opacity(0.8)).frame(width: 10, height: 10)
-                }.padding(.trailing, 8)
-                Text(language.isEmpty ? "Code" : language.lowercased()).font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundColor(.secondary)
+                    Circle().fill(Color.red.opacity(0.8)).frame(width: 9, height: 9)
+                    Circle().fill(Color.yellow.opacity(0.8)).frame(width: 9, height: 9)
+                    Circle().fill(Color.green.opacity(0.8)).frame(width: 9, height: 9)
+                }
+                .padding(.trailing, 6)
+                
+                Text(language.isEmpty ? "Code" : language.lowercased())
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.secondary)
+                
                 Spacer()
+                
                 Button(action: copyToClipboard) {
-                    HStack(spacing: 4) { Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard"); Text(isCopied ? "已复制" : "复制") }.font(.system(size: 11)).foregroundColor(isCopied ? .green : .secondary)
-                }.buttonStyle(.plain)
+                    HStack(spacing: 4) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                        Text(isCopied ? "已复制" : "复制")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(isCopied ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 12).padding(.vertical, 8).background(Color(NSColor.windowBackgroundColor).opacity(0.5))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
             
-            Text(code).font(.system(size: 13, design: .monospaced)).padding(14).lineSpacing(4).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true)
+            Divider().opacity(0.4)
+            
+            // 语法高亮文本区
+            Text(CodeSyntaxHighlighter.highlight(code: code))
+                .padding(12)
+                .lineSpacing(4.5)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .background(Color(NSColor.textBackgroundColor)).cornerRadius(10).overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.15), lineWidth: 1)).padding(.vertical, 6)
+        .background(Color(NSColor.textBackgroundColor).opacity(0.75))
+        .cornerRadius(9)
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+        )
+        .padding(.vertical, 4)
     }
     
     private func copyToClipboard() {
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(code, forType: .string)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
         withAnimation { isCopied = true }
-        Task { try? await Task.sleep(nanoseconds: 2_000_000_000); withAnimation { isCopied = false } }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            withAnimation { isCopied = false }
+        }
     }
 }
 
@@ -972,7 +1192,6 @@ struct TableBlockView: View {
     }
 }
 
-// MARK: - 极简内联思考导轨组件 (无框极细导轨，连贯融入正文流)
 struct ThinkBlockView: View {
     let content: String
     var isGenerating: Bool
@@ -983,7 +1202,6 @@ struct ThinkBlockView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            // 1. 极简单行折叠标头
             Button(action: {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                     isExpanded.toggle()
@@ -994,10 +1212,6 @@ struct ThinkBlockView: View {
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .font(.system(size: 9, weight: .bold))
                         .foregroundColor(.secondary.opacity(0.6))
-                    
-//                    Image(systemName: isClosed ? "brain" : "brain.head.profile")
-//                        .font(.system(size: 11))
-//                        .foregroundColor(isClosed ? .secondary.opacity(0.7) : .purple)
                     
                     Text(dynamicTitle)
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -1023,7 +1237,6 @@ struct ThinkBlockView: View {
             .buttonStyle(.plain)
             .onHover { h in isHovered = h }
             
-            // 2. 展开后的极细垂直导轨内容区
             if isExpanded {
                 HStack(alignment: .top, spacing: 8) {
                     Rectangle()
@@ -1055,14 +1268,8 @@ struct ThinkBlockView: View {
         }
         .padding(.vertical, 1)
         .onAppear {
-            // 全部默认收起
-            if !isClosed {
-                isExpanded = false
-            } else {
-                isExpanded = false
-            }
+            isExpanded = false
         }
-        // 思考标签闭合时自动收拢
         .onChange(of: isClosed) { _, closed in
             if closed {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
@@ -1070,7 +1277,6 @@ struct ThinkBlockView: View {
                 }
             }
         }
-        // 整体流式生成结束时确保统一收拢
         .onChange(of: isGenerating) { _, generating in
             if !generating {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
@@ -1082,7 +1288,6 @@ struct ThinkBlockView: View {
     
     private var dynamicTitle: String {
         if !isClosed { return "思考中..." }
-        
         let text = content
         let lastStr: String
         if let lastNewlineIndex = text.lastIndex(of: "\n") {
@@ -1108,12 +1313,20 @@ struct TypingIndicatorView: View {
     @State private var opacities: [Double] = [0.3, 0.3, 0.3]
     
     var body: some View {
-        HStack(spacing: 6) { ForEach(0..<3, id: \.self) { index in Circle().fill(Color.cyan).frame(width: 8, height: 8).scaleEffect(scales[index]).opacity(opacities[index]) } }
+        HStack(spacing: 6) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle().fill(Color.cyan).frame(width: 8, height: 8).scaleEffect(scales[index]).opacity(opacities[index])
+            }
+        }
         .padding(.vertical, 8).padding(.horizontal, 4).onAppear { animateDots() }
     }
     private func animateDots() {
         let animation = Animation.easeInOut(duration: 0.6).repeatForever(autoreverses: true)
-        for i in 0..<3 { DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.2) { withAnimation(animation) { scales[i] = 1.0; opacities[i] = 1.0 } } }
+        for i in 0..<3 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.2) {
+                withAnimation(animation) { scales[i] = 1.0; opacities[i] = 1.0 }
+            }
+        }
     }
 }
 
@@ -1128,16 +1341,31 @@ struct ActionChipModel: Hashable {
     let title: String
 }
 
-// MARK: - MessageContentView (集成块级标题与 Markdown 渲染)
 struct MessageContentView: View, Equatable {
     var messageID: UUID = UUID()
     var text: String
     var isUser: Bool
     var isGenerating: Bool
+    var skillLogs: [SkillExecutionLog] = []
+    var ragHits: [RAGHitLog] = []
     var onAction: ((String) -> Void)? = nil
     
+    @State private var inspectingLog: SkillExecutionLog? = nil
+    @State private var showInspectPopover: Bool = false
+    
+    @State private var inspectingRagHit: RAGHitLog? = nil
+    @State private var showRagPopover: Bool = false
+    
+    // 鼠标物理坐标动态锚点
+    @State private var popoverAnchorPosition: CGPoint = CGPoint(x: 100, y: 20)
+    @State private var contentGlobalFrame: CGRect = .zero
+    
     static func == (lhs: MessageContentView, rhs: MessageContentView) -> Bool {
-        return lhs.messageID == rhs.messageID && lhs.text == rhs.text && lhs.isGenerating == rhs.isGenerating
+        return lhs.messageID == rhs.messageID &&
+               lhs.text == rhs.text &&
+               lhs.isGenerating == rhs.isGenerating &&
+               lhs.skillLogs == rhs.skillLogs &&
+               lhs.ragHits == rhs.ragHits
     }
     
     private func extractActionTags(from text: String) -> (String, [ActionChipModel]) {
@@ -1213,110 +1441,186 @@ struct MessageContentView: View, Equatable {
     var body: some View {
         let parts = MessageASTCache.shared.getParsedParts(id: messageID, text: text, isGenerating: isGenerating)
         
-        VStack(alignment: .leading, spacing: 6) {
-            if parts.isEmpty {
-                if isGenerating { TypingIndicatorView() }
-                else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
-            } else {
-                ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
-                    switch part.type {
-                    case .header(let level):
-                        HeaderBlockView(level: level, text: part.text, isUser: isUser)
-                        
-                    case .code(let language):
-                        CodeBlockView(code: part.text, language: language)
-                            .textSelection(.enabled)
-                    case .table(let headers, let rows):
-                        TableBlockView(headers: headers, rows: rows)
-                            .textSelection(.enabled)
-                    case .think(let isClosed):
-                        ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed)
-                            .textSelection(.enabled)
-                    case .divider:
-                        HorizontalRuleBlockView()
-                    case .text:
-                        let (cleanText, actionChips) = extractActionTags(from: part.text)
-                        let segments = splitByCardTag(cleanText)
-                        
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(0..<segments.count, id: \.self) { segIdx in
-                                let seg = segments[segIdx]
-                                
-                                if seg.isCard {
-                                    VStack(alignment: .leading, spacing: 4) {
+        ZStack(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 6) {
+                if parts.isEmpty {
+                    if isGenerating { TypingIndicatorView() }
+                    else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
+                } else {
+                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                        switch part.type {
+                        case .header(let level):
+                            HeaderBlockView(level: level, text: part.text, isUser: isUser)
+                            
+                        case .code(let language):
+                            CodeBlockView(code: part.text, language: language)
+                                .textSelection(.enabled)
+                        case .table(let headers, let rows):
+                            TableBlockView(headers: headers, rows: rows)
+                                .textSelection(.enabled)
+                        case .think(let isClosed):
+                            ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed)
+                                .textSelection(.enabled)
+                        case .divider:
+                            HorizontalRuleBlockView()
+                        case .text:
+                            let (cleanText, actionChips) = extractActionTags(from: part.text)
+                            let segments = splitByCardTag(cleanText)
+                            
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(0..<segments.count, id: \.self) { segIdx in
+                                    let seg = segments[segIdx]
+                                    
+                                    if seg.isCard {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
+                                                .lineSpacing(6)
+                                                .multilineTextAlignment(.leading)
+                                                .tint(.cyan)
+                                                .textSelection(.enabled)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 11)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .fill(Color.cyan.opacity(0.07))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .stroke(Color.cyan.opacity(0.38), lineWidth: 1.5)
+                                        )
+                                        .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
+                                        .padding(.vertical, 4)
+                                        .compositingGroup()
+                                    } else {
                                         Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
                                             .lineSpacing(6)
                                             .multilineTextAlignment(.leading)
                                             .tint(.cyan)
                                             .textSelection(.enabled)
                                             .fixedSize(horizontal: false, vertical: true)
+                                            .compositingGroup()
                                     }
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 11)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color.cyan.opacity(0.07))
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .stroke(Color.cyan.opacity(0.38), lineWidth: 1.5)
-                                    )
-                                    .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
-                                    .padding(.vertical, 4)
-                                    .compositingGroup()
-                                } else {
-                                    Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
-                                        .lineSpacing(6)
-                                        .multilineTextAlignment(.leading)
-                                        .tint(.cyan)
-                                        .textSelection(.enabled)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .compositingGroup()
                                 }
-                            }
-                            
-                            if !actionChips.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 8) {
-                                        ForEach(actionChips, id: \.self) { chip in
-                                            Button(action: {
-                                                if chip.type == .skill {
-                                                    let systemInvokePrompt = "请直接调用此技能(tool)：\(chip.payload)。无需多余废话，直接执行。"
-                                                    onAction?(systemInvokePrompt)
-                                                } else {
-                                                    onAction?(chip.payload)
+                                
+                                if !actionChips.isEmpty {
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 8) {
+                                            ForEach(actionChips, id: \.self) { chip in
+                                                Button(action: {
+                                                    if chip.type == .skill {
+                                                        let systemInvokePrompt = "请直接调用此技能(tool)：\(chip.payload)。无需多余废话，直接执行。"
+                                                        onAction?(systemInvokePrompt)
+                                                    } else {
+                                                        onAction?(chip.payload)
+                                                    }
+                                                }) {
+                                                    HStack(spacing: 4) {
+                                                        Image(systemName: chip.type == .skill ? "wrench.and.screwdriver.fill" : "paperplane.fill")
+                                                            .font(.system(size: 10))
+                                                        Text(chip.title).font(.system(size: 12, weight: .bold))
+                                                    }
+                                                    .foregroundColor(chip.type == .skill ? .purple : .cyan)
+                                                    .padding(.horizontal, 10)
+                                                    .padding(.vertical, 5)
+                                                    .background((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.15))
+                                                    .cornerRadius(6)
+                                                    .overlay(
+                                                        RoundedRectangle(cornerRadius: 6)
+                                                            .stroke((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.3), lineWidth: 1)
+                                                    )
                                                 }
-                                            }) {
-                                                HStack(spacing: 4) {
-                                                    Image(systemName: chip.type == .skill ? "wrench.and.screwdriver.fill" : "paperplane.fill")
-                                                        .font(.system(size: 10))
-                                                    Text(chip.title).font(.system(size: 12, weight: .bold))
-                                                }
-                                                .foregroundColor(chip.type == .skill ? .purple : .cyan)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 5)
-                                                .background((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.15))
-                                                .cornerRadius(6)
-                                                .overlay(
-                                                    RoundedRectangle(cornerRadius: 6)
-                                                        .stroke((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.3), lineWidth: 1)
-                                                )
+                                                .buttonStyle(.plain)
                                             }
-                                            .buttonStyle(.plain)
                                         }
+                                        .padding(.vertical, 2)
                                     }
-                                    .padding(.vertical, 2)
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
                             }
                         }
                     }
                 }
             }
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { contentGlobalFrame = geo.frame(in: .global) }
+                        .onChange(of: geo.frame(in: .global)) { _, newFrame in contentGlobalFrame = newFrame }
+                }
+            )
+            
+            // 1x1 隐形鼠标物理吸附锚点 (精确依附于点击位置)
+            Color.clear
+                .frame(width: 1, height: 1)
+                .offset(x: popoverAnchorPosition.x, y: popoverAnchorPosition.y)
+                .popover(isPresented: $showInspectPopover, arrowEdge: .top) {
+                    if let log = inspectingLog {
+                        let isExec = log.resultOutput == "执行中..." || log.resultOutput == "等待授权..."
+                        let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
+                        DetailedSkillView(
+                            log: log,
+                            themeColor: log.executorName != nil ? .purple : (isExec ? .blue : (isFailed ? .red : .green)),
+                            isExecuting: isExec
+                        )
+                    }
+                }
+                .popover(isPresented: $showRagPopover, arrowEdge: .top) {
+                    if let hit = inspectingRagHit {
+                        RAGChunkInspectorPopover(hit: hit)
+                    }
+                }
         }
         .environment(\.openURL, OpenURLAction { url in
-            let handled = LocalLinkOpener.openSmartLink(url)
-            return handled ? .handled : .systemAction
+            guard url.scheme == "action" else {
+                let handled = LocalLinkOpener.openSmartLink(url)
+                return handled ? .handled : .systemAction
+            }
+            
+            // 捕获当前鼠标事件的窗口物理坐标并映射至局部
+            if let event = NSApp.currentEvent, let window = event.window ?? NSApp.keyWindow {
+                let windowHeight = window.contentView?.frame.height ?? window.frame.height
+                let clickX = event.locationInWindow.x
+                let clickY = windowHeight - event.locationInWindow.y
+                
+                let localX = max(8, min(max(16, contentGlobalFrame.width - 8), clickX - contentGlobalFrame.minX))
+                let localY = max(8, min(max(16, contentGlobalFrame.height - 8), clickY - contentGlobalFrame.minY))
+                self.popoverAnchorPosition = CGPoint(x: localX, y: localY)
+            }
+            
+            if url.host == "inspect_tool" {
+                let targetToolName = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                let callId = queryParams?.first(where: { $0.name == "call_id" })?.value
+                
+                // 1. 优先通过 call_id 绝对唯一精确寻址
+                if let callId = callId, !callId.isEmpty,
+                   let matchedLog = skillLogs.first(where: { $0.confirmationId == callId || $0.id.uuidString == callId }) {
+                    self.inspectingLog = matchedLog
+                    self.showInspectPopover = true
+                    return .handled
+                }
+                
+                // 2. 降级兜底寻址
+                if let matchedLog = skillLogs.last(where: {
+                    $0.skillName.lowercased() == targetToolName.lowercased() ||
+                    $0.displayName.lowercased() == targetToolName.lowercased()
+                }) ?? skillLogs.last {
+                    self.inspectingLog = matchedLog
+                    self.showInspectPopover = true
+                    return .handled
+                }
+            } else if url.host == "inspect_rag" {
+                let hitId = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                if let matchedHit = ragHits.first(where: { $0.id.uuidString == hitId || $0.title == hitId }) {
+                    self.inspectingRagHit = matchedHit
+                    self.showRagPopover = true
+                    return .handled
+                }
+            }
+            
+            return .handled
         })
     }
 }
@@ -1332,47 +1636,87 @@ struct HorizontalRuleBlockView: View {
     }
 }
 
-// MARK: - ==================== 5. 统一交互式卡片与时间轴组件 ====================
+// MARK: - ==================== 5. ChatInteractiveCards (具身工具与公证卡片) ====================
 
 struct JsonTreeView: View {
     let value: Any
     let key: String?
     let isLast: Bool
 
-    init(value: Any, key: String? = nil, isLast: Bool = true) { self.value = value; self.key = key; self.isLast = isLast }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 4) {
-            if let key = key { Text("\"\(key)\"").foregroundColor(.indigo.opacity(0.8)).font(.system(.caption, design: .monospaced).weight(.medium)); Text(":").foregroundColor(.secondary) }
-            content.font(.system(.caption, design: .monospaced))
-            if !isLast { Text(",").foregroundStyle(.tertiary) }
-        }
+    init(value: Any, key: String? = nil, isLast: Bool = true) {
+        self.value = value
+        self.key = key
+        self.isLast = isLast
     }
 
-    @ViewBuilder
-    private var content: some View {
-        if let dict = value as? [String: Any] {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("{").foregroundColor(.secondary)
-                let sortedKeys = dict.keys.sorted()
-                ForEach(0..<sortedKeys.count, id: \.self) { index in let k = sortedKeys[index]; JsonTreeView(value: dict[k]!, key: k, isLast: index == sortedKeys.count - 1).padding(.leading, 16) }
-                Text("}").foregroundColor(.secondary)
+    var body: some View {
+        FastJsonViewer(value: value)
+    }
+}
+
+struct FastJsonViewer: View {
+    let value: Any
+    
+    var body: some View {
+        if let dict = value as? [String: Any], !dict.isEmpty {
+            // 简单扁平字典，走轻量高效 Key-Value 行渲染
+            let isFlat = dict.values.allSatisfy { !($0 is [String: Any]) && !($0 is [Any]) }
+            if isFlat {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(dict.keys.sorted(), id: \.self) { k in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(k)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(.indigo)
+                            Text(":")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            Text(formatSimpleVal(dict[k]!))
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundColor(dict[k] is String ? .teal : .primary.opacity(0.9))
+                                .lineLimit(6)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            } else {
+                // 复杂多层嵌套，单次格式化等宽文本输出（毫秒级瞬时渲染）
+                Text(formatPrettyJSON(from: dict))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.primary.opacity(0.9))
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-        } else if let array = value as? [Any] {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("[").foregroundColor(.secondary)
-                ForEach(0..<array.count, id: \.self) { index in JsonTreeView(value: array[index], key: nil, isLast: index == array.count - 1).padding(.leading, 16) }
-                Text("]").foregroundColor(.secondary)
-            }
+        } else if let array = value as? [Any], !array.isEmpty {
+            Text(formatPrettyJSON(from: array))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.9))
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         } else {
-            Group {
-                if value is String { Text("\"\(value as! String)\"").foregroundColor(.teal) }
-                else if value is Int || value is Double { Text("\(String(describing: value))").foregroundColor(.orange.opacity(0.9)) }
-                else if value is Bool { Text("\(String(describing: value))").foregroundColor(.cyan) }
-                else if value is NSNull { Text("null").foregroundStyle(.tertiary) }
-                else { Text("\(String(describing: value))").foregroundColor(.primary) }
-            }.fixedSize(horizontal: false, vertical: true)
+            Text(formatSimpleVal(value))
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundColor(.teal)
+                .textSelection(.enabled)
         }
+    }
+    
+    private func formatSimpleVal(_ val: Any) -> String {
+        if let s = val as? String { return "\"\(s)\"" }
+        if let b = val as? Bool { return b ? "true" : "false" }
+        if let n = val as? NSNumber { return "\(n)" }
+        if val is NSNull { return "null" }
+        return "\(val)"
+    }
+    
+    private func formatPrettyJSON(from object: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+              let str = String(data: data, encoding: .utf8) else {
+            return "\(object)"
+        }
+        return str
     }
 }
 
@@ -1721,7 +2065,6 @@ struct TaskCompletionCardView: View {
     }
 }
 
-// 辅助组件：展示技能详细参数的弹窗面板
 struct DetailedSkillView: View {
     let log: SkillExecutionLog
     let themeColor: Color
@@ -1729,62 +2072,129 @@ struct DetailedSkillView: View {
     
     @State private var detectedImage: NSImage? = nil
     @State private var detectedURL: URL? = nil
+    @State private var isCopied: Bool = false
     
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                HStack(spacing: 8) {
-                    Image(systemName: "terminal.fill").foregroundColor(themeColor)
-                    Text(log.displayName).font(.system(size: 13, weight: .semibold, design: .monospaced)).foregroundColor(.primary)
-                }
+            // 头部导航条
+            HStack(spacing: 8) {
+                Image(systemName: "terminal.fill")
+                    .foregroundColor(themeColor)
+                    .font(.system(size: 12))
+                
+                Text(log.displayName)
+                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(.primary)
+                
                 Spacer()
-                if isExecuting { HStack(spacing: 6) { Text("计算中"); ProgressView().controlSize(.small) }.font(.caption).foregroundColor(.secondary) }
+                
+                if isExecuting {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("计算中").font(.system(size: 10)).foregroundColor(.secondary)
+                    }
+                }
+                
+                Button(action: copyAllDetails) {
+                    HStack(spacing: 3) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                        Text(isCopied ? "已复制" : "一键复制")
+                    }
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(isCopied ? .green : themeColor)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background((isCopied ? Color.green : themeColor).opacity(0.12))
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 16).padding(.vertical, 14).background(themeColor.opacity(0.05))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(themeColor.opacity(0.06))
             
             Divider()
             
             ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack { Image(systemName: "tray.and.arrow.down"); Text("输入参数").fontWeight(.medium) }.font(.system(size: 12, design: .rounded)).foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 14) {
+                    // 输入参数区域
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "tray.and.arrow.down")
+                            Text("输入参数").fontWeight(.bold)
+                        }
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundColor(.secondary)
+                        
                         if !log.args.isEmpty {
-                            JsonTreeView(value: log.args).textSelection(.enabled).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(Color(NSColor.textBackgroundColor).opacity(0.6)).cornerRadius(8)
-                        } else { Text("()").foregroundStyle(.tertiary).font(.caption) }
+                            FastJsonViewer(value: log.args)
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(NSColor.textBackgroundColor).opacity(0.6))
+                                .cornerRadius(7)
+                        } else {
+                            Text("无附加参数")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary.opacity(0.6))
+                                .italic()
+                        }
                     }
                     
+                    // 截图展示
                     if let img = detectedImage {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack { Image(systemName: "photo"); Text("生成/捕获的图片").fontWeight(.medium) }.font(.system(size: 12, design: .rounded)).foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "photo")
+                                Text("捕获的图像").fontWeight(.bold)
+                            }
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundColor(.secondary)
+                            
                             Image(nsImage: img)
                                 .resizable()
                                 .scaledToFit()
-                                .frame(maxHeight: 180)
-                                .cornerRadius(8)
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.1), lineWidth: 1))
+                                .frame(maxHeight: 160)
+                                .cornerRadius(7)
+                                .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1), lineWidth: 1))
                                 .onTapGesture {
                                     openSystemImagePreview(image: img, fileURL: detectedURL)
                                 }
                         }
                     }
                     
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack { Image(systemName: "tray.and.arrow.up"); Text("执行结果").fontWeight(.medium) }.font(.system(size: 12, design: .rounded)).foregroundColor(.secondary)
+                    // 执行结果区域
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "tray.and.arrow.up")
+                            Text("执行结果").fontWeight(.bold)
+                        }
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundColor(.secondary)
                         
                         if log.skillName == "knowledge_search" && log.resultOutput.contains("<knowledge_chunk") {
                             KnowledgeSearchResultBubbleView(log: log)
-                                .padding(12)
+                                .padding(10)
                                 .background(Color(NSColor.textBackgroundColor).opacity(0.6))
-                                .cornerRadius(8)
+                                .cornerRadius(7)
                         } else {
                             let resultText = log.resultOutput.isEmpty ? "(等待返回)" : log.resultOutput
-                            Text(resultText).font(.system(size: 12, design: .monospaced)).foregroundColor(log.resultOutput.contains("❌") ? .pink : .primary.opacity(0.9)).lineSpacing(4).frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true).padding(12).background(Color(NSColor.textBackgroundColor).opacity(0.6)).cornerRadius(8).textSelection(.enabled)
+                            Text(resultText)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundColor(log.resultOutput.contains("❌") ? .pink : .primary.opacity(0.9))
+                                .lineSpacing(3.5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(10)
+                                .background(Color(NSColor.textBackgroundColor).opacity(0.6))
+                                .cornerRadius(7)
+                                .textSelection(.enabled)
                         }
                     }
-                }.padding(16)
+                }
+                .padding(14)
             }
         }
-        .frame(width: 500, height: 380)
+        .frame(width: 480, height: 350)
         .background(.regularMaterial)
         .task(id: log.id) {
             let textToScan = "\(log.resultOutput) \(log.args)"
@@ -1802,9 +2212,21 @@ struct DetailedSkillView: View {
             }
         }
     }
+    
+    private func copyAllDetails() {
+        let text = """
+        【工具名称】: \(log.displayName) (\(log.skillName))
+        【输入参数】: \(log.args)
+        【执行结果】:
+        \(log.resultOutput)
+        """
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        withAnimation { isCopied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
+    }
 }
 
-// 辅助组件：时间轴普通节点渲染
 struct TimelineNodeView: View {
     let icon: String
     let color: Color
@@ -1860,16 +2282,13 @@ struct TimelineNodeView: View {
     }
 }
 
-// MARK: - ==================== 5.1 灵动向上渐变滚动技能链与可折叠容器 ====================
-
 struct AgentActionTimelineView: View {
     let skillLogs: [SkillExecutionLog]
     var isGenerating: Bool = false
     
-    @State private var isExpanded = false // 默认收拢停驻
+    @State private var isExpanded = false
     @State private var hoveredLogId: UUID? = nil
     
-    // 获取最新激活的技能日志
     private var activeLog: SkillExecutionLog? {
         skillLogs.last
     }
@@ -1877,18 +2296,15 @@ struct AgentActionTimelineView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if isGenerating && activeLog?.resultOutput == "执行中..." {
-                // 🌀 1. 运行时状态：灵动向上推移滚动胶囊
                 dynamicRollingTickerView
                     .transition(.asymmetric(
                         insertion: .move(edge: .bottom).combined(with: .opacity),
                         removal: .move(edge: .top).combined(with: .opacity)
                     ))
             } else {
-                // 🟢 2. 完结/静止状态：优雅停驻卡片 (点击展开完整技能链)
                 restingHeaderView
             }
             
-            // 3. 展开后的完整微时间轴
             if isExpanded && !skillLogs.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     Divider().opacity(0.3).padding(.vertical, 2)
@@ -1900,7 +2316,7 @@ struct AgentActionTimelineView: View {
                             SkillConfirmationCardView(log: log).padding(.bottom, isLast ? 0 : 6)
                         } else {
                             let isExec = log.resultOutput == "执行中..." || log.resultOutput.hasPrefix("思考中...")
-                            let isErr = log.resultOutput.contains("❌") || log.resultOutput.contains("⚠️")
+                            let isErr = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
                             let isTextOutput = log.skillName == "sub_agent_thought"
                             let icon = isTextOutput ? "bubble.left.and.bubble.right.fill" : (isExec ? "bolt.badge.clock.fill" : (isErr ? "exclamationmark.triangle.fill" : "terminal.fill"))
                             let color: Color = log.executorName != nil ? .purple : (isExec ? .blue : (isErr ? .red : .green))
@@ -1929,7 +2345,6 @@ struct AgentActionTimelineView: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.75), value: skillLogs.count)
     }
     
-    // 🌀 运行中微胶囊
     private var dynamicRollingTickerView: some View {
         HStack(spacing: 8) {
             ZStack {
@@ -1963,7 +2378,6 @@ struct AgentActionTimelineView: View {
         .padding(.vertical, 7)
     }
     
-    // 🟢 完结停驻态标头
     private var restingHeaderView: some View {
         Button(action: { isExpanded.toggle() }) {
             HStack(spacing: 8) {
@@ -2013,8 +2427,6 @@ struct AgentActionTimelineView: View {
     }
 }
 
-// MARK: - ==================== 5.2 RAG 知识库切片即时抽屉与查看器 ====================
-
 struct RAGHitsBottomView: View {
     let ragHits: [RAGHitLog]
 
@@ -2038,7 +2450,6 @@ struct RAGHitsBottomView: View {
     }
 }
 
-// 单个知识切片徽章 (点击弹出 Popover 查看文本切片内容)
 struct RAGHitChipButton: View {
     let hit: RAGHitLog
     @State private var isHovered = false
@@ -2073,14 +2484,12 @@ struct RAGHitChipButton: View {
     }
 }
 
-// 知识库切片内容查看面板 (Popover)
 struct RAGChunkInspectorPopover: View {
     let hit: RAGHitLog
     @State private var isCopied = false
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header 标头
             HStack(spacing: 8) {
                 ZStack {
                     Circle().fill(Color.cyan.opacity(0.15)).frame(width: 24, height: 24)
@@ -2119,7 +2528,6 @@ struct RAGChunkInspectorPopover: View {
             
             Divider()
             
-            // Content 文本滚动区
             ScrollView(.vertical, showsIndicators: true) {
                 Text(hit.content.trimmingCharacters(in: .whitespacesAndNewlines))
                     .font(.system(size: 11.5, design: .monospaced))
@@ -2151,50 +2559,6 @@ struct RAGChunkInspectorPopover: View {
         .frame(width: 440, height: 320)
         .background(.ultraThinMaterial)
     }
-}
-
-// MARK: - 🎨 系统原生图像预览辅助调度器
-@MainActor
-func openSystemImagePreview(image: NSImage, fileURL: URL? = nil) {
-    if let url = fileURL, FileManager.default.fileExists(atPath: url.path) {
-        NSWorkspace.shared.open(url)
-        return
-    }
-    
-    let tempDir = FileManager.default.temporaryDirectory
-    let tempURL = tempDir.appendingPathComponent("preview_\(UUID().uuidString.prefix(8)).png")
-    
-    if let tiff = image.tiffRepresentation,
-       let bitmap = NSBitmapImageRep(data: tiff),
-       let pngData = bitmap.representation(using: .png, properties: [:]) {
-        try? pngData.write(to: tempURL, options: .atomic)
-        NSWorkspace.shared.open(tempURL)
-    }
-}
-
-nonisolated func scanLocalImageFromText(_ text: String) -> (image: NSImage, url: URL)? {
-    guard text.contains("screenshot_") || text.contains(".png") || text.contains(".jpg") || text.contains(".jpeg") || text.contains(".webp") else {
-        return nil
-    }
-    
-    let tokens = text.components(separatedBy: CharacterSet.whitespacesAndNewlines)
-    for token in tokens {
-        if (token.contains("screenshot_") || token.contains("/")) &&
-           (token.hasSuffix(".png") || token.hasSuffix(".jpg") || token.hasSuffix(".jpeg") || token.hasSuffix(".webp")) {
-            
-            var cleanPath = token.trimmingCharacters(in: CharacterSet.punctuationCharacters.subtracting(CharacterSet(charactersIn: "/")))
-            if let userRange = cleanPath.range(of: "/Users/") {
-                cleanPath = String(cleanPath[userRange.lowerBound...])
-            }
-            
-            let url = URL(fileURLWithPath: cleanPath)
-            if FileManager.default.fileExists(atPath: cleanPath),
-               let image = NSImage(contentsOfFile: cleanPath) {
-                return (image, url)
-            }
-        }
-    }
-    return nil
 }
 
 struct ToolCardBubbleView: View {
@@ -2393,373 +2757,178 @@ struct ToolCardBubbleView: View {
     }
 }
 
-// MARK: - ==================== 6. 消息行与主视图装配 ====================
-
-struct ChatMessageRowView: View, Equatable {
-    let msg: ChatMessage
-    var isGenerating: Bool
-    let onDelete: () -> Void
-    var onEdit: (() -> Void)? = nil
-    var onRegenerate: (() -> Void)? = nil
-    var onAppendInstruction: ((String) -> Void)? = nil
-    var onConfirmTask: (() -> Void)? = nil
-    
-    @State private var isHovered: Bool = false
-    @State private var isCopied: Bool = false
-    @State private var rowWidth: CGFloat = 800
-    @State private var renderedText: String = ""
-    @State private var lastRenderTime: Date = Date()
-    private let throttleInterval: TimeInterval = 0.08
-    
-    static func == (lhs: ChatMessageRowView, rhs: ChatMessageRowView) -> Bool {
-        return lhs.msg == rhs.msg && lhs.isGenerating == rhs.isGenerating
-    }
-    
-    private var shouldHideStandardContent: Bool {
-        if msg.isUser { return false }
-        if isGenerating { return false }
-        return msg.skillLogs.contains { !$0.uiTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-    
-    private var displaySafeText: String {
-        if msg.isUser { return renderedText }
-        
-        var cleanText = renderedText.filterStopTokens().filterPersonaDelta()
-        if isGenerating { return cleanText }
-        
-        cleanText = cleanText.replacingOccurrences(
-            of: "(?s)```json\\n\\s*\\{.*?\"(action|tool|name)\".*?\\}\\n```",
-            with: "", options: .regularExpression
-        )
-        cleanText = cleanText.replacingOccurrences(
-            of: "(?s)\\n*\\[(正在)?调用技能:.*?\\]\\n*",
-            with: "", options: .regularExpression
-        )
-        return cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    
-    private var uniqueRagHits: [RAGHitLog] {
-        var uniqueHits: [RAGHitLog] = []
-        var seenTitles: Set<String> = []
-        for hit in msg.ragHits {
-            if !seenTitles.contains(hit.title) {
-                seenTitles.insert(hit.title)
-                let combined = msg.ragHits.filter { $0.title == hit.title }.map { $0.content }.joined(separator: "\n\n------\n\n")
-                uniqueHits.append(RAGHitLog(title: hit.title, path: hit.path, content: combined))
-            }
-        }
-        return uniqueHits
-    }
-    
-    private var displayFileURLs: [URL] {
-        return msg.fileURLs.filter { url in
-            let fileName = url.lastPathComponent.lowercased()
-            let isScreenshotPill = fileName.hasPrefix("screenshot_") && (fileName.hasSuffix(".png") || fileName.hasSuffix(".jpg") || fileName.hasSuffix(".jpeg"))
-            return !isScreenshotPill
-        }
-    }
+struct KnowledgeSearchResultBubbleView: View {
+    let log: SkillExecutionLog
+    @State private var isCopied = false
     
     var body: some View {
-        let isNarrow = rowWidth < 600
-        let visibleFiles = displayFileURLs
+        let hitItems = RAGXMLParser.extractHits(from: log.resultOutput)
+        let topK = ConfigManager.shared.app.generalConfig.ragTopK
         
-        VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 4) {
-            let hasImages = !msg.images.isEmpty
-            let hasFiles = !visibleFiles.isEmpty
-            let hasText = !displaySafeText.isEmpty || (isGenerating && !msg.isUser)
-            let hasSkillLogs = !msg.skillLogs.isEmpty
-            
-            HStack(alignment: .top, spacing: 12) {
-                if msg.isUser {
-                    Spacer(minLength: 40)
-                    actionButtons.padding(.top, 4).opacity(actionOpacity)
+        VStack(alignment: .leading, spacing: 10) {
+            if hitItems.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.magnifyingglass")
+                    Text("未召回任何有效知识切片，目标 Top-K: \(topK)。Agent 将依靠基础模型能力作答。")
                 }
-                
-                VStack(alignment: .leading, spacing: 10) {
-                    if msg.isUser && hasImages {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(msg.images, id: \.self) { img in
-                                    Image(nsImage: img)
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(maxHeight: 140)
-                                        .cornerRadius(8)
-                                        .shadow(color: Color.black.opacity(0.1), radius: 3, x: 0, y: 2)
-                                        .contentShape(Rectangle())
-                                        .onTapGesture { openSystemImagePreview(image: img) }
-                                        .onHover { hovering in
-                                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                                        }
-                                }
-                            }
-                        }
-                    }
-                    
-                    if hasFiles {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(visibleFiles, id: \.self) { url in
-                                HStack(spacing: 6) {
-                                    Image(systemName: "doc.fill").foregroundColor(.primary).font(.system(size: 12))
-                                    Text(url.lastPathComponent).font(.system(size: 11, weight: .medium)).foregroundColor(.primary).lineLimit(1)
-                                }
-                                .padding(6)
-                                .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
-                                .cornerRadius(6)
-                                .onTapGesture { NSWorkspace.shared.open(url) }
-                            }
-                        }
-                    }
-                    
-                    // 恢复最初的 AgentActionTimelineView / ToolCardBubbleView 技能链显示方式
-                    if hasSkillLogs {
-                        VStack(alignment: .leading, spacing: 8) {
-                            let isAutonomousLoop = AiChatStore.shared.currentAgent.enableAutonomy
-                            
-                            if isAutonomousLoop {
-                                AgentActionTimelineView(skillLogs: msg.skillLogs, isGenerating: isGenerating)
-                            } else {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    ForEach(msg.skillLogs) { log in
-                                        ToolCardBubbleView(log: log, parentContent: msg.text, onAction: onAppendInstruction)
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                            }
-                        }
-                    }
-                    
-                    if hasText {
-                        if msg.isUser {
-                            UserMessageContentView(text: msg.text)
-                        } else if !shouldHideStandardContent {
-                            MessageContentView(
-                                messageID: msg.id,
-                                text: displaySafeText,
-                                isUser: false,
-                                isGenerating: isGenerating,
-                                onAction: onAppendInstruction
-                            ).equatable()
-                        }
-                    }
-                    
-                    // 恢复最初的 TaskCompletionCardView 结单展现方式
-                    if !msg.isUser, let finishLog = msg.skillLogs.last(where: { $0.skillName == "finish_task" }) {
-                        TaskCompletionCardView(
-                            log: finishLog,
-                            totalToolCalls: msg.skillLogs.count,
-                            onConfirm: { onConfirmTask?() },
-                            onRetry: { instruction in onAppendInstruction?(instruction) }
-                        )
-                    }
-                    
-                    if !msg.isUser && !uniqueRagHits.isEmpty {
-                        RAGHitsBottomView(ragHits: uniqueRagHits)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(msg.isUser ? Color.blue : Color(NSColor.unemphasizedSelectedContentBackgroundColor).opacity(0.5))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .shadow(color: Color.black.opacity(msg.isUser ? 0.1 : 0.05), radius: 3, x: 0, y: 1)
-                .overlay(alignment: .topTrailing) {
-                    if !msg.isUser && isNarrow {
-                        actionButtons.scaleEffect(0.85, anchor: .bottomTrailing).offset(x: 0, y: -20).opacity(actionOpacity)
-                    }
-                }
-                
-                if !msg.isUser {
-                    if !isNarrow { actionButtons.padding(.top, 4).opacity(actionOpacity) }
-                    Spacer(minLength: isNarrow ? 0 : 40)
-                }
-            }
-        }
-        .padding(.top, (!msg.isUser && isNarrow) ? 20 : 6)
-        .padding(.bottom, 6)
-        .contentShape(Rectangle())
-        .onHover { hover in withAnimation(.easeOut(duration: 0.2)) { isHovered = hover } }
-        .background(
-            GeometryReader { geo in Color.clear.onAppear { rowWidth = geo.size.width }.onChange(of: geo.size.width) { _, newWidth in rowWidth = newWidth } }
-        )
-        .onAppear { renderedText = msg.text }
-        .onChange(of: msg.text) { _, newText in
-            if !isGenerating { renderedText = newText } else {
-                let now = Date()
-                if now.timeIntervalSince(lastRenderTime) > throttleInterval { renderedText = newText; lastRenderTime = now }
-            }
-        }
-        .onChange(of: isGenerating) { _, gen in if !gen { renderedText = msg.text } }
-    }
-    
-    @ViewBuilder private var actionButtons: some View {
-        HStack(spacing: 6) {
-            if !msg.isUser {
-                Button(action: { toggleFeedback(.liked) }) {
-                    Image(systemName: msg.feedback == .liked ? "hand.thumbsup.fill" : "hand.thumbsup")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(msg.feedback == .liked ? .green : .primary)
-                        .padding(6)
-                        .background(Circle().fill(msg.feedback == .liked ? Color.green.opacity(0.15) : Color(NSColor.controlBackgroundColor)))
-                }
-                .buttonStyle(.plain)
-                .help("赞同回答")
-                
-                Button(action: { toggleFeedback(.disliked) }) {
-                    Image(systemName: msg.feedback == .disliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(msg.feedback == .disliked ? .orange : .primary)
-                        .padding(6)
-                        .background(Circle().fill(msg.feedback == .disliked ? Color.orange.opacity(0.15) : Color(NSColor.controlBackgroundColor)))
-                }
-                .buttonStyle(.plain)
-                .help("不赞同回答")
-                
-                Divider().frame(height: 12).padding(.horizontal, 2)
-            }
-            
-            Button(action: {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(displaySafeText, forType: .string)
-                withAnimation { isCopied = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
-            }) {
-                Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard.fill")
-                    .font(.system(size: 11))
-                    .foregroundColor(isCopied ? .green : .primary)
-                    .padding(6)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help("复制内容")
-            
-            if !msg.isUser, let onRegenerate = onRegenerate {
-                Button(action: onRegenerate) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.cyan)
-                        .padding(6)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .help("重新生成回复")
-            }
-            
-            if msg.isUser, let onEdit = onEdit {
-                Button(action: onEdit) {
-                    Image(systemName: "pencil.line")
-                        .font(.system(size: 11))
-                        .foregroundColor(.cyan)
-                        .padding(6)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .help("编辑消息")
-            }
-            
-            Button(action: onDelete) {
-                Image(systemName: "trash.fill")
-                    .font(.system(size: 11))
-                    .foregroundColor(.red.opacity(0.8))
-                    .padding(6)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help("删除消息")
-        }
-        .allowsHitTesting(isHovered && !isGenerating)
-    }
-    
-    private func toggleFeedback(_ type: MessageFeedback) {
-        guard let idx = AiChatStore.shared.messages.firstIndex(where: { $0.id == msg.id }) else { return }
-        
-        withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
-            if AiChatStore.shared.messages[idx].feedback == type {
-                AiChatStore.shared.messages[idx].feedback = .none
+                .font(.system(size: 11))
+                .foregroundColor(.orange)
             } else {
-                AiChatStore.shared.messages[idx].feedback = type
-                if type != .none {
-                    let targetId = msg.id
-                    let allMessagesSnapshot = AiChatStore.shared.messages
-                    let currentModel = AiChatStore.shared.currentAgent.baseModel
+                HStack(alignment: .center) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "books.vertical.fill").foregroundColor(.cyan)
+                        Text("成功召回 \(hitItems.count) 个知识切片 (目标 Top-K: \(topK))：").font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundColor(.secondary)
                     
-                    Task(priority: .utility) {
-                        await MemoryManager.shared.harvestFeedbackExperience(
-                            recentMessages: allMessagesSnapshot,
-                            targetMessageId: targetId,
-                            feedback: type,
-                            model: currentModel
-                        )
+                    Spacer()
+                    
+                    Button(action: {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(log.resultOutput, forType: .string)
+                        withAnimation { isCopied = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                            Text(isCopied ? "已复制" : "复制原结果")
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(isCopied ? .green : .cyan)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(isCopied ? Color.green.opacity(0.15) : Color.cyan.opacity(0.1))
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                }
+                
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(hitItems) { hit in
+                        KnowledgeHitRowView(hit: hit)
                     }
                 }
             }
-            AiChatStore.shared.saveCurrentState()
         }
     }
-    
-    private var actionOpacity: Double { (isHovered && !isGenerating) ? 1.0 : 0.0 }
 }
 
-struct UserMessageContentView: View {
-    let text: String
+struct KnowledgeHitRowView: View {
+    let hit: RAGXMLParser.HitItem
     @State private var isExpanded: Bool = false
     @State private var isHovered: Bool = false
     
-    private var isTooLong: Bool {
-        let lineCount = text.components(separatedBy: .newlines).count
-        return lineCount > 4 || text.count > 150
-    }
-    
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            Group {
-                if !isTooLong || isExpanded {
-                    Text(text)
-                        .lineLimit(nil)
-                        .textSelection(.enabled)
-                } else {
-                    Text(text)
-                        .lineLimit(5)
-                        .allowsHitTesting(false)
-                }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "doc.text.viewfinder")
+                    .foregroundColor(.cyan.opacity(0.8))
+                    .padding(.top, 2)
+                
+                Text(hit.title)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                
+                Spacer()
+                
+                Text(String(format: "%.4f", hit.score))
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(scoreColor(hit.score).opacity(0.15))
+                    .foregroundColor(scoreColor(hit.score))
+                    .cornerRadius(4)
+                
+                Image(systemName: "chevron.right")
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.secondary)
+                    .padding(.top, 3)
+                    .padding(.leading, 2)
             }
-            .font(.system(size: 14))
-            .foregroundColor(.white)
-            .lineSpacing(4)
-            .padding(.bottom, (!isExpanded && isTooLong) ? 16 : 0)
-            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isExpanded)
             
-            if isTooLong {
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        isExpanded.toggle()
+            if !hit.tags.isEmpty || !hit.prohibited.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(hit.tags, id: \.self) { tag in
+                            HStack(spacing: 3) {
+                                Image(systemName: "tag.fill").font(.system(size: 8))
+                                Text(tag).font(.system(size: 9, weight: .medium))
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.cyan.opacity(0.15))
+                            .foregroundColor(.cyan)
+                            .cornerRadius(4)
+                        }
+                        
+                        ForEach(hit.prohibited, id: \.self) { proh in
+                            HStack(spacing: 3) {
+                                Image(systemName: "nosign").font(.system(size: 8))
+                                Text(proh).font(.system(size: 9, weight: .medium))
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.red.opacity(0.12))
+                            .foregroundColor(.red)
+                            .cornerRadius(4)
+                        }
                     }
-                } label: {
-                    Image(systemName: isExpanded ? "chevron.up.circle.fill" : "ellipsis.circle.fill")
-                        .font(.system(size: 18))
-                        .foregroundColor(.white)
-                        .background(Color.blue.clipShape(Circle()))
-                        .shadow(color: Color.black.opacity(0.15), radius: 2, y: 1)
                 }
-                .buttonStyle(.plain)
-                .offset(x: 4, y: 4)
-                .help(isExpanded ? "收起长文本" : "展开阅读全文")
-                .scaleEffect(isHovered ? 1.1 : 1.0)
-                .onHover { hovering in
-                    withAnimation(.easeInOut(duration: 0.2)) { isHovered = hovering }
-                }
+                .padding(.leading, 20)
+                .padding(.top, 1)
+            }
+            
+            if isExpanded {
+                Divider().opacity(0.3).padding(.vertical, 2)
+                
+                Text(hit.rawContent.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.primary.opacity(0.85))
+                    .lineSpacing(4)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 20)
+                    .padding(.bottom, 4)
+            } else {
+                Text(hit.snippet)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 20)
             }
         }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(isHovered ? 0.8 : 0.6))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(isExpanded ? Color.cyan.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 1))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                isExpanded.toggle()
+            }
+        }
+        .onHover { hover in
+            withAnimation(.easeInOut(duration: 0.2)) { isHovered = hover }
+            if hover { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+    
+    private func scoreColor(_ score: Float) -> Color {
+        if score >= 0.8 { return .green }
+        if score >= 0.5 { return .orange }
+        return .red
     }
 }
+
+// MARK: - ==================== 6. ChatInputComponents (输入法交互与光标浮窗) ====================
 
 struct NativeMacTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var dynamicHeight: CGFloat
-    @Binding var caretRect: CGRect // [Added] 导出当前光标相对坐标
+    @Binding var caretRect: CGRect
     
     var onSubmit: () -> Void
     var onPasteImages: ([NSImage]) -> Void
@@ -2791,18 +2960,10 @@ struct NativeMacTextView: NSViewRepresentable {
     
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let tv = nsView.documentView as? CustomTextView else { return }
-        
-        // 如果当前输入法正处于中文拼音组合、未上屏状态（hasMarkedText），
-        // 绝对不能用外部的 text 强行覆写 NSTextView，否则会导致拼音被清空、吞字。
         guard !tv.hasMarkedText() else { return }
         
         if tv.string != text {
-            if text.isEmpty {
-                tv.string = ""
-            } else {
-                tv.string = text
-            }
-            
+            tv.string = text
             DispatchQueue.main.async {
                 let newHeight = context.coordinator.calculateHeight(for: tv)
                 if self.dynamicHeight != newHeight {
@@ -2833,7 +2994,6 @@ struct NativeMacTextView: NSViewRepresentable {
             return min(max(lm.usedRect(for: tc).height + tv.textContainerInset.height * 2, 22), 106)
         }
         
-        // MARK: - [Added] 精准定位光标字形物理坐标
         func updateCaretRect(for tv: NSTextView) {
             guard let lm = tv.layoutManager, let tc = tv.textContainer else { return }
             let selectedLocation = tv.selectedRange().location
@@ -2922,7 +3082,7 @@ struct ChatInputAreaView: View {
     let onCancel: () -> Void
     
     @State private var inputHeight: CGFloat = 22
-    @State private var caretRect: CGRect = .zero // [Added] 接收光标物理坐标
+    @State private var caretRect: CGRect = .zero
     
     @State private var showAgentMentionMenu: Bool = false
     @State private var mentionFilterText: String = ""
@@ -2986,7 +3146,6 @@ struct ChatInputAreaView: View {
                 .disabled(store.isLoading)
                 .help("添加附件或图片")
                 
-                // 输入框胶囊
                 HStack(alignment: .bottom, spacing: 8) {
                     VStack(alignment: .leading, spacing: 6) {
                         ZStack(alignment: .topLeading) {
@@ -3009,7 +3168,6 @@ struct ChatInputAreaView: View {
                             )
                             .frame(height: inputHeight)
                             
-                            // MARK: - [Caret Anchor] 光标隐形锚点（Popover 挂载于此）
                             Color.clear
                                 .frame(width: max(caretRect.width, 2), height: max(caretRect.height, 16))
                                 .offset(x: max(0, caretRect.origin.x), y: max(0, caretRect.origin.y))
@@ -3203,7 +3361,6 @@ struct ChatInputAreaView: View {
     }
 }
 
-// MARK: - 预设选项原生气泡浮窗 (# 唤出，带自动居中定位与历史高亮)
 struct OptionHashPopoverBubbleView: View {
     let options: [TextOptionItem]
     let onSelect: (String) -> Void
@@ -3222,12 +3379,10 @@ struct OptionHashPopoverBubbleView: View {
         optionManager.lastSelectedContent
     }
     
-    // 可用文件列表
     private var availableFileTabs: [String] {
         Array(Set(options.map { $0.fileName })).sorted()
     }
     
-    // 当前 Tab 下的选项集合
     private var currentFilteredOptions: [TextOptionItem] {
         if selectedTab == "全部" {
             return options
@@ -3237,17 +3392,10 @@ struct OptionHashPopoverBubbleView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // 1. 顶栏功能区
             headerView
-            
             Divider().opacity(0.25)
-            
-            // 2. 文件 Tab 胶囊切换栏
             tabBarView
-            
             Divider().opacity(0.2)
-            
-            // 3. 选项列表滚动区 (带记忆定位)
             listView
         }
         .frame(width: 480)
@@ -3257,7 +3405,6 @@ struct OptionHashPopoverBubbleView: View {
         }
     }
     
-    // MARK: - 顶栏视图
     private var headerView: some View {
         HStack(spacing: 6) {
             Image(systemName: "number.square.fill")
@@ -3274,7 +3421,6 @@ struct OptionHashPopoverBubbleView: View {
             
             Spacer()
             
-            // 刷新按钮
             Button(action: executeReload) {
                 HStack(spacing: 3) {
                     Image(systemName: "arrow.clockwise")
@@ -3287,7 +3433,6 @@ struct OptionHashPopoverBubbleView: View {
             .buttonStyle(.plain)
             .help("重新扫描并加载 options 目录下的文本选项")
             
-            // 打开目录按钮
             Button(action: onOpenFolder) {
                 HStack(spacing: 3) {
                     Image(systemName: "folder")
@@ -3300,7 +3445,6 @@ struct OptionHashPopoverBubbleView: View {
             .help("在访达中打开 options/ 选项目录")
             .padding(.leading, 4)
             
-            // 关闭按钮
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 12))
@@ -3315,7 +3459,6 @@ struct OptionHashPopoverBubbleView: View {
         .background(Color.primary.opacity(0.02))
     }
     
-    // MARK: - 多文件胶囊 Tab 切换栏
     private var tabBarView: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
@@ -3367,7 +3510,6 @@ struct OptionHashPopoverBubbleView: View {
         .buttonStyle(.plain)
     }
     
-    // MARK: - 选项列表视图 (带自动滚动居中定位)
     private var listView: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: true) {
@@ -3442,7 +3584,6 @@ struct OptionHashPopoverBubbleView: View {
         }
     }
     
-    // MARK: - 状态还原与平滑滚动调度
     private func restoreLastTabAndPosition() {
         if let savedTab = optionManager.lastSelectedTab {
             if savedTab == "全部" || availableFileTabs.contains(savedTab) {
@@ -3479,7 +3620,6 @@ struct OptionHashPopoverBubbleView: View {
     }
 }
 
-// MARK: - AgentMentionPopoverBubbleView
 struct AgentMentionPopoverBubbleView: View {
     let agents: [AgentProfile]
     let onSelect: (String) -> Void
@@ -3541,8 +3681,586 @@ struct AgentMentionPopoverBubbleView: View {
             }
             .frame(maxHeight: 180)
         }
-        .frame(width: 360) // [Modified] 加宽至 360pt
+        .frame(width: 360)
         .background(.ultraThinMaterial)
+    }
+}
+
+struct OptionDrawerPopoverView: View {
+    let onSelectOption: (String) -> Void
+    
+    @State private var searchText: String = ""
+    @State private var selectedFileCategory: String = "全部"
+    
+    init(onSelectOption: @escaping (String) -> Void) {
+        self.onSelectOption = onSelectOption
+    }
+    
+    private var optionManager: TextOptionManager {
+        TextOptionManager.shared
+    }
+    
+    private var currentFilteredOptions: [TextOptionItem] {
+        optionManager.searchOptions(keyword: searchText, selectedCategory: selectedFileCategory)
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.secondary)
+                    .font(.system(size: 12))
+                
+                TextField("搜索选项内容或文本...", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                
+                if !searchText.isEmpty {
+                    Button(action: { searchText = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                }
+                
+                Spacer()
+                
+                Button(action: { optionManager.openInFinder() }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "folder")
+                        Text("目录")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.purple)
+                }
+                .buttonStyle(.plain)
+                .help("在访达中打开选项目录，自由添加或编辑 .txt 文件")
+            }
+            .padding(10)
+            .background(Color.primary.opacity(0.03))
+            
+            Divider().opacity(0.5)
+            
+            if !optionManager.availableFiles.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        categoryChip(title: "全部")
+                        ForEach(optionManager.availableFiles, id: \.self) { fileName in
+                            categoryChip(title: fileName)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                }
+                Divider().opacity(0.3)
+            }
+            
+            ScrollView(.vertical, showsIndicators: true) {
+                if currentFilteredOptions.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 28))
+                            .foregroundColor(.secondary.opacity(0.5))
+                        Text("未检索到匹配的选项内容")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                        Button("打开文件夹添加 .txt 文件") {
+                            optionManager.openInFinder()
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.link)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 36)
+                } else {
+                    LazyVStack(spacing: 4) {
+                        ForEach(currentFilteredOptions) { option in
+                            Button(action: { onSelectOption(option.content) }) {
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(option.fileName)
+                                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.purple)
+                                        .padding(.horizontal, 4).padding(.vertical, 2)
+                                        .background(Color.purple.opacity(0.1))
+                                        .cornerRadius(3)
+                                        .padding(.top, 1)
+                                    
+                                    Text(option.content)
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.primary.opacity(0.9))
+                                        .lineSpacing(3)
+                                        .multilineTextAlignment(.leading)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.primary.opacity(0.03))
+                                .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+            .frame(maxHeight: 260)
+        }
+        .frame(width: 360)
+        .background(.ultraThinMaterial)
+    }
+    
+    private func categoryChip(title: String) -> some View {
+        let isSelected = selectedFileCategory == title
+        return Button(action: {
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
+                selectedFileCategory = title
+            }
+        }) {
+            Text(title)
+                .font(.system(size: 11, weight: isSelected ? .bold : .medium))
+                .foregroundColor(isSelected ? .purple : .secondary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(isSelected ? Color.purple.opacity(0.15) : Color.primary.opacity(0.04))
+                .cornerRadius(5)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(isSelected ? Color.purple.opacity(0.3) : Color.clear, lineWidth: 0.8)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - ==================== 7. ChatMainView (主视图装配与渲染管线) ====================
+
+struct ChatMessageRowView: View, Equatable {
+    let msg: ChatMessage
+    var isGenerating: Bool
+    let onDelete: () -> Void
+    var onEdit: (() -> Void)? = nil
+    var onRegenerate: (() -> Void)? = nil
+    var onAppendInstruction: ((String) -> Void)? = nil
+    var onConfirmTask: (() -> Void)? = nil
+    
+    @State private var isHovered: Bool = false
+    @State private var isCopied: Bool = false
+    @State private var rowWidth: CGFloat = 800
+    @State private var renderedText: String = ""
+    @State private var lastRenderTime: Date = Date()
+    private let throttleInterval: TimeInterval = 0.08
+    
+    // 视口感知与几何位置跟踪
+    @State private var bubbleHeight: CGFloat = 0
+    @State private var bubbleGlobalMinY: CGFloat = 0
+    @State private var bubbleGlobalMaxY: CGFloat = 0
+    @State private var windowHeight: CGFloat = 800
+    
+    static func == (lhs: ChatMessageRowView, rhs: ChatMessageRowView) -> Bool {
+        return lhs.msg == rhs.msg && lhs.isGenerating == rhs.isGenerating
+    }
+    
+    // 动态判定工具条是否应在气泡上方展示
+    private var shouldShowToolbarAtTop: Bool {
+        guard !msg.isUser else { return false }
+        let bottomCutoff = max(300, windowHeight - 90)
+        let isBottomHidden = bubbleGlobalMaxY > bottomCutoff
+        let isTopOnScreen = bubbleGlobalMinY < bottomCutoff - 60
+        return (bubbleHeight > 240) && isBottomHidden && isTopOnScreen
+    }
+    
+    private var shouldHideStandardContent: Bool {
+        if msg.isUser { return false }
+        if isGenerating { return false }
+        return msg.skillLogs.contains { !$0.uiTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+    
+    private var displaySafeText: String {
+        if msg.isUser { return renderedText }
+        
+        var cleanText = renderedText.filterStopTokens().filterPersonaDelta()
+        if isGenerating { return cleanText }
+        
+        cleanText = cleanText.replacingOccurrences(
+            of: "(?s)```json\\n\\s*\\{.*?\"(action|tool|name)\".*?\\}\\n```",
+            with: "", options: .regularExpression
+        )
+        cleanText = cleanText.replacingOccurrences(
+            of: "(?s)\\n*\\[(正在)?调用技能:.*?\\]\\n*",
+            with: "", options: .regularExpression
+        )
+        return cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    private var uniqueRagHits: [RAGHitLog] {
+        var uniqueHits: [RAGHitLog] = []
+        var seenTitles: Set<String> = []
+        for hit in msg.ragHits {
+            if !seenTitles.contains(hit.title) {
+                seenTitles.insert(hit.title)
+                let combined = msg.ragHits.filter { $0.title == hit.title }.map { $0.content }.joined(separator: "\n\n------\n\n")
+                uniqueHits.append(RAGHitLog(title: hit.title, path: hit.path, content: combined))
+            }
+        }
+        return uniqueHits
+    }
+    
+    private var displayFileURLs: [URL] {
+        return msg.fileURLs.filter { url in
+            let fileName = url.lastPathComponent.lowercased()
+            let isScreenshotPill = fileName.hasPrefix("screenshot_") && (fileName.hasSuffix(".png") || fileName.hasSuffix(".jpg") || fileName.hasSuffix(".jpeg"))
+            return !isScreenshotPill
+        }
+    }
+    
+    var body: some View {
+        let visibleFiles = displayFileURLs
+        let hasImages = !msg.images.isEmpty
+        let hasFiles = !visibleFiles.isEmpty
+        let hasText = !displaySafeText.isEmpty || (isGenerating && !msg.isUser)
+        let hasSkillLogs = !msg.skillLogs.isEmpty
+        
+        VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 3) {
+            // 气泡上方工具栏 (当长气泡底部被视口遮挡时显示)
+            if shouldShowToolbarAtTop {
+                actionButtons
+                    .padding(.horizontal, 4)
+                    .padding(.bottom, 2)
+                    .opacity(actionOpacity)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .move(edge: .top).combined(with: .opacity)
+                    ))
+            }
+            
+            // 主消息气泡容器
+            HStack(alignment: .top, spacing: 0) {
+                if msg.isUser {
+                    Spacer(minLength: 28)
+                }
+                
+                VStack(alignment: .leading, spacing: 10) {
+                    if msg.isUser && hasImages {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(msg.images, id: \.self) { img in
+                                    Image(nsImage: img)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(maxHeight: 140)
+                                        .cornerRadius(8)
+                                        .shadow(color: Color.black.opacity(0.1), radius: 3, x: 0, y: 2)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture { openSystemImagePreview(image: img) }
+                                        .onHover { hovering in
+                                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                        }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if hasFiles {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(visibleFiles, id: \.self) { url in
+                                HStack(spacing: 6) {
+                                    Image(systemName: "doc.fill").foregroundColor(.primary).font(.system(size: 12))
+                                    Text(url.lastPathComponent).font(.system(size: 11, weight: .medium)).foregroundColor(.primary).lineLimit(1)
+                                }
+                                .padding(6)
+                                .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
+                                .cornerRadius(6)
+                                .onTapGesture { NSWorkspace.shared.open(url) }
+                            }
+                        }
+                    }
+                    
+                    if hasSkillLogs {
+                        VStack(alignment: .leading, spacing: 8) {
+                            let isAutonomousLoop = AiChatStore.shared.currentAgent.enableAutonomy
+                            
+                            if isAutonomousLoop {
+                                AgentActionTimelineView(skillLogs: msg.skillLogs, isGenerating: isGenerating)
+                            } else {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(msg.skillLogs) { log in
+                                        ToolCardBubbleView(log: log, parentContent: msg.text, onAction: onAppendInstruction)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                    
+                    if hasText {
+                        if msg.isUser {
+                            UserMessageContentView(text: msg.text)
+                        } else if !shouldHideStandardContent {
+                            MessageContentView(
+                                messageID: msg.id,
+                                text: displaySafeText,
+                                isUser: false,
+                                isGenerating: isGenerating,
+                                skillLogs: msg.skillLogs,
+                                ragHits: msg.ragHits,
+                                onAction: onAppendInstruction
+                            ).equatable()
+                        }
+                    }
+                    
+                    if !msg.isUser, let finishLog = msg.skillLogs.last(where: { $0.skillName == "finish_task" }) {
+                        TaskCompletionCardView(
+                            log: finishLog,
+                            totalToolCalls: msg.skillLogs.count,
+                            onConfirm: { onConfirmTask?() },
+                            onRetry: { instruction in onAppendInstruction?(instruction) }
+                        )
+                    }
+                    
+                    if !msg.isUser && !uniqueRagHits.isEmpty {
+                        RAGHitsBottomView(ragHits: uniqueRagHits)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(
+                    msg.isUser
+                    ? AnyView(
+                        LinearGradient(
+                            colors: [Color.blue, Color(hex: "#1D4ED8")],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    : AnyView(
+                        Color(NSColor.controlBackgroundColor)
+                            .opacity(0.52)
+                            .background(.ultraThinMaterial)
+                    )
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .stroke(
+                            msg.isUser ? Color.clear : Color.primary.opacity(0.08),
+                            lineWidth: 0.8
+                        )
+                )
+                .shadow(color: Color.black.opacity(msg.isUser ? 0.12 : 0.04), radius: 3, x: 0, y: 1)
+                .background(
+                    // 几何尺寸与视口位置检测
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { updateGeometry(geo) }
+                            .onChange(of: geo.frame(in: .global)) { _, _ in updateGeometry(geo) }
+                    }
+                )
+                
+                if !msg.isUser {
+                    Spacer(minLength: 28)
+                }
+            }
+            
+            // 气泡下方工具栏 (常规状态或已滚动到底部时显示)
+            if !shouldShowToolbarAtTop {
+                actionButtons
+                    .padding(.horizontal, 4)
+                    .padding(.top, 2)
+                    .opacity(actionOpacity)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .move(edge: .bottom).combined(with: .opacity)
+                    ))
+            }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onHover { hover in withAnimation(.easeOut(duration: 0.18)) { isHovered = hover } }
+        .animation(.spring(response: 0.28, dampingFraction: 0.8), value: shouldShowToolbarAtTop)
+        .animation(.easeOut(duration: 0.18), value: isHovered)
+        .onAppear { renderedText = msg.text }
+        .onChange(of: msg.text) { _, newText in
+            if !isGenerating { renderedText = newText } else {
+                let now = Date()
+                if now.timeIntervalSince(lastRenderTime) > throttleInterval { renderedText = newText; lastRenderTime = now }
+            }
+        }
+        .onChange(of: isGenerating) { _, gen in if !gen { renderedText = msg.text } }
+    }
+    
+    // 动态更新几何位置信息
+    private func updateGeometry(_ geo: GeometryProxy) {
+        let globalFrame = geo.frame(in: .global)
+        let height = geo.size.height
+        if self.bubbleHeight != height { self.bubbleHeight = height }
+        if self.bubbleGlobalMinY != globalFrame.minY { self.bubbleGlobalMinY = globalFrame.minY }
+        if self.bubbleGlobalMaxY != globalFrame.maxY { self.bubbleGlobalMaxY = globalFrame.maxY }
+        if let win = NSApp.keyWindow ?? NSApp.mainWindow {
+            let winH = win.contentView?.frame.height ?? win.frame.height
+            if self.windowHeight != winH { self.windowHeight = winH }
+        }
+    }
+    
+    // 操作按钮组
+    @ViewBuilder private var actionButtons: some View {
+        HStack(spacing: 5) {
+            if !msg.isUser {
+                Button(action: { toggleFeedback(.liked) }) {
+                    Image(systemName: msg.feedback == .liked ? "hand.thumbsup.fill" : "hand.thumbsup")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundColor(msg.feedback == .liked ? .green : .secondary)
+                        .padding(5)
+                        .background(Circle().fill(msg.feedback == .liked ? Color.green.opacity(0.15) : Color(NSColor.controlBackgroundColor).opacity(0.75)))
+                }
+                .buttonStyle(.plain)
+                .help("赞同回答")
+                
+                Button(action: { toggleFeedback(.disliked) }) {
+                    Image(systemName: msg.feedback == .disliked ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundColor(msg.feedback == .disliked ? .orange : .secondary)
+                        .padding(5)
+                        .background(Circle().fill(msg.feedback == .disliked ? Color.orange.opacity(0.15) : Color(NSColor.controlBackgroundColor).opacity(0.75)))
+                }
+                .buttonStyle(.plain)
+                .help("不赞同回答")
+                
+                Divider().frame(height: 12).padding(.horizontal, 2)
+            }
+            
+            // 统一为纯图标圆形按钮，点击状态绿色平滑反馈
+            Button(action: {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(displaySafeText, forType: .string)
+                withAnimation { isCopied = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
+            }) {
+                Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(isCopied ? .green : .secondary)
+                    .padding(5)
+                    .background(Circle().fill(isCopied ? Color.green.opacity(0.15) : Color(NSColor.controlBackgroundColor).opacity(0.75)))
+            }
+            .buttonStyle(.plain)
+            .help(isCopied ? "已复制到剪贴板" : "复制内容")
+            
+            if !msg.isUser, let onRegenerate = onRegenerate {
+                Button(action: onRegenerate) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(.cyan)
+                        .padding(5)
+                        .background(Circle().fill(Color(NSColor.controlBackgroundColor).opacity(0.75)))
+                }
+                .buttonStyle(.plain)
+                .help("重新生成回复")
+            }
+            
+            if msg.isUser, let onEdit = onEdit {
+                Button(action: onEdit) {
+                    Image(systemName: "pencil.line")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(.cyan)
+                        .padding(5)
+                        .background(Circle().fill(Color(NSColor.controlBackgroundColor).opacity(0.75)))
+                }
+                .buttonStyle(.plain)
+                .help("编辑消息")
+            }
+            
+            Button(action: onDelete) {
+                Image(systemName: "trash.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.red.opacity(0.75))
+                    .padding(5)
+                    .background(Circle().fill(Color(NSColor.controlBackgroundColor).opacity(0.75)))
+            }
+            .buttonStyle(.plain)
+            .help("删除消息")
+        }
+        .allowsHitTesting(isHovered && !isGenerating)
+    }
+    
+    private func toggleFeedback(_ type: MessageFeedback) {
+        guard let idx = AiChatStore.shared.messages.firstIndex(where: { $0.id == msg.id }) else { return }
+        
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
+            if AiChatStore.shared.messages[idx].feedback == type {
+                AiChatStore.shared.messages[idx].feedback = .none
+            } else {
+                AiChatStore.shared.messages[idx].feedback = type
+                if type != .none {
+                    let targetId = msg.id
+                    let allMessagesSnapshot = AiChatStore.shared.messages
+                    let currentModel = AiChatStore.shared.currentAgent.baseModel
+                    
+                    Task(priority: .utility) {
+                        await MemoryManager.shared.harvestFeedbackExperience(
+                            recentMessages: allMessagesSnapshot,
+                            targetMessageId: targetId,
+                            feedback: type,
+                            model: currentModel
+                        )
+                    }
+                }
+            }
+            AiChatStore.shared.saveCurrentState()
+        }
+    }
+    
+    private var actionOpacity: Double { (isHovered && !isGenerating) ? 1.0 : 0.0 }
+}
+
+struct UserMessageContentView: View {
+    let text: String
+    @State private var isExpanded: Bool = false
+    @State private var isHovered: Bool = false
+    
+    private var isTooLong: Bool {
+        let lineCount = text.components(separatedBy: .newlines).count
+        return lineCount > 4 || text.count > 150
+    }
+    
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Group {
+                if !isTooLong || isExpanded {
+                    Text(text)
+                        .lineLimit(nil)
+                        .textSelection(.enabled)
+                } else {
+                    Text(text)
+                        .lineLimit(5)
+                        .allowsHitTesting(false)
+                }
+            }
+            .font(.system(size: 14))
+            .foregroundColor(.white)
+            .lineSpacing(4)
+            .padding(.bottom, (!isExpanded && isTooLong) ? 16 : 0)
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isExpanded)
+            
+            if isTooLong {
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.up.circle.fill" : "ellipsis.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(.white)
+                        .background(Color.blue.clipShape(Circle()))
+                        .shadow(color: Color.black.opacity(0.15), radius: 2, y: 1)
+                }
+                .buttonStyle(.plain)
+                .offset(x: 4, y: 4)
+                .help(isExpanded ? "收起长文本" : "展开阅读全文")
+                .scaleEffect(isHovered ? 1.1 : 1.0)
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.2)) { isHovered = hovering }
+                }
+            }
+        }
     }
 }
 
@@ -3563,34 +4281,13 @@ struct AiChatView: View {
         VStack(spacing: 0) {
             topBarView
             
-            // 吸顶全景流动胶囊条：精确挂载在消息列表正上方
-            if let planContent = store.blackboardPlan,
-               !planContent.isEmpty && planContent != "[]" {
-                AgentFlowRibbonView(
-                    planContent: planContent,
-                    isExecuting: store.isLoading,
-                    onContinueExecution: {
-                        Task {
-                            await orchestrator.send(
-                                text: "请核对任务黑板，基于现有的执行进度，继续推进下一个未完成任务。",
-                                images: [],
-                                files: []
-                            )
-                        }
-                    },
-                    onClearPlan: {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                            store.blackboardPlan = nil
-                            orchestrator.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-                            orchestrator.agentVM.sharedContext.removeValue(forKey: "AGENT_GLOBAL_MEMO")
-                        }
-                    }
-                )
-                .transition(.move(edge: .top).combined(with: .opacity))
-                .zIndex(5)
+            if let alert = store.activeBeaconAlert {
+                LLMBeaconView(alert: alert)
+                    .padding(.top, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.95)))
+                    .zIndex(10)
             }
             
-            // 对话消息列表滚动区
             messageListView
             
             if let currentAgentModel = ConfigManager.shared.app.agentProfiles.first(where: { $0.id == store.selectedAgentID })?.baseModel {
@@ -3669,7 +4366,7 @@ struct AiChatView: View {
                 }
                 Divider()
                 Button(action: {
-                    AgentWindowManager.shared.show()
+                    AgentManager.shared.show()
                     NotificationCenter.default.post(name: NSNotification.Name("SwitchAgentManagerTab"), object: 0)
                 }) {
                     Label("智能体流水线工坊...", systemImage: "slider.horizontal.3")
@@ -3829,7 +4526,7 @@ struct AiChatView: View {
                     
                     Divider()
                     Button("管理全部对话...") {
-                        AgentWindowManager.shared.show()
+                        AgentManager.shared.show()
                         NotificationCenter.default.post(name: NSNotification.Name("SwitchAgentManagerTab"), object: 7)
                     }
                 }
@@ -3943,7 +4640,6 @@ struct AiChatView: View {
     }
 }
 
-// MARK: - 隐藏式伸缩分割线 (Token 仪表盘)
 struct ContextTokenDividerBar: View {
     let currentTokens: Int
     let maxTokens: Int
@@ -4028,8 +4724,6 @@ struct ContextTokenDividerBar: View {
     }
 }
 
-// MARK: - ==================== 🛠️ 高性能 Siri 绚丽流光活跃指示背景 ====================
-
 struct SiriVibrantBackgroundView: View {
     let isActive: Bool
     @Environment(\.colorScheme) var colorScheme
@@ -4051,64 +4745,54 @@ struct SiriVibrantBackgroundView: View {
                     let h = geometry.size.height
                     
                     ZStack {
-                        TimelineView(.animation) { timeline in
+                        // 采用 30fps 节流驱动，杜绝 ProMotion 120Hz 盲目全屏模糊计算
+                        TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { timeline in
                             let time = timeline.date.timeIntervalSinceReferenceDate
-                            let t = time * 1.2
-                            let pulseLeft = sin(t * 1.8) + 0.2 * cos(t * 4.2)
-                            let pulseRight = cos(t * 1.5) + 0.15 * sin(t * 3.7)
-                            let pulseCenter = sin(t * 1.1) + 0.25 * cos(t * 5.1)
+                            let t = time * 1.1
+                            let pulseLeft = sin(t * 1.6)
+                            let pulseRight = cos(t * 1.4)
+                            let pulseCenter = sin(t * 1.0)
                             
-                            let driftLX = CGFloat(sin(t * 0.8) * (w * 0.08))
-                            let driftLY = CGFloat(cos(t * 1.2) * (h * 0.04))
-                            let driftRX = CGFloat(cos(t * 0.9) * (w * 0.08))
-                            let driftRY = CGFloat(sin(t * 1.4) * (h * 0.04))
-                            let driftCX = CGFloat(sin(t * 1.3) * (w * 0.12))
+                            let driftLX = CGFloat(sin(t * 0.7) * (w * 0.07))
+                            let driftLY = CGFloat(cos(t * 1.0) * (h * 0.03))
+                            let driftRX = CGFloat(cos(t * 0.8) * (w * 0.07))
+                            let driftRY = CGFloat(sin(t * 1.2) * (h * 0.03))
+                            let driftCX = CGFloat(sin(t * 1.1) * (w * 0.10))
                             
                             ZStack {
                                 Ellipse()
-                                    .fill(RadialGradient(colors: [neonCyan.opacity(1.0), neonCyan.opacity(0.4), .clear], center: .center, startRadius: 0, endRadius: w * 0.65))
-                                    .frame(width: w * 1.2, height: h * 0.45)
+                                    .fill(RadialGradient(colors: [neonCyan.opacity(0.9), neonCyan.opacity(0.3), .clear], center: .center, startRadius: 0, endRadius: w * 0.6))
+                                    .frame(width: w * 1.1, height: h * 0.4)
                                     .position(x: w * 0.0 + driftLX, y: h * 1.0 + driftLY)
-                                    .scaleEffect(1.0 + pulseLeft * 0.12)
-                                    .opacity(0.85 + pulseLeft * 0.1)
+                                    .scaleEffect(1.0 + pulseLeft * 0.08)
                                 
                                 Ellipse()
-                                    .fill(RadialGradient(colors: [neonPurple.opacity(0.95), neonPurple.opacity(0.35), .clear], center: .center, startRadius: 0, endRadius: w * 0.65))
-                                    .frame(width: w * 1.2, height: h * 0.45)
+                                    .fill(RadialGradient(colors: [neonPurple.opacity(0.85), neonPurple.opacity(0.25), .clear], center: .center, startRadius: 0, endRadius: w * 0.6))
+                                    .frame(width: w * 1.1, height: h * 0.4)
                                     .position(x: w * 1.0 + driftRX, y: h * 1.0 + driftRY)
-                                    .scaleEffect(1.0 + pulseRight * 0.14)
-                                    .opacity(0.80 + pulseRight * 0.12)
+                                    .scaleEffect(1.0 + pulseRight * 0.09)
                                 
                                 Ellipse()
-                                    .fill(RadialGradient(colors: [neonPink.opacity(1.0), neonPink.opacity(0.5), .clear], center: .center, startRadius: 0, endRadius: w * 0.75))
-                                    .frame(width: w * 1.4, height: h * 0.5)
-                                    .position(x: w * 0.5 + driftCX, y: h * 1.03)
-                                    .scaleEffect(1.0 + pulseCenter * 0.1)
-                                
-                                Circle()
-                                    .fill(RadialGradient(colors: [neonOrange.opacity(1.0), neonOrange.opacity(0.2), .clear], center: .center, startRadius: 0, endRadius: w * 0.3))
-                                    .frame(width: w * 0.45, height: w * 0.45)
-                                    .position(
-                                        x: w * 0.5 + CGFloat(sin(t * 2.2) * (w * 0.25)),
-                                        y: h * 0.96 + CGFloat(cos(t * 1.9) * 12)
-                                    )
-                                    .scaleEffect(1.0 + sin(t * 4.4) * 0.08)
+                                    .fill(RadialGradient(colors: [neonPink.opacity(0.9), neonPink.opacity(0.4), .clear], center: .center, startRadius: 0, endRadius: w * 0.7))
+                                    .frame(width: w * 1.3, height: h * 0.45)
+                                    .position(x: w * 0.5 + driftCX, y: h * 1.02)
+                                    .scaleEffect(1.0 + pulseCenter * 0.07)
                             }
-                            .hueRotation(.degrees(time * 38))
+                            .hueRotation(.degrees(time * 30))
                             .opacity(steadyStateInflow)
                         }
                         .drawingGroup()
                         
                         Rectangle()
                             .fill(LinearGradient(colors: [neonCyan, neonPink, neonPurple, neonOrange], startPoint: .leading, endPoint: .trailing))
-                            .frame(height: h * 0.5)
+                            .frame(height: h * 0.45)
                             .position(x: w * 0.5, y: h * 1.0)
                             .scaleEffect(x: shockwaveScale, y: shockwaveScale, anchor: .bottom)
                             .opacity(shockwaveOpacity)
                             .blendMode(.plusLighter)
                     }
-                    .blur(radius: 42)
-                    .opacity(colorScheme == .dark ? 0.68 : 0.38)
+                    .blur(radius: 36)
+                    .opacity(colorScheme == .dark ? 0.60 : 0.32)
                     .blendMode(colorScheme == .dark ? .plusLighter : .normal)
                 }
             }
@@ -4123,11 +4807,11 @@ struct SiriVibrantBackgroundView: View {
                     shockwaveScale = 1.6
                     shockwaveOpacity = 0.0
                 }
-                withAnimation(.easeInOut(duration: 0.55).delay(0.06)) {
+                withAnimation(.easeInOut(duration: 0.5).delay(0.05)) {
                     steadyStateInflow = 1.0
                 }
             } else {
-                withAnimation(.easeInOut(duration: 0.4)) {
+                withAnimation(.easeInOut(duration: 0.35)) {
                     steadyStateInflow = 0.0
                     shockwaveOpacity = 0.0
                     shockwaveScale = 0.3
@@ -4137,320 +4821,221 @@ struct SiriVibrantBackgroundView: View {
     }
 }
 
-// MARK: - 专属组件：Agentic RAG 知识库检索结果可视化气泡
-struct KnowledgeSearchResultBubbleView: View {
-    let log: SkillExecutionLog
-    @State private var isCopied = false
+struct LLMBeaconView: View {
+    let alert: LLMBeaconAlert
+    @State private var isBreathing: Bool = false
+    
+    var themeColor: Color {
+        alert.isWarning ? .orange : .red
+    }
     
     var body: some View {
-        let hitItems = RAGXMLParser.extractHits(from: log.resultOutput)
-        let topK = ConfigManager.shared.app.generalConfig.ragTopK
-        
-        VStack(alignment: .leading, spacing: 10) {
-            if hitItems.isEmpty {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.magnifyingglass")
-                    Text("未召回任何有效知识切片，目标 Top-K: \(topK)。Agent 将依靠基础模型能力作答。")
-                }
-                .font(.system(size: 11))
-                .foregroundColor(.orange)
-            } else {
-                HStack(alignment: .center) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "books.vertical.fill").foregroundColor(.cyan)
-                        Text("成功召回 \(hitItems.count) 个知识切片 (目标 Top-K: \(topK))：").font(.system(size: 11, weight: .bold))
-                    }
-                    .foregroundColor(.secondary)
-                    
-                    Spacer()
-                    
-                    Button(action: {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(log.resultOutput, forType: .string)
-                        withAnimation { isCopied = true }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
-                            Text(isCopied ? "已复制" : "复制原结果")
-                        }
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(isCopied ? .green : .cyan)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(isCopied ? Color.green.opacity(0.15) : Color.cyan.opacity(0.1))
-                        .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                }
+        HStack(spacing: 7) {
+            ZStack {
+                Circle()
+                    .fill(themeColor.opacity(0.3))
+                    .frame(width: 14, height: 14)
+                    .scaleEffect(isBreathing ? 1.4 : 0.8)
+                    .opacity(isBreathing ? 0.2 : 0.8)
                 
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(hitItems) { hit in
-                        KnowledgeHitRowView(hit: hit)
-                    }
-                }
+                Circle()
+                    .fill(themeColor)
+                    .frame(width: 6, height: 6)
+            }
+            
+            Text(alert.message)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundColor(.primary.opacity(0.9))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4.5)
+        .background(
+            Capsule()
+                .fill(.ultraThinMaterial)
+                .shadow(color: themeColor.opacity(0.18), radius: 6, x: 0, y: 2)
+        )
+        .overlay(
+            Capsule()
+                .stroke(themeColor.opacity(0.35), lineWidth: 0.8)
+        )
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                isBreathing = true
             }
         }
     }
 }
 
-struct KnowledgeHitRowView: View {
-    let hit: RAGXMLParser.HitItem
-    @State private var isExpanded: Bool = false
+// MARK: - ==================== Generic Action Badge Architecture ====================
+
+public enum ActionBadgeType: Equatable, Sendable {
+    case tool(name: String, callId: String, status: String)
+    case rag(id: String, score: String?)
+    case custom(scheme: String, payload: String)
+}
+
+public struct ActionBadgeModel: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let type: ActionBadgeType
+    public let title: String
+    public let rawURLString: String
+    
+    public init(id: String = UUID().uuidString, type: ActionBadgeType, title: String, rawURLString: String) {
+        self.id = id
+        self.type = type
+        self.title = title
+        self.rawURLString = rawURLString
+    }
+}
+
+public struct ActionBadgeParser {
+    public static func extractBadges(from text: String) -> (cleanText: String, badges: [ActionBadgeModel]) {
+        var cleanText = text
+        var badges: [ActionBadgeModel] = []
+        
+        let pattern = "\\[(.*?)\\]\\((action://(inspect_tool|inspect_rag|custom)(?:/([^?)]*))?(?:\\?([^)]*))?)\\)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return (text, []) }
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: text.utf16.count))
+        
+        for match in matches.reversed() {
+            guard let totalRange = Range(match.range, in: cleanText),
+                  let titleRange = Range(match.range(at: 1), in: cleanText),
+                  let urlRange = Range(match.range(at: 2), in: cleanText),
+                  let hostRange = Range(match.range(at: 3), in: cleanText) else { continue }
+            
+            let title = String(cleanText[titleRange])
+            let rawUrl = String(cleanText[urlRange])
+            let host = String(cleanText[hostRange])
+            
+            let path = match.range(at: 4).location != NSNotFound ? (Range(match.range(at: 4), in: cleanText).map { String(cleanText[$0]) } ?? "") : ""
+            let query = match.range(at: 5).location != NSNotFound ? (Range(match.range(at: 5), in: cleanText).map { String(cleanText[$0]) } ?? "") : ""
+            
+            var queryParams: [String: String] = [:]
+            for pair in query.components(separatedBy: "&") {
+                let kv = pair.components(separatedBy: "=")
+                if kv.count == 2 {
+                    let k = kv[0].removingPercentEncoding ?? kv[0]
+                    let v = kv[1].removingPercentEncoding ?? kv[1]
+                    queryParams[k] = v
+                }
+            }
+            
+            let badgeType: ActionBadgeType
+            let badgeId: String
+            
+            if host == "inspect_tool" {
+                let callId = queryParams["call_id"] ?? UUID().uuidString
+                let status = queryParams["status"] ?? "running"
+                badgeType = .tool(name: path.removingPercentEncoding ?? path, callId: callId, status: status)
+                badgeId = callId
+            } else if host == "inspect_rag" {
+                let score = queryParams["score"]
+                badgeType = .rag(id: path.removingPercentEncoding ?? path, score: score)
+                badgeId = path
+            } else {
+                badgeType = .custom(scheme: host, payload: path)
+                badgeId = UUID().uuidString
+            }
+            
+            let badge = ActionBadgeModel(id: badgeId, type: badgeType, title: title, rawURLString: rawUrl)
+            badges.insert(badge, at: 0)
+            cleanText.removeSubrange(totalRange)
+        }
+        
+        return (cleanText.trimmingCharacters(in: .whitespacesAndNewlines), badges)
+    }
+}
+
+// MARK: - 原生 macOS 极致圆角胶囊徽章组件
+
+struct ActionBadgeCapsuleView: View {
+    let badge: ActionBadgeModel
+    let onTapTool: (String, String) -> Void
+    var onTapRAG: ((String) -> Void)? = nil
+    
     @State private var isHovered: Bool = false
     
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "doc.text.viewfinder")
-                    .foregroundColor(.cyan.opacity(0.8))
-                    .padding(.top, 2)
-                
-                Text(hit.title)
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                
-                Spacer()
-                
-                Text(String(format: "%.4f", hit.score))
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(scoreColor(hit.score).opacity(0.15))
-                    .foregroundColor(scoreColor(hit.score))
-                    .cornerRadius(4)
-                
-                Image(systemName: "chevron.right")
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.secondary)
-                    .padding(.top, 3)
-                    .padding(.leading, 2)
+    private var badgeThemeColor: Color {
+        switch badge.type {
+        case .tool(_, _, let status):
+            switch status {
+            case "success": return Color(hex: "#10B981") // 翠绿
+            case "failed":  return Color(hex: "#EF4444") // 警示红
+            case "waiting": return Color.orange          // 待授权橙
+            default:        return Color.purple          // 执行中紫
             }
-            
-            if !hit.tags.isEmpty || !hit.prohibited.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(hit.tags, id: \.self) { tag in
-                            HStack(spacing: 3) {
-                                Image(systemName: "tag.fill").font(.system(size: 8))
-                                Text(tag).font(.system(size: 9, weight: .medium))
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.cyan.opacity(0.15))
-                            .foregroundColor(.cyan)
-                            .cornerRadius(4)
-                        }
-                        
-                        ForEach(hit.prohibited, id: \.self) { proh in
-                            HStack(spacing: 3) {
-                                Image(systemName: "nosign").font(.system(size: 8))
-                                Text(proh).font(.system(size: 9, weight: .medium))
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.red.opacity(0.12))
-                            .foregroundColor(.red)
-                            .cornerRadius(4)
-                        }
-                    }
-                }
-                .padding(.leading, 20)
-                .padding(.top, 1)
-            }
-            
-            if isExpanded {
-                Divider().opacity(0.3).padding(.vertical, 2)
-                
-                Text(hit.rawContent.trimmingCharacters(in: .whitespacesAndNewlines))
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.primary.opacity(0.85))
-                    .lineSpacing(4)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 20)
-                    .padding(.bottom, 4)
-            } else {
-                Text(hit.snippet)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 20)
-            }
-        }
-        .padding(10)
-        .background(Color(NSColor.controlBackgroundColor).opacity(isHovered ? 0.8 : 0.6))
-        .cornerRadius(8)
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(isExpanded ? Color.cyan.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 1))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                isExpanded.toggle()
-            }
-        }
-        .onHover { hover in
-            withAnimation(.easeInOut(duration: 0.2)) { isHovered = hover }
-            if hover { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        case .rag:
+            return Color.cyan                            // 知识库青色
+        case .custom:
+            return Color.indigo
         }
     }
     
-    private func scoreColor(_ score: Float) -> Color {
-        if score >= 0.8 { return .green }
-        if score >= 0.5 { return .orange }
-        return .red
-    }
-}
-
-// MARK: - 预设选项抽屉 Popover 弹窗
-struct OptionDrawerPopoverView: View {
-    let onSelectOption: (String) -> Void
-    
-    @State private var searchText: String = ""
-    @State private var selectedFileCategory: String = "全部"
-    
-    // MARK: - [Added] 显式声明初始化构造器，解决权限降级报错
-    init(onSelectOption: @escaping (String) -> Void) {
-        self.onSelectOption = onSelectOption
-    }
-    
-    private var optionManager: TextOptionManager {
-        TextOptionManager.shared
-    }
-    
-    private var currentFilteredOptions: [TextOptionItem] {
-        optionManager.searchOptions(keyword: searchText, selectedCategory: selectedFileCategory)
+    private var iconName: String {
+        switch badge.type {
+        case .tool(_, _, let status):
+            switch status {
+            case "success": return "checkmark.circle.fill"
+            case "failed":  return "xmark.circle.fill"
+            case "waiting": return "pause.circle.fill"
+            default:        return "bolt.fill"
+            }
+        case .rag:
+            return "books.vertical.fill"
+        case .custom:
+            return "link.circle.fill"
+        }
     }
     
     var body: some View {
-        VStack(spacing: 0) {
-            // 1. 标头与搜索
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(.secondary)
-                    .font(.system(size: 12))
-                
-                TextField("搜索选项内容或文本...", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                
-                if !searchText.isEmpty {
-                    Button(action: { searchText = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary)
-                            .font(.system(size: 11))
-                    }
-                    .buttonStyle(.plain)
-                }
-                
-                Spacer()
-                
-                Button(action: { optionManager.openInFinder() }) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "folder")
-                        Text("目录")
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.purple)
-                }
-                .buttonStyle(.plain)
-                .help("在访达中打开选项目录，自由添加或编辑 .txt 文件")
-            }
-            .padding(10)
-            .background(Color.primary.opacity(0.03))
-            
-            Divider().opacity(0.5)
-            
-            // 2. 分类横向标签条
-            if !optionManager.availableFiles.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        categoryChip(title: "全部")
-                        ForEach(optionManager.availableFiles, id: \.self) { fileName in
-                            categoryChip(title: fileName)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                }
-                Divider().opacity(0.3)
-            }
-            
-            // 3. 选项滚动列表
-            ScrollView(.vertical, showsIndicators: true) {
-                if currentFilteredOptions.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 28))
-                            .foregroundColor(.secondary.opacity(0.5))
-                        Text("未检索到匹配的选项内容")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                        Button("打开文件夹添加 .txt 文件") {
-                            optionManager.openInFinder()
-                        }
-                        .font(.system(size: 11))
-                        .buttonStyle(.link)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 36)
-                } else {
-                    LazyVStack(spacing: 4) {
-                        ForEach(currentFilteredOptions) { option in
-                            Button(action: { onSelectOption(option.content) }) {
-                                HStack(alignment: .top, spacing: 8) {
-                                    Text(option.fileName)
-                                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.purple)
-                                        .padding(.horizontal, 4).padding(.vertical, 2)
-                                        .background(Color.purple.opacity(0.1))
-                                        .cornerRadius(3)
-                                        .padding(.top, 1)
-                                    
-                                    Text(option.content)
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.primary.opacity(0.9))
-                                        .lineSpacing(3)
-                                        .multilineTextAlignment(.leading)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 6)
-                                .background(Color.primary.opacity(0.03))
-                                .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(8)
-                }
-            }
-            .frame(maxHeight: 260)
-        }
-        .frame(width: 360)
-        .background(.ultraThinMaterial)
-    }
-    
-    private func categoryChip(title: String) -> some View {
-        let isSelected = selectedFileCategory == title
-        return Button(action: {
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
-                selectedFileCategory = title
+        Button(action: {
+            switch badge.type {
+            case .tool(let name, let callId, _):
+                onTapTool(name, callId)
+            case .rag(let id, _):
+                onTapRAG?(id)
+            case .custom:
+                break
             }
         }) {
-            Text(title)
-                .font(.system(size: 11, weight: isSelected ? .bold : .medium))
-                .foregroundColor(isSelected ? .purple : .secondary)
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(isSelected ? Color.purple.opacity(0.15) : Color.primary.opacity(0.04))
-                .cornerRadius(5)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 5)
-                        .stroke(isSelected ? Color.purple.opacity(0.3) : Color.clear, lineWidth: 0.8)
-                )
+            HStack(spacing: 4) {
+                Image(systemName: iconName)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .foregroundColor(badgeThemeColor)
+                
+                Text(cleanTitle)
+                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundColor(badgeThemeColor.opacity(0.95))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                Capsule()
+                    .fill(badgeThemeColor.opacity(isHovered ? 0.20 : 0.10))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(badgeThemeColor.opacity(isHovered ? 0.50 : 0.28), lineWidth: 0.8)
+            )
+            .scaleEffect(isHovered ? 1.02 : 1.0)
         }
         .buttonStyle(.plain)
+        .onHover { h in
+            withAnimation(.easeInOut(duration: 0.15)) { isHovered = h }
+            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .help("点击查看执行入参与返回详情")
+    }
+    
+    private var cleanTitle: String {
+        var str = badge.title
+        for prefix in ["✓", "✕", "⚡︎", "⏸"] {
+            if str.hasPrefix(prefix) {
+                str = String(str.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return str
     }
 }

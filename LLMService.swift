@@ -167,9 +167,9 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
         }
         
         if !activeSkills.isEmpty {
-            // 🌟 确定性字典序排列，确保 Tools Schema 签名绝对一致
+            // 确定性工具排序 + 纯净 Gemini Schema
             let sortedSkills = activeSkills.sorted { $0.name.lowercased() < $1.name.lowercased() }
-            let declarations = sortedSkills.map { $0.toFunctionDeclaration() }
+            let declarations = sortedSkills.map { $0.toFunctionDeclaration(isGemini: true) }
             requestBody["tools"] = [["functionDeclarations": declarations]]
             requestBody["toolConfig"] = ["functionCallingConfig": ["mode": "AUTO"]]
         }
@@ -424,20 +424,39 @@ private extension NSImage {
 }
 
 private extension AgentSkill {
-    func toFunctionDeclaration() -> [String: Any] {
+    func toFunctionDeclaration(isGemini: Bool = false) -> [String: Any] {
         var properties: [String: Any] = [:]
         var required: [String] = []
         
-        for param in self.parameters {
+        // 🌟 确定性参数字典序升序排列，保障 Prompt Cache 绝对命中
+        let sortedParams = self.parameters.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        
+        for param in sortedParams {
             var mappedType = param.type.rawValue.lowercased()
             if mappedType == "enum" { mappedType = "string" }
             
             var paramDef: [String: Any] = ["type": mappedType, "description": param.description]
             if mappedType == "object" {
                 paramDef["properties"] = [String: Any]()
-                paramDef["additionalProperties"] = true
+                if !isGemini {
+                    paramDef["additionalProperties"] = true
+                }
+                // Gemini 模式下绝对不包含 additionalProperties 等非法字段
             } else if mappedType == "array" {
-                paramDef["items"] = ["type": "string"]
+                if param.name == "tasks" {
+                    var taskProps: [String: Any] = [
+                        "id": ["type": "string", "description": "任务节点 ID"],
+                        "status": ["type": "string", "description": "填: '等待中'"],
+                        "text": ["type": "string", "description": "任务描述"]
+                    ]
+                    paramDef["items"] = [
+                        "type": "object",
+                        "properties": taskProps,
+                        "required": ["id", "status", "text"]
+                    ]
+                } else {
+                    paramDef["items"] = ["type": "string"]
+                }
             }
             properties[param.name] = paramDef
             if param.isRequired { required.append(param.name) }
@@ -449,7 +468,7 @@ private extension AgentSkill {
             "parameters": [
                 "type": "object",
                 "properties": properties,
-                "required": required
+                "required": required.sorted() // 🌟 required 数组同步排序
             ]
         ]
     }
@@ -801,7 +820,15 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
             var errorDetail = ""
             for try await line in result.lines { errorDetail += line + "\n" }
             let finalErrorMsg = "HTTP \(httpResponse.statusCode): \(errorDetail.trimmingCharacters(in: .whitespacesAndNewlines))"
-            await MainActor.run { LogManager.shared.error("❌ LLM API 拒绝服务", detail: finalErrorMsg, parentID: parentLogID) }
+            
+            await MainActor.run {
+                LogManager.shared.error("❌ LLM API 异常", detail: finalErrorMsg, parentID: parentLogID)
+                
+                // 广播轻量指示灯事件
+                let isTransient = [502, 503, 504, 429].contains(httpResponse.statusCode)
+                let friendlyText = isTransient ? "LLM 服务暂态负载波动 (HTTP \(httpResponse.statusCode)) · 正在自愈重试..." : "LLM 接口异常 (HTTP \(httpResponse.statusCode))"
+                AiChatStore.shared.showLLMIndicator(message: friendlyText, isWarning: isTransient)
+            }
             throw NSError(domain: "LLMClient", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: finalErrorMsg])
         }
         
