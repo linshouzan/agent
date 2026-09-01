@@ -257,9 +257,6 @@ public final class PersonaManager: Sendable {
     public var runtimeStates: [UUID: PersonaRuntimeState] = [:]
     public var memories: [PersonaMemoryItem] = []
     
-    private var idleDistillTask: Task<Void, Never>? = nil
-    private var lastActivityTime: Date = Date()
-    
     private let personasFileName = "personas.json"
     private let statesFileName = "persona_states.json"
     private let memoriesFileName = "persona_memories.json"
@@ -291,7 +288,6 @@ public final class PersonaManager: Sendable {
     
     private init() {
         loadData()
-        startIdleAutoConsolidationLoop()
     }
     
     public func loadData() {
@@ -484,8 +480,6 @@ public final class PersonaManager: Sendable {
             state.lastUpdated = Date()
             updateRuntimeState(state)
         }
-        
-        self.lastActivityTime = Date()
     }
     
     // MARK: - 语义特征与 Ebbinghaus 时间衰减双轨召回引擎
@@ -765,29 +759,6 @@ public final class PersonaManager: Sendable {
         return "\(staticPrompt)\n\n\(dynamicContext)"
     }
     
-    // MARK: - 异步记忆提炼与闲置自愈循环
-    
-    private func startIdleAutoConsolidationLoop() {
-        idleDistillTask?.cancel()
-        idleDistillTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
-                guard let self = self else { return }
-                let idleInterval = Date().timeIntervalSince(self.lastActivityTime)
-                if idleInterval > 180 {
-                    if let activePersonaID = AiChatStore.shared.selectedPersonaID,
-                       !AiChatStore.shared.messages.isEmpty {
-                        _ = await self.distillAndConsolidate(for: activePersonaID, recentMessages: AiChatStore.shared.messages)
-                    }
-                }
-            }
-        }
-    }
-    
-    public func recordInteraction(personaID: UUID) {
-        self.lastActivityTime = Date()
-    }
-    
     func distillAndConsolidate(for personaID: UUID, recentMessages: [ChatMessage]) async -> (success: Bool, message: String) {
         guard let persona = personas.first(where: { $0.id == personaID }) else {
             return (false, "未找到对应的数字分身")
@@ -971,6 +942,47 @@ public final class PersonaManager: Sendable {
         }
         saveMemories()
         return imported
+    }
+    
+    // 2. 新增轻量级分身性格与口吻编译器 (仅提取性格、语气、台词范例与神态流)
+    // MARK: - 拟人口吻与性格活力注入 (Tone & Personality Overlay)
+    /// 仅提取分身的核心性格、言语口吻、神态动作流与台词示范，作为装饰层注入智能体，不变更智能体本身的业务提示词与工具链
+    public func compilePersonaToneOverlay(for personaID: UUID) -> String {
+        guard let persona = personas.first(where: { $0.id == personaID }) else { return "" }
+        
+        var overlay = """
+        
+        <persona_tone_overlay>
+        【🎭 附加对话语气与性格人设 (Tone & Style Guide)】
+        - 说话人身份: \(persona.name)\(persona.roleTag.isEmpty ? "" : "（\(persona.roleTag)）")
+        - 性格基调: \(persona.summary.isEmpty ? "热情鲜活、真诚自然" : persona.summary)
+        - 语言风格: \(persona.toneStyle.isEmpty ? "富有亲和力与真人活力，杜绝机械生硬感" : persona.toneStyle)
+        """
+        
+        if !persona.worldviewContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            overlay += "\n- 世界观背景: \(persona.worldviewContext)"
+        }
+        
+        if persona.enableNovelActionBrackets {
+            overlay += """
+            
+            - 神态动作呈现: 在交流中自然穿插中文全角括号 `（动作/神态/心境）` 呈现即时微表情与肢体交互。
+            """
+        }
+        
+        if !persona.fewShotExamples.isEmpty {
+            overlay += "\n- 语气台词示范:\n"
+            for eg in persona.fewShotExamples {
+                overlay += "  • \(eg)\n"
+            }
+        }
+        
+        overlay += """
+        【交互准则】: 在完整且精准履行当前智能体专业职能与任务逻辑的前提下，通篇融入上述性格口吻，使回复具备真人般的生动与温度。
+        </persona_tone_overlay>
+        """
+        
+        return overlay
     }
 }
 
@@ -1666,7 +1678,6 @@ public struct PersonaWindowContentView: View {
                     PersonaManager.shared.applyMentalDelta(for: pID, deltaJSON: deltaJSON)
                 }
                 
-                PersonaManager.shared.recordInteraction(personaID: pID)
                 LogManager.shared.endSession(sessionID: sessionID, isSuccess: true, detail: accumulated)
                 
                 await MainActor.run {

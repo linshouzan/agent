@@ -5,9 +5,9 @@
 // 核心解构架构拓扑 (Domain-Driven Architecture):
 // ├── 1. KnowledgeModels          : 知识库元数据、切片实体与树状节点模型
 // ├── 2. KnowledgeExtractors      : 文本清洗规范器与多语言源码 AST 切片提取器
-// ├── 3. KnowledgeNLP             : 多尺度 N-Gram 分词器与 RAG XML 报文解析器
-// ├── 4. MicroVectorDB (Core)     : 纯 Swift 微型向量数据库 (NLEmbedding + Cosine)
-// ├── 5. KnowledgeSearchEngine    : 自适应混合检索 (BM25 + RRF) 与滑动窗口精排 (NativeReranker)
+// ├── 3. KnowledgeNLP             : 多尺度 N-Gram 分词器与 RAG XML 报文解析器 (低堆分配优化)
+// ├── 4. MicroVectorDB (Core)     : 纯 Swift 微型向量数据库 (Accelerate 加速 + 零内存膨胀 BM25)
+// ├── 5. KnowledgeSearchEngine    : 句级滑动重排器 (NativeReranker, 资源复用优化)
 // ├── 6. KnowledgeViewModel       : 响应式业务编排门面与后台脱轨解析流水线 (@Observable @MainActor)
 // ├── 7. KnowledgeSearchWindow    : 检索测试与自适应诊断独立窗口生命周期管理器 (NSWindowDelegate)
 // └── 8. KnowledgeUI Components   : 无限级树状双栏面板、检索大盘与机制引导 Popover 群
@@ -112,32 +112,45 @@ struct KnowledgeNode: Identifiable, Sendable {
 
 /// 文本数据规范化与噪声清洗引擎
 struct DataCleaner: Sendable {
+    // 预编译静态正则表达式，避免高频调用重复创建
+    private static let controlCharRegex = try? NSRegularExpression(pattern: "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]")
+    private static let pageNumberRegex = try? NSRegularExpression(pattern: "(?m)^\\s*(?:page|页码|第)?\\s*-?\\s*\\d+\\s*(?:of\\s*\\d+|页)?\\s*-?\\s*$", options: [.caseInsensitive])
+    private static let htmlTagRegex = try? NSRegularExpression(pattern: "<[^>]+>")
+    private static let multiSpaceRegex = try? NSRegularExpression(pattern: "[ \\t]{2,}")
+    private static let multiNewlineRegex = try? NSRegularExpression(pattern: "\\n{3,}")
+
     nonisolated static func clean(_ rawText: String) -> String {
         var text = rawText.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        text = text.replacing(pattern: "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]", with: "")
-        text = text.replacing(pattern: "(?m)^\\s*(?:page|页码|第)?\\s*-?\\s*\\d+\\s*(?:of\\s*\\d+|页)?\\s*-?\\s*$", with: "")
-        text = text.replacing(pattern: "<[^>]+>", with: " ")
-        text = text.replacing(pattern: "[ \\t]{2,}", with: " ")
-        text = text.replacing(pattern: "\\n{3,}", with: "\n\n")
+        
+        if let regex = controlCharRegex {
+            text = regex.stringByReplacingMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+        if let regex = pageNumberRegex {
+            text = regex.stringByReplacingMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        }
+        if let regex = htmlTagRegex {
+            text = regex.stringByReplacingMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text), withTemplate: " ")
+        }
+        if let regex = multiSpaceRegex {
+            text = regex.stringByReplacingMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text), withTemplate: " ")
+        }
+        if let regex = multiNewlineRegex {
+            text = regex.stringByReplacingMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text), withTemplate: "\n\n")
+        }
+        
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
     nonisolated static func isValidChunk(_ chunk: String) -> Bool {
         let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.count < 15 { return false }
-        let letters = trimmed.unicodeScalars.filter { CharacterSet.letters.contains($0) || CharacterSet.alphanumerics.contains($0) }
-        return (Double(letters.count) / Double(trimmed.count)) >= 0.3
-    }
-}
-
-fileprivate extension String {
-    nonisolated func replacing(pattern: String, with template: String) -> String {
-        do {
-            let regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
-            return regex.stringByReplacingMatches(in: self, options: [], range: NSRange(self.startIndex..., in: self), withTemplate: template)
-        } catch {
-            return self
+        var validLetterCount = 0
+        for scalar in trimmed.unicodeScalars {
+            if CharacterSet.letters.contains(scalar) || CharacterSet.alphanumerics.contains(scalar) {
+                validLetterCount += 1
+            }
         }
+        return (Double(validLetterCount) / Double(trimmed.count)) >= 0.3
     }
 }
 
@@ -159,7 +172,6 @@ struct CodeKnowledgeExtractor: Sendable {
     
     static func chunkCodeFile(fileURL: URL, projectName: String = "当前项目") throws -> [String] {
         let content = try String(contentsOf: fileURL, encoding: .utf8)
-        let fileName = fileURL.lastPathComponent
         let ext = fileURL.pathExtension.lowercased()
         
         var chunks: [String] = []
@@ -207,13 +219,13 @@ struct CodeKnowledgeExtractor: Sendable {
         }
         
         if chunks.isEmpty {
-            return generateFallbackChunks(content: content, fileName: fileName, ext: ext)
+            return generateFallbackChunks(content: content, ext: ext)
         }
         
         return chunks
     }
     
-    private static func generateFallbackChunks(content: String, fileName: String, ext: String) -> [String] {
+    private static func generateFallbackChunks(content: String, ext: String) -> [String] {
         var chunks: [String] = []
         var currentIndex = content.startIndex
         let chunkSize = 1000
@@ -236,9 +248,10 @@ struct QueryAnalysis: Sendable {
     let effectiveTokens: [String]
 }
 
-/// 多尺度滑动 N-Gram 智能分词器 (零人工停用词依赖)
+/// 多尺度滑动 N-Gram 智能分词器 (轻量低内存分配设计)
 struct SmartTokenizer: Sendable {
     
+    // MARK: - [Modified] 轻量词元提取器（杜绝大文本字符级 N-Gram 造成的堆内存爆炸）
     static func tokenize(_ text: String) -> [String] {
         let cleanText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return [] }
@@ -264,22 +277,24 @@ struct SmartTokenizer: Sendable {
             return true
         }
         
-        // 2. 词级 2-Gram 拼接
+        // 2. 词级 2-Gram 拼接（识别复合词组）
         if words.count >= 2 {
             for i in 0..<(words.count - 1) {
                 tokenSet.insert(words[i] + words[i+1])
             }
         }
         
-        // 3. 字符级多尺度滑动 N-Gram (2-Gram, 3-Gram, 4-Gram)
-        let chars = Array(cleanText.filter { !$0.isWhitespace && !$0.isPunctuation })
-        let charCount = chars.count
-        
-        if charCount >= 2 {
-            for n in 2...min(4, charCount) {
-                for i in 0...(charCount - n) {
-                    let gram = String(chars[i..<(i + n)])
-                    tokenSet.insert(gram)
+        // 3. 字符级轻量滑动切片（仅对长度在 2~64 字符内的短查询执行，防止对大文档全量切片引起内存膨胀）
+        if cleanText.count <= 64 {
+            let chars = Array(cleanText.filter { !$0.isWhitespace && !$0.isPunctuation })
+            let charCount = chars.count
+            
+            if charCount >= 2 {
+                for n in 2...min(4, charCount) {
+                    for i in 0...(charCount - n) {
+                        let gram = String(chars[i..<(i + n)])
+                        tokenSet.insert(gram)
+                    }
                 }
             }
         }
@@ -745,14 +760,13 @@ final class MicroVectorDB: @unchecked Sendable {
         }
     }
     
-    // MARK: - 自适应 BM25
+    // MARK: - [Modified] 零堆分配 BM25 词频计算（消灭 components(separatedBy:) 内存黑洞）
     private func computeBM25(queryTokens: [String], chunks: [VectorChunk], totalDocs: Float) async -> (scored: [(id: UUID, score: Float)], idfMap: [String: Float]) {
         guard !queryTokens.isEmpty else { return ([], [:]) }
         
         let meaningfulTokens = queryTokens.filter { $0.count >= 2 }
         let effectiveTokens = meaningfulTokens.isEmpty ? queryTokens : meaningfulTokens
         
-        var documentFrequency: [String: Float] = [:]
         var idfMap: [String: Float] = [:]
         
         for q in effectiveTokens {
@@ -761,8 +775,6 @@ final class MicroVectorDB: @unchecked Sendable {
                 ($0.metadata?.positiveTags.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false) ||
                 ($0.metadata?.headingPath.contains(where: { $0.localizedCaseInsensitiveContains(q) }) ?? false)
             }.count
-            
-            documentFrequency[q] = Float(count)
             
             if count > 0 {
                 let idf = log((totalDocs - Float(count) + 0.5) / (Float(count) + 0.5) + 1.0)
@@ -806,7 +818,8 @@ final class MicroVectorDB: @unchecked Sendable {
                 let idf = idfMap[q] ?? 0.0
                 guard idf > 0 else { continue }
                 
-                var f_qD = Float(chunkText.components(separatedBy: q).count - 1)
+                // 零内存分配计算子串词频
+                var f_qD: Float = Float(Self.countOccurrences(of: q, in: chunkText))
                 
                 var fieldMultiplier: Float = 1.0
                 if let tags = meta?.positiveTags, tags.contains(where: { $0.lowercased().contains(q) }) {
@@ -835,6 +848,18 @@ final class MicroVectorDB: @unchecked Sendable {
         
         bm25Scored.sort { $0.score > $1.score }
         return (bm25Scored, idfMap)
+    }
+    
+    /// 无内存分配的子串出现次数统计器
+    private static func countOccurrences(of needle: String, in haystack: String) -> Int {
+        guard !needle.isEmpty && !haystack.isEmpty else { return 0 }
+        var count = 0
+        var searchRange = haystack.startIndex..<haystack.endIndex
+        while let foundRange = haystack.range(of: needle, options: [.literal], range: searchRange) {
+            count += 1
+            searchRange = foundRange.upperBound..<haystack.endIndex
+        }
+        return count
     }
     
     func generateEmbedding(for text: String) async -> [Float] {
@@ -886,7 +911,7 @@ final class MicroVectorDB: @unchecked Sendable {
     }
     
     func cosineSimilarity(a: [Float], b: [Float]) -> Float {
-        guard a.count == b.count else { return 0 }
+        guard a.count == b.count && !a.isEmpty else { return 0 }
         let n = vDSP_Length(a.count)
         var dotProduct: Float = 0
         vDSP_dotpr(a, 1, b, 1, &dotProduct, n)
@@ -903,6 +928,15 @@ final class MicroVectorDB: @unchecked Sendable {
 
 actor NativeReranker: Sendable {
     static let shared = NativeReranker()
+    
+    // 缓存全局复用的语言嵌入模型，避免高频构建销毁
+    private let sharedEmbedding: NLEmbedding? = {
+        NLEmbedding.sentenceEmbedding(for: .simplifiedChinese)
+        ?? NLEmbedding.wordEmbedding(for: .simplifiedChinese)
+        ?? NLEmbedding.sentenceEmbedding(for: .english)
+        ?? NLEmbedding.wordEmbedding(for: .english)
+    }()
+    
     private init() {}
     
     func rerank(

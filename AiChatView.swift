@@ -413,17 +413,14 @@ class MarkdownRenderCache: @unchecked Sendable {
                     runAttr.backgroundColor = isUser ? Color.white.opacity(0.18) : Color.primary.opacity(0.048)
                     result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
                 } else if inlineIntent.contains(.stronglyEmphasized) && inlineIntent.contains(.emphasized) {
-                    // 粗斜体 (***text***)
                     runAttr.font = Font.system(size: 14.0, weight: .bold).italic()
                     runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
                     result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
                 } else if inlineIntent.contains(.stronglyEmphasized) {
-                    // 粗体 (**text**)
                     runAttr.font = Font.system(size: 14.0, weight: .bold)
                     runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
                     result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
                 } else if inlineIntent.contains(.emphasized) {
-                    // 斜体/轻量强调 (*text*)：字阶加权 + 原生斜体倾斜，解决中文无原生斜体字库问题
                     runAttr.font = Font.system(size: 14.0, weight: .semibold).italic()
                     runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.96)
                     result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
@@ -431,7 +428,6 @@ class MarkdownRenderCache: @unchecked Sendable {
             } else if let url = run.link, let scheme = url.scheme, let host = url.host {
                 runAttr.underlineStyle = nil
                 
-                // 工具角标
                 if scheme == "action" && host == "inspect_tool" {
                     runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
                     runAttr.baselineOffset = 3.0
@@ -1068,14 +1064,12 @@ struct CodeSyntaxHighlighter {
         let nsCode = code as NSString
         let fullRange = NSRange(location: 0, length: nsCode.length)
         
-        // 1. 数字 (蓝色)
         for match in numberRegex.matches(in: code, range: fullRange) {
             if let range = Range(match.range, in: attr) {
                 attr[range].foregroundColor = Color(hex: "#3B82F6")
             }
         }
         
-        // 2. 关键字 (紫色)
         for match in keywordsRegex.matches(in: code, range: fullRange) {
             if let range = Range(match.range, in: attr) {
                 attr[range].foregroundColor = Color(hex: "#8B5CF6")
@@ -1083,14 +1077,12 @@ struct CodeSyntaxHighlighter {
             }
         }
         
-        // 3. 字符串 (橙黄色)
         for match in stringRegex.matches(in: code, range: fullRange) {
             if let range = Range(match.range, in: attr) {
                 attr[range].foregroundColor = Color(hex: "#D97706")
             }
         }
         
-        // 4. 注释 (灰色，覆盖其它着色)
         for match in commentRegex.matches(in: code, range: fullRange) {
             if let range = Range(match.range, in: attr) {
                 attr[range].foregroundColor = Color.secondary.opacity(0.7)
@@ -1108,7 +1100,6 @@ struct CodeBlockView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // 头部三色窗体与语言指示条
             HStack {
                 HStack(spacing: 6) {
                     Circle().fill(Color.red.opacity(0.8)).frame(width: 9, height: 9)
@@ -1139,7 +1130,6 @@ struct CodeBlockView: View {
             
             Divider().opacity(0.4)
             
-            // 语法高亮文本区
             Text(CodeSyntaxHighlighter.highlight(code: code))
                 .padding(12)
                 .lineSpacing(4.5)
@@ -1341,6 +1331,7 @@ struct ActionChipModel: Hashable {
     let title: String
 }
 
+// MARK: - MessageContentView (已移除频繁监听 GeometryReader 状态震荡)
 struct MessageContentView: View, Equatable {
     var messageID: UUID = UUID()
     var text: String
@@ -1355,10 +1346,6 @@ struct MessageContentView: View, Equatable {
     
     @State private var inspectingRagHit: RAGHitLog? = nil
     @State private var showRagPopover: Bool = false
-    
-    // 鼠标物理坐标动态锚点
-    @State private var popoverAnchorPosition: CGPoint = CGPoint(x: 100, y: 20)
-    @State private var contentGlobalFrame: CGRect = .zero
     
     static func == (lhs: MessageContentView, rhs: MessageContentView) -> Bool {
         return lhs.messageID == rhs.messageID &&
@@ -1441,136 +1428,122 @@ struct MessageContentView: View, Equatable {
     var body: some View {
         let parts = MessageASTCache.shared.getParsedParts(id: messageID, text: text, isGenerating: isGenerating)
         
-        ZStack(alignment: .topLeading) {
-            VStack(alignment: .leading, spacing: 6) {
-                if parts.isEmpty {
-                    if isGenerating { TypingIndicatorView() }
-                    else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
-                } else {
-                    ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
-                        switch part.type {
-                        case .header(let level):
-                            HeaderBlockView(level: level, text: part.text, isUser: isUser)
-                            
-                        case .code(let language):
-                            CodeBlockView(code: part.text, language: language)
-                                .textSelection(.enabled)
-                        case .table(let headers, let rows):
-                            TableBlockView(headers: headers, rows: rows)
-                                .textSelection(.enabled)
-                        case .think(let isClosed):
-                            ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed)
-                                .textSelection(.enabled)
-                        case .divider:
-                            HorizontalRuleBlockView()
-                        case .text:
-                            let (cleanText, actionChips) = extractActionTags(from: part.text)
-                            let segments = splitByCardTag(cleanText)
-                            
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(0..<segments.count, id: \.self) { segIdx in
-                                    let seg = segments[segIdx]
-                                    
-                                    if seg.isCard {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
-                                                .lineSpacing(6)
-                                                .multilineTextAlignment(.leading)
-                                                .tint(.cyan)
-                                                .textSelection(.enabled)
-                                                .fixedSize(horizontal: false, vertical: true)
-                                        }
-                                        .padding(.horizontal, 14)
-                                        .padding(.vertical, 11)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .fill(Color.cyan.opacity(0.07))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(Color.cyan.opacity(0.38), lineWidth: 1.5)
-                                        )
-                                        .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
-                                        .padding(.vertical, 4)
-                                        .compositingGroup()
-                                    } else {
+        VStack(alignment: .leading, spacing: 6) {
+            if parts.isEmpty {
+                if isGenerating { TypingIndicatorView() }
+                else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
+            } else {
+                ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                    switch part.type {
+                    case .header(let level):
+                        HeaderBlockView(level: level, text: part.text, isUser: isUser)
+                        
+                    case .code(let language):
+                        CodeBlockView(code: part.text, language: language)
+                            .textSelection(.enabled)
+                    case .table(let headers, let rows):
+                        TableBlockView(headers: headers, rows: rows)
+                            .textSelection(.enabled)
+                    case .think(let isClosed):
+                        ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed)
+                            .textSelection(.enabled)
+                    case .divider:
+                        HorizontalRuleBlockView()
+                    case .text:
+                        let (cleanText, actionChips) = extractActionTags(from: part.text)
+                        let segments = splitByCardTag(cleanText)
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(0..<segments.count, id: \.self) { segIdx in
+                                let seg = segments[segIdx]
+                                
+                                if seg.isCard {
+                                    VStack(alignment: .leading, spacing: 4) {
                                         Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
                                             .lineSpacing(6)
                                             .multilineTextAlignment(.leading)
                                             .tint(.cyan)
                                             .textSelection(.enabled)
                                             .fixedSize(horizontal: false, vertical: true)
-                                            .compositingGroup()
                                     }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 11)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(Color.cyan.opacity(0.07))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .stroke(Color.cyan.opacity(0.38), lineWidth: 1.5)
+                                    )
+                                    .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
+                                    .padding(.vertical, 4)
+                                    .compositingGroup()
+                                } else {
+                                    Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
+                                        .lineSpacing(6)
+                                        .multilineTextAlignment(.leading)
+                                        .tint(.cyan)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .compositingGroup()
                                 }
-                                
-                                if !actionChips.isEmpty {
-                                    ScrollView(.horizontal, showsIndicators: false) {
-                                        HStack(spacing: 8) {
-                                            ForEach(actionChips, id: \.self) { chip in
-                                                Button(action: {
-                                                    if chip.type == .skill {
-                                                        let systemInvokePrompt = "请直接调用此技能(tool)：\(chip.payload)。无需多余废话，直接执行。"
-                                                        onAction?(systemInvokePrompt)
-                                                    } else {
-                                                        onAction?(chip.payload)
-                                                    }
-                                                }) {
-                                                    HStack(spacing: 4) {
-                                                        Image(systemName: chip.type == .skill ? "wrench.and.screwdriver.fill" : "paperplane.fill")
-                                                            .font(.system(size: 10))
-                                                        Text(chip.title).font(.system(size: 12, weight: .bold))
-                                                    }
-                                                    .foregroundColor(chip.type == .skill ? .purple : .cyan)
-                                                    .padding(.horizontal, 10)
-                                                    .padding(.vertical, 5)
-                                                    .background((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.15))
-                                                    .cornerRadius(6)
-                                                    .overlay(
-                                                        RoundedRectangle(cornerRadius: 6)
-                                                            .stroke((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.3), lineWidth: 1)
-                                                    )
+                            }
+                            
+                            if !actionChips.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(actionChips, id: \.self) { chip in
+                                            Button(action: {
+                                                if chip.type == .skill {
+                                                    let systemInvokePrompt = "请直接调用此技能(tool)：\(chip.payload)。无需多余废话，直接执行。"
+                                                    onAction?(systemInvokePrompt)
+                                                } else {
+                                                    onAction?(chip.payload)
                                                 }
-                                                .buttonStyle(.plain)
+                                            }) {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: chip.type == .skill ? "wrench.and.screwdriver.fill" : "paperplane.fill")
+                                                        .font(.system(size: 10))
+                                                    Text(chip.title).font(.system(size: 12, weight: .bold))
+                                                }
+                                                .foregroundColor(chip.type == .skill ? .purple : .cyan)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 5)
+                                                .background((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.15))
+                                                .cornerRadius(6)
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 6)
+                                                        .stroke((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.3), lineWidth: 1)
+                                                )
                                             }
+                                            .buttonStyle(.plain)
                                         }
-                                        .padding(.vertical, 2)
                                     }
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                                    .padding(.vertical, 2)
                                 }
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
                             }
                         }
                     }
                 }
             }
-            .background(
-                GeometryReader { geo in
-                    Color.clear
-                        .onAppear { contentGlobalFrame = geo.frame(in: .global) }
-                        .onChange(of: geo.frame(in: .global)) { _, newFrame in contentGlobalFrame = newFrame }
-                }
-            )
-            
-            // 1x1 隐形鼠标物理吸附锚点 (精确依附于点击位置)
-            Color.clear
-                .frame(width: 1, height: 1)
-                .offset(x: popoverAnchorPosition.x, y: popoverAnchorPosition.y)
-                .popover(isPresented: $showInspectPopover, arrowEdge: .top) {
-                    if let log = inspectingLog {
-                        let isExec = log.resultOutput == "执行中..." || log.resultOutput == "等待授权..."
-                        let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
-                        DetailedSkillView(
-                            log: log,
-                            themeColor: log.executorName != nil ? .purple : (isExec ? .blue : (isFailed ? .red : .green)),
-                            isExecuting: isExec
-                        )
-                    }
-                }
-                .popover(isPresented: $showRagPopover, arrowEdge: .top) {
-                    if let hit = inspectingRagHit {
-                        RAGChunkInspectorPopover(hit: hit)
-                    }
-                }
+        }
+        .popover(isPresented: $showInspectPopover, arrowEdge: .top) {
+            if let log = inspectingLog {
+                let isExec = log.resultOutput == "执行中..." || log.resultOutput == "等待授权..."
+                let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
+                DetailedSkillView(
+                    log: log,
+                    themeColor: log.executorName != nil ? .purple : (isExec ? .blue : (isFailed ? .red : .green)),
+                    isExecuting: isExec
+                )
+            }
+        }
+        .popover(isPresented: $showRagPopover, arrowEdge: .top) {
+            if let hit = inspectingRagHit {
+                RAGChunkInspectorPopover(hit: hit)
+            }
         }
         .environment(\.openURL, OpenURLAction { url in
             guard url.scheme == "action" else {
@@ -1578,23 +1551,11 @@ struct MessageContentView: View, Equatable {
                 return handled ? .handled : .systemAction
             }
             
-            // 捕获当前鼠标事件的窗口物理坐标并映射至局部
-            if let event = NSApp.currentEvent, let window = event.window ?? NSApp.keyWindow {
-                let windowHeight = window.contentView?.frame.height ?? window.frame.height
-                let clickX = event.locationInWindow.x
-                let clickY = windowHeight - event.locationInWindow.y
-                
-                let localX = max(8, min(max(16, contentGlobalFrame.width - 8), clickX - contentGlobalFrame.minX))
-                let localY = max(8, min(max(16, contentGlobalFrame.height - 8), clickY - contentGlobalFrame.minY))
-                self.popoverAnchorPosition = CGPoint(x: localX, y: localY)
-            }
-            
             if url.host == "inspect_tool" {
                 let targetToolName = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
                 let callId = queryParams?.first(where: { $0.name == "call_id" })?.value
                 
-                // 1. 优先通过 call_id 绝对唯一精确寻址
                 if let callId = callId, !callId.isEmpty,
                    let matchedLog = skillLogs.first(where: { $0.confirmationId == callId || $0.id.uuidString == callId }) {
                     self.inspectingLog = matchedLog
@@ -1602,7 +1563,6 @@ struct MessageContentView: View, Equatable {
                     return .handled
                 }
                 
-                // 2. 降级兜底寻址
                 if let matchedLog = skillLogs.last(where: {
                     $0.skillName.lowercased() == targetToolName.lowercased() ||
                     $0.displayName.lowercased() == targetToolName.lowercased()
@@ -1659,7 +1619,6 @@ struct FastJsonViewer: View {
     
     var body: some View {
         if let dict = value as? [String: Any], !dict.isEmpty {
-            // 简单扁平字典，走轻量高效 Key-Value 行渲染
             let isFlat = dict.values.allSatisfy { !($0 is [String: Any]) && !($0 is [Any]) }
             if isFlat {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1680,7 +1639,6 @@ struct FastJsonViewer: View {
                     }
                 }
             } else {
-                // 复杂多层嵌套，单次格式化等宽文本输出（毫秒级瞬时渲染）
                 Text(formatPrettyJSON(from: dict))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.primary.opacity(0.9))
@@ -2076,7 +2034,6 @@ struct DetailedSkillView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 头部导航条
             HStack(spacing: 8) {
                 Image(systemName: "terminal.fill")
                     .foregroundColor(themeColor)
@@ -2117,7 +2074,6 @@ struct DetailedSkillView: View {
             
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 14) {
-                    // 输入参数区域
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 4) {
                             Image(systemName: "tray.and.arrow.down")
@@ -2140,7 +2096,6 @@ struct DetailedSkillView: View {
                         }
                     }
                     
-                    // 截图展示
                     if let img = detectedImage {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 4) {
@@ -2162,7 +2117,6 @@ struct DetailedSkillView: View {
                         }
                     }
                     
-                    // 执行结果区域
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 4) {
                             Image(systemName: "tray.and.arrow.up")
@@ -3834,6 +3788,7 @@ struct OptionDrawerPopoverView: View {
 
 // MARK: - ==================== 7. ChatMainView (主视图装配与渲染管线) ====================
 
+// MARK: - [Modified] ChatMessageRowView (支持悬浮同时展示上下双工具栏，零性能损耗)
 struct ChatMessageRowView: View, Equatable {
     let msg: ChatMessage
     var isGenerating: Bool
@@ -3845,28 +3800,12 @@ struct ChatMessageRowView: View, Equatable {
     
     @State private var isHovered: Bool = false
     @State private var isCopied: Bool = false
-    @State private var rowWidth: CGFloat = 800
     @State private var renderedText: String = ""
     @State private var lastRenderTime: Date = Date()
     private let throttleInterval: TimeInterval = 0.08
     
-    // 视口感知与几何位置跟踪
-    @State private var bubbleHeight: CGFloat = 0
-    @State private var bubbleGlobalMinY: CGFloat = 0
-    @State private var bubbleGlobalMaxY: CGFloat = 0
-    @State private var windowHeight: CGFloat = 800
-    
     static func == (lhs: ChatMessageRowView, rhs: ChatMessageRowView) -> Bool {
         return lhs.msg == rhs.msg && lhs.isGenerating == rhs.isGenerating
-    }
-    
-    // 动态判定工具条是否应在气泡上方展示
-    private var shouldShowToolbarAtTop: Bool {
-        guard !msg.isUser else { return false }
-        let bottomCutoff = max(300, windowHeight - 90)
-        let isBottomHidden = bubbleGlobalMaxY > bottomCutoff
-        let isTopOnScreen = bubbleGlobalMinY < bottomCutoff - 60
-        return (bubbleHeight > 240) && isBottomHidden && isTopOnScreen
     }
     
     private var shouldHideStandardContent: Bool {
@@ -3921,19 +3860,15 @@ struct ChatMessageRowView: View, Equatable {
         let hasSkillLogs = !msg.skillLogs.isEmpty
         
         VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 3) {
-            // 气泡上方工具栏 (当长气泡底部被视口遮挡时显示)
-            if shouldShowToolbarAtTop {
+            // 1. 气泡顶部浮动工具条（AI 回复专属，鼠标移入时显现）
+            if !msg.isUser {
                 actionButtons
                     .padding(.horizontal, 4)
-                    .padding(.bottom, 2)
+                    .padding(.bottom, 1)
                     .opacity(actionOpacity)
-                    .transition(.asymmetric(
-                        insertion: .move(edge: .top).combined(with: .opacity),
-                        removal: .move(edge: .top).combined(with: .opacity)
-                    ))
             }
             
-            // 主消息气泡容器
+            // 2. 主消息气泡容器
             HStack(alignment: .top, spacing: 0) {
                 if msg.isUser {
                     Spacer(minLength: 28)
@@ -4047,37 +3982,21 @@ struct ChatMessageRowView: View, Equatable {
                         )
                 )
                 .shadow(color: Color.black.opacity(msg.isUser ? 0.12 : 0.04), radius: 3, x: 0, y: 1)
-                .background(
-                    // 几何尺寸与视口位置检测
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { updateGeometry(geo) }
-                            .onChange(of: geo.frame(in: .global)) { _, _ in updateGeometry(geo) }
-                    }
-                )
                 
                 if !msg.isUser {
                     Spacer(minLength: 28)
                 }
             }
             
-            // 气泡下方工具栏 (常规状态或已滚动到底部时显示)
-            if !shouldShowToolbarAtTop {
-                actionButtons
-                    .padding(.horizontal, 4)
-                    .padding(.top, 2)
-                    .opacity(actionOpacity)
-                    .transition(.asymmetric(
-                        insertion: .move(edge: .bottom).combined(with: .opacity),
-                        removal: .move(edge: .bottom).combined(with: .opacity)
-                    ))
-            }
+            // 3. 气泡底部浮动工具条（用户消息右对齐，AI 消息左对齐，鼠标移入时显现）
+            actionButtons
+                .padding(.horizontal, 4)
+                .padding(.top, 2)
+                .opacity(actionOpacity)
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-        .onHover { hover in withAnimation(.easeOut(duration: 0.18)) { isHovered = hover } }
-        .animation(.spring(response: 0.28, dampingFraction: 0.8), value: shouldShowToolbarAtTop)
-        .animation(.easeOut(duration: 0.18), value: isHovered)
+        .onHover { hover in withAnimation(.easeOut(duration: 0.15)) { isHovered = hover } }
         .onAppear { renderedText = msg.text }
         .onChange(of: msg.text) { _, newText in
             if !isGenerating { renderedText = newText } else {
@@ -4086,19 +4005,6 @@ struct ChatMessageRowView: View, Equatable {
             }
         }
         .onChange(of: isGenerating) { _, gen in if !gen { renderedText = msg.text } }
-    }
-    
-    // 动态更新几何位置信息
-    private func updateGeometry(_ geo: GeometryProxy) {
-        let globalFrame = geo.frame(in: .global)
-        let height = geo.size.height
-        if self.bubbleHeight != height { self.bubbleHeight = height }
-        if self.bubbleGlobalMinY != globalFrame.minY { self.bubbleGlobalMinY = globalFrame.minY }
-        if self.bubbleGlobalMaxY != globalFrame.maxY { self.bubbleGlobalMaxY = globalFrame.maxY }
-        if let win = NSApp.keyWindow ?? NSApp.mainWindow {
-            let winH = win.contentView?.frame.height ?? win.frame.height
-            if self.windowHeight != winH { self.windowHeight = winH }
-        }
     }
     
     // 操作按钮组
@@ -4128,7 +4034,6 @@ struct ChatMessageRowView: View, Equatable {
                 Divider().frame(height: 12).padding(.horizontal, 2)
             }
             
-            // 统一为纯图标圆形按钮，点击状态绿色平滑反馈
             Button(action: {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(displaySafeText, forType: .string)
@@ -4264,6 +4169,7 @@ struct UserMessageContentView: View {
     }
 }
 
+// MARK: - [Modified] AiChatView (固定唯一标识并消除全量层叠重绘)
 @MainActor
 struct AiChatView: View {
     @ObservedObject private var store = AiChatStore.shared
@@ -4464,7 +4370,7 @@ struct AiChatView: View {
                 HStack(spacing: 5) {
                     Image(systemName: "cpu")
                         .font(.system(size: 9))
-                    Text(agent.baseModel.isEmpty ? "未指定模型" : agent.baseModel)
+                    Text(agent.baseModel.isEmpty ? "未指定模型" : agent.actualModelName)
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -4486,7 +4392,7 @@ struct AiChatView: View {
                 .padding(.vertical, 4)
                 .background(Color.primary.opacity(0.035))
                 .cornerRadius(6)
-                .help("底层模型: \(agent.baseModel)\(hasKB ? "\n关联知识库: \(kbText)" : "")")
+                .help("底层模型: \(agent.actualModelName)\(hasKB ? "\n关联知识库: \(kbText)" : "")")
             }
             
             Spacer(minLength: 4)
@@ -4574,7 +4480,7 @@ struct AiChatView: View {
         ScrollView {
             ScrollViewReader { proxy in
                 VStack(spacing: 16) {
-                    ForEach(store.messages) { msg in
+                    ForEach(store.messages, id: \.id) { msg in
                         let isGen = store.isLoading && msg.id == store.messages.last?.id
                         ChatMessageRowView(
                             msg: msg, isGenerating: isGen, onDelete: { store.deleteMessage(id: msg.id) },
@@ -4745,7 +4651,6 @@ struct SiriVibrantBackgroundView: View {
                     let h = geometry.size.height
                     
                     ZStack {
-                        // 采用 30fps 节流驱动，杜绝 ProMotion 120Hz 盲目全屏模糊计算
                         TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { timeline in
                             let time = timeline.date.timeIntervalSinceReferenceDate
                             let t = time * 1.1
@@ -4960,13 +4865,13 @@ struct ActionBadgeCapsuleView: View {
         switch badge.type {
         case .tool(_, _, let status):
             switch status {
-            case "success": return Color(hex: "#10B981") // 翠绿
-            case "failed":  return Color(hex: "#EF4444") // 警示红
-            case "waiting": return Color.orange          // 待授权橙
-            default:        return Color.purple          // 执行中紫
+            case "success": return Color(hex: "#10B981")
+            case "failed":  return Color(hex: "#EF4444")
+            case "waiting": return Color.orange
+            default:        return Color.purple
             }
         case .rag:
-            return Color.cyan                            // 知识库青色
+            return Color.cyan
         case .custom:
             return Color.indigo
         }

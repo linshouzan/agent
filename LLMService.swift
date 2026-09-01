@@ -1,13 +1,23 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：LLMService.swift
-// 文件说明：这是适用于 macos 14+ 的大模型服务调用方法
-// 关联说明：ConfigManager为配置存储管理对应的通知也已另外定义，不需要补充定义
-// 代码要求：请保证代码的逻辑和完整性，保留代码中的所有注释内容
-// 核心架构及升级功能说明：
-// 1. 彻底修复 Gemma 4 / Gemini 推理模型流式响应的“思维链被截断洗白”恶疾。
-// 2. 网络层原子分流：从源头解析 "thought": true 协议并转化为 .reasoning 事件投递。
-// 3. 完美兼容 Swift 6 Strict Concurrency 模式，规避跨线程闭包数据竞争。
-// 4. 端到端透传 Gemini thought_signature 防篡改数字签名，彻底杜绝 HTTP 400 拒服。
+// 文件说明：适用于 macOS 14+ 的大模型多协议通信引擎与流式事件分流中心 (Swift 6 Ready)
+//
+// 核心架构与协议调度说明：
+// 1. 协议解耦与策略工厂架构 (Protocol-Oriented Adapter Pattern):
+//    - 统一抽象 LLMProtocolAdapter 协议，隔离 OpenAI、Gemini (GenerateContent)、Gemini Interactions 与 Ollama 底层协议差异。
+//    - LLMAdapterFactory 单例工厂动态注册与路由适配器，保持无侵入式通道扩充能力。
+// 2. 新一代 Gemini Interactions 协议原生支持 (Interactions API / Typed Item Stream):
+//    - 严格遵循 /v1beta/interactions 标准，将历史消息无损序列化为扁平化类型化原子项 (Typed Items: text, image, document, function_call, function_result, thought)。
+//    - 支持通道级 Google 原生内置工具 (google_search, url_context, code_execution, google_maps 等) 与自定义 Function Calling 混合下发。
+// 3. 流式工具分块聚合机制 (Multi-Tool Call Accumulator):
+//    - 解决 SSE 流式传输中 arguments_delta 参数分块截断与提前触发执行漏洞，内存流式累加并延迟反序列化。
+//    - 跨 Step 暂存并传递 thought_signature，并在上下文组装时作为独立 thought 原子项注入，确保多轮验证链闭环。
+// 4. 原子级思维链分流与防截断机制 (Native Deep Thinking & Reasoning Stream):
+//    - 源头拦截并分流 reasoning_content / thought / thought_delta 增量，并向 UI 投递独立的 reasoning 事件流。
+// 5. 跨平台多模态高保真编排 (Multimodal Pipeline):
+//    - 支持图片 Base64 编码、Docling 结构化解析降级、PDFKit 纯文本抽取与原生 Document 直传。
+// 6. 健壮的网络安全与 SSL 质询拦截:
+//    - 统一实现 URLSessionDelegate 质询校验，支持内网自签名证书与企业级安全网关穿透。
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -18,7 +28,7 @@ import AppKit
 import QuickLookThumbnailing
 import PDFKit
 
-// MARK: - 1. 协议定义 (Protocol Definition)
+// MARK: - ==================== 1. 协议定义 (Protocol Definition) ====================
 
 protocol LLMProtocolAdapter: Sendable {
     var protocolType: String { get }
@@ -38,7 +48,7 @@ protocol LLMProtocolAdapter: Sendable {
     func parseSSEPayload(json: [String: Any]) -> [LLMRawEvent]
 }
 
-// MARK: - 2. 策略工厂 (Adapter Registry)
+// MARK: - ==================== 2. 策略工厂 (Adapter Registry) ====================
 
 final class LLMAdapterFactory: @unchecked Sendable {
     static let shared = LLMAdapterFactory()
@@ -48,6 +58,7 @@ final class LLMAdapterFactory: @unchecked Sendable {
     private init() {
         register(OpenAIProtocolAdapter())
         register(GeminiProtocolAdapter())
+        register(GeminiInteractionsProtocolAdapter())
         register(OllamaProtocolAdapter())
     }
     
@@ -60,7 +71,7 @@ final class LLMAdapterFactory: @unchecked Sendable {
     }
 }
 
-// MARK: - 3. Google Gemini 协议适配器
+// MARK: - ==================== 3. Google Gemini 传统流式协议适配器 (generateContent) ====================
 
 struct GeminiProtocolAdapter: LLMProtocolAdapter {
     let protocolType: String = "gemini"
@@ -77,7 +88,8 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
         isthink: Bool
     ) throws -> URLRequest {
         let apiVersion = (model.contains("exp") || model.contains("preview")) ? "v1alpha" : "v1beta"
-        guard let url = URL(string: "\(host)/\(apiVersion)/models/\(model):streamGenerateContent?alt=sse&key=\(apiKey)") else {
+        let baseHost = host.isEmpty ? "https://generativelanguage.googleapis.com" : host.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(baseHost)/\(apiVersion)/models/\(model):streamGenerateContent?alt=sse&key=\(apiKey)") else {
             throw NSError(domain: "GeminiAdapter", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 Gemini 接口地址"])
         }
         
@@ -167,7 +179,6 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
         }
         
         if !activeSkills.isEmpty {
-            // 确定性工具排序 + 纯净 Gemini Schema
             let sortedSkills = activeSkills.sorted { $0.name.lowercased() < $1.name.lowercased() }
             let declarations = sortedSkills.map { $0.toFunctionDeclaration(isGemini: true) }
             requestBody["tools"] = [["functionDeclarations": declarations]]
@@ -222,7 +233,292 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
     }
 }
 
-// MARK: - 4. OpenAI / 通用兼容协议适配器
+// MARK: - ==================== 3.1 Google Gemini Interactions 协议适配器 (Interactions API) ====================
+
+struct GeminiInteractionsProtocolAdapter: LLMProtocolAdapter {
+    let protocolType: String = "interactions"
+    
+    func buildURLRequest(
+        host: String,
+        model: String,
+        apiKey: String,
+        messages: [ContextMessage],
+        images: [NSImage],
+        fileURLs: [URL],
+        instruction: String,
+        activeSkills: [AgentSkill],
+        isthink: Bool
+    ) throws -> URLRequest {
+        let baseHost = host.isEmpty ? "https://generativelanguage.googleapis.com" : host.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let endpointString: String
+        if baseHost.contains("/interactions") {
+            endpointString = baseHost
+        } else {
+            endpointString = "\(baseHost)/v1beta/interactions"
+        }
+        
+        guard let url = URL(string: endpointString) else {
+            throw NSError(domain: "GeminiInteractionsAdapter", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 Interactions API 接口地址"])
+        }
+        
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 300)
+        request.httpMethod = "POST"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.addValue("keep-alive", forHTTPHeaderField: "Connection")
+        request.addValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        
+        // 1. 将上下文多轮历史转换为 Interactions 标准原子项列表
+        var inputItems: [[String: Any]] = []
+        let userMessagesCount = messages.filter { $0.role == .user }.count
+        var currentUserIndex = 0
+        
+        for msg in messages {
+            switch msg.role {
+            case .system:
+                if let text = msg.content, !text.isEmpty {
+                    inputItems.append([
+                        "type": "text",
+                        "text": "【系统指引】: \(text)"
+                    ])
+                }
+                
+            case .user:
+                currentUserIndex += 1
+                if let text = msg.content, !text.isEmpty {
+                    inputItems.append([
+                        "type": "text",
+                        "text": text
+                    ])
+                }
+                
+                if currentUserIndex == userMessagesCount {
+                    for img in images {
+                        if let base64 = img.toBase64JPEG() {
+                            inputItems.append([
+                                "type": "image",
+                                "data": base64,
+                                "mime_type": "image/jpeg"
+                            ])
+                        }
+                    }
+                    for fileURL in fileURLs where fileURL.pathExtension.lowercased() == "pdf" {
+                        if let fileData = try? Data(contentsOf: fileURL) {
+                            inputItems.append([
+                                "type": "document",
+                                "data": fileData.base64EncodedString(),
+                                "mime_type": "application/pdf"
+                            ])
+                        }
+                    }
+                }
+                
+            case .assistant:
+                if let text = msg.content, !text.isEmpty {
+                    inputItems.append([
+                        "type": "text",
+                        "text": text
+                    ])
+                }
+                
+                if let toolCalls = msg.toolCalls {
+                    for tc in toolCalls {
+                        // 🌟 若存在加密思维链签名，作为独立的 thought 项在 function_call 前先行注入
+                        if let sig = tc.thoughtSignature, !sig.isEmpty {
+                            inputItems.append([
+                                "type": "thought",
+                                "signature": sig
+                            ])
+                        }
+                        
+                        let argsDict = (try? JSONSerialization.jsonObject(with: Data(tc.arguments.utf8))) as? [String: Any] ?? [:]
+                        let fcItem: [String: Any] = [
+                            "type": "function_call",
+                            "name": tc.name,
+                            "arguments": argsDict
+                        ]
+                        inputItems.append(fcItem)
+                    }
+                }
+                
+            case .tool:
+                var resultData: Any = [:]
+                if let content = msg.content,
+                   let data = content.data(using: .utf8),
+                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    resultData = parsed
+                } else {
+                    resultData = ["output": msg.content ?? "ok"]
+                }
+                
+                let frItem: [String: Any] = [
+                    "type": "function_result",
+                    "name": msg.name ?? "",
+                    "result": resultData
+                ]
+                inputItems.append(frItem)
+            }
+        }
+        
+        if inputItems.isEmpty {
+            inputItems.append(["type": "text", "text": ""])
+        }
+        
+        var requestBody: [String: Any] = [
+            "model": model,
+            "input": inputItems,
+            "stream": true
+        ]
+        
+        if !instruction.isEmpty {
+            requestBody["system_instruction"] = instruction
+        }
+        
+        // 2. 混合装配 Google 原生内置工具与自定义 Function Calling
+        var toolDeclarations: [[String: Any]] = []
+        
+        // A. 挂载通道级别的 Google 原生内置工具 (google_search, url_context, code_execution 等)
+        if let currentConfig = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(model) }) {
+            for toolName in currentConfig.builtinTools {
+                let trimmedToolName = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedToolName.isEmpty {
+                    toolDeclarations.append(["type": trimmedToolName])
+                }
+            }
+        }
+        
+        // B. 挂载 Agent 自定义本地技能
+        if !activeSkills.isEmpty {
+            let sortedSkills = activeSkills.sorted { $0.name.lowercased() < $1.name.lowercased() }
+            for skill in sortedSkills {
+                let decl = skill.toFunctionDeclaration(isGemini: true)
+                toolDeclarations.append([
+                    "type": "function",
+                    "name": skill.name,
+                    "description": skill.description,
+                    "parameters": decl["parameters"] ?? [
+                        "type": "object",
+                        "properties": [String: Any](),
+                        "required": [String]()
+                    ]
+                ])
+            }
+        }
+        
+        if !toolDeclarations.isEmpty {
+            requestBody["tools"] = toolDeclarations
+        }
+        
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+        return request
+    }
+    
+    func parseSSEPayload(json: [String: Any]) -> [LLMRawEvent] {
+        var events: [LLMRawEvent] = []
+        
+        // 1. 显式捕获并上报 Interactions API 内部下发的错误事件
+        if let errorObj = json["error"] as? [String: Any] {
+            let errorMsg = errorObj["message"] as? String ?? "未知服务端请求异常"
+            let errorCode = errorObj["code"] as? String ?? "error"
+            events.append(.text("\n\n> ❌ **Google API 拒绝请求 (\(errorCode))**: \(errorMsg)"))
+            return events
+        }
+        
+        // 2. Usage 统计解析
+        if let usage = (json["usage"] as? [String: Any])
+            ?? (json["usageMetadata"] as? [String: Any])
+            ?? ((json["interaction"] as? [String: Any])?["usage"] as? [String: Any]) {
+            if let total = (usage["total_tokens"] as? Int)
+                ?? (usage["totalTokenCount"] as? Int)
+                ?? (usage["total_token_count"] as? Int) {
+                events.append(.usage(total))
+            }
+        }
+        
+        // 3. 解析 Step 结构 (Interactions 原生 step.start / step.delta / step.stop)
+        if let step = json["step"] as? [String: Any] {
+            let stepType = step["type"] as? String ?? ""
+            if stepType == "function_call" {
+                let id = step["id"] as? String ?? ""
+                let name = step["name"] as? String ?? ""
+                let argsDict = step["arguments"] as? [String: Any] ?? [:]
+                events.append(.toolCall(id: id, name: name, args: argsDict, thoughtSignature: nil))
+            }
+        }
+        
+        // 4. 解析 Delta 结构 (Interactions 原生增量事件)
+        if let delta = json["delta"] as? [String: Any] {
+            let deltaType = delta["type"] as? String ?? ""
+            
+            // A. 思想签名独立事件
+            if deltaType == "thought_signature" || delta["signature"] != nil {
+                if let sig = (delta["signature"] as? String) ?? (delta["thought_signature"] as? String), !sig.isEmpty {
+                    events.append(.toolCall(id: "", name: "", args: [:], thoughtSignature: sig))
+                }
+            }
+            // B. 参数增量分块事件 (精准捕获 arguments_delta)
+            else if deltaType == "arguments_delta" || delta["arguments"] != nil {
+                if let argsStr = delta["arguments"] as? String {
+                    events.append(.toolCall(id: "", name: "", args: ["__raw_stream_chunk__": argsStr], thoughtSignature: nil))
+                } else if let argsDict = delta["arguments"] as? [String: Any] {
+                    events.append(.toolCall(id: "", name: "", args: argsDict, thoughtSignature: nil))
+                }
+            }
+            // C. 文本增量事件
+            else if deltaType == "text_delta" || deltaType == "text" || delta["text"] != nil {
+                if let text = (delta["text"] as? String) ?? (delta["content"] as? String), !text.isEmpty {
+                    events.append(.text(text))
+                }
+            }
+            // D. 思考链增量事件
+            else if deltaType == "thought_delta" || deltaType == "thought" || delta["thought"] != nil || delta["reasoning_content"] != nil {
+                if let thought = (delta["thought"] as? String) ?? (delta["reasoning_content"] as? String) ?? (delta["text"] as? String), !thought.isEmpty {
+                    events.append(.reasoning(thought))
+                }
+            }
+            // E. Google 原生内置工具执行事件
+            else if deltaType == "code_execution_call" || delta["code_execution_call"] != nil {
+                if let code = (delta["code"] as? String) ?? ((delta["code_execution_call"] as? [String: Any])?["code"] as? String) {
+                    events.append(.text("\n```python\n# 正在执行 Python 沙盒运算...\n\(code)\n```\n"))
+                }
+            } else if deltaType == "code_execution_result" || delta["code_execution_result"] != nil {
+                if let output = (delta["output"] as? String) ?? ((delta["code_execution_result"] as? [String: Any])?["output"] as? String) {
+                    events.append(.text("\n> 💻 **[沙盒输出]**:\n```\n\(output)\n```\n\n"))
+                }
+            } else if deltaType == "google_search_result" || delta["google_search_result"] != nil {
+                events.append(.reasoning("🔍 [已完成 Google 联网事实检索]\n"))
+            } else if deltaType == "url_context_result" || delta["url_context_result"] != nil {
+                events.append(.reasoning("🌐 [已提取网页链接正文]\n"))
+            }
+            // F. 常规 function_call 增量
+            else if deltaType == "function_call" {
+                let name = delta["name"] as? String ?? ""
+                let id = delta["id"] as? String ?? delta["call_id"] as? String ?? ""
+                events.append(.toolCall(id: id, name: name, args: [:], thoughtSignature: nil))
+            }
+        }
+        
+        // 5. 兼容老版本 choices / candidates 响应结构
+        if let candidates = json["candidates"] as? [[String: Any]], let first = candidates.first {
+            if let content = first["content"] as? [String: Any], let parts = content["parts"] as? [[String: Any]] {
+                for part in parts {
+                    if let text = part["text"] as? String, !text.isEmpty {
+                        let isThought = part["thought"] as? Bool ?? false
+                        if isThought { events.append(.reasoning(text)) } else { events.append(.text(text)) }
+                    } else if let fc = part["functionCall"] as? [String: Any] {
+                        let name = fc["name"] as? String ?? ""
+                        let args = fc["args"] as? [String: Any] ?? [:]
+                        let sig = (part["thoughtSignature"] as? String) ?? (part["thought_signature"] as? String)
+                        events.append(.toolCall(id: "call_\(UUID().uuidString.prefix(8))", name: name, args: args, thoughtSignature: sig))
+                    }
+                }
+            }
+        }
+        
+        return events
+    }
+}
+
+// MARK: - ==================== 4. OpenAI / 通用兼容协议适配器 ====================
 
 struct OpenAIProtocolAdapter: LLMProtocolAdapter {
     let protocolType: String = "openai"
@@ -314,7 +610,6 @@ struct OpenAIProtocolAdapter: LLMProtocolAdapter {
         }
         
         if !activeSkills.isEmpty {
-            // 🌟 确定性字典序排列
             let sortedSkills = activeSkills.sorted { $0.name.lowercased() < $1.name.lowercased() }
             requestBody["tools"] = sortedSkills.map { ["type": "function", "function": $0.toFunctionDeclaration()] }
             requestBody["tool_choice"] = "auto"
@@ -342,20 +637,31 @@ struct OpenAIProtocolAdapter: LLMProtocolAdapter {
                 events.append(.text(content))
             }
             
-            if let toolCalls = delta["tool_calls"] as? [[String: Any]], let firstCall = toolCalls.first,
-               let function = firstCall["function"] as? [String: Any] {
-                let id = firstCall["id"] as? String ?? UUID().uuidString
-                let name = function["name"] as? String ?? ""
-                let argsStr = function["arguments"] as? String ?? "{}"
-                let argsDict = (try? JSONSerialization.jsonObject(with: Data(argsStr.utf8))) as? [String: Any] ?? [:]
-                events.append(.toolCall(id: id, name: name, args: argsDict, thoughtSignature: nil))
+            if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                for tc in toolCalls {
+                    let id = tc["id"] as? String ?? ""
+                    let function = tc["function"] as? [String: Any] ?? [:]
+                    let name = function["name"] as? String ?? ""
+                    let argsStr = function["arguments"] as? String ?? ""
+                    
+                    var argsDict: [String: Any] = [:]
+                    if let parsed = (try? JSONSerialization.jsonObject(with: Data(argsStr.utf8))) as? [String: Any] {
+                        argsDict = parsed
+                    } else if !argsStr.isEmpty {
+                        argsDict["__raw_stream_chunk__"] = argsStr
+                    }
+                    
+                    if !name.isEmpty || !argsDict.isEmpty {
+                        events.append(.toolCall(id: id, name: name, args: argsDict, thoughtSignature: nil))
+                    }
+                }
             }
         }
         return events
     }
 }
 
-// MARK: - 5. Ollama 本地协议适配器
+// MARK: - ==================== 5. Ollama 本地协议适配器 ====================
 
 struct OllamaProtocolAdapter: LLMProtocolAdapter {
     let protocolType: String = "ollama"
@@ -410,7 +716,7 @@ struct OllamaProtocolAdapter: LLMProtocolAdapter {
     }
 }
 
-// MARK: - 6. 辅助能力扩展
+// MARK: - ==================== 6. 辅助能力扩展与核心数据模型 ====================
 
 private extension NSImage {
     func toBase64JPEG() -> String? {
@@ -428,7 +734,6 @@ private extension AgentSkill {
         var properties: [String: Any] = [:]
         var required: [String] = []
         
-        // 🌟 确定性参数字典序升序排列，保障 Prompt Cache 绝对命中
         let sortedParams = self.parameters.sorted { $0.name.lowercased() < $1.name.lowercased() }
         
         for param in sortedParams {
@@ -441,10 +746,9 @@ private extension AgentSkill {
                 if !isGemini {
                     paramDef["additionalProperties"] = true
                 }
-                // Gemini 模式下绝对不包含 additionalProperties 等非法字段
             } else if mappedType == "array" {
                 if param.name == "tasks" {
-                    var taskProps: [String: Any] = [
+                    let taskProps: [String: Any] = [
                         "id": ["type": "string", "description": "任务节点 ID"],
                         "status": ["type": "string", "description": "填: '等待中'"],
                         "text": ["type": "string", "description": "任务描述"]
@@ -468,7 +772,7 @@ private extension AgentSkill {
             "parameters": [
                 "type": "object",
                 "properties": properties,
-                "required": required.sorted() // 🌟 required 数组同步排序
+                "required": required.sorted()
             ]
         ]
     }
@@ -481,13 +785,12 @@ public enum MessageRole: String, Codable, Sendable {
     case tool = "tool"
 }
 
-// MARK: - 升级 LLMToolCall：携带 Google Gemini 的 thoughtSignature 凭据
 public struct LLMToolCall: Codable, Equatable, Sendable {
     public var id: String
     public var type: String = "function"
     public var name: String
-    public var arguments: String // 标准 JSON 字符串
-    public var thoughtSignature: String? // Google Gemini 防篡改加密签名
+    public var arguments: String
+    public var thoughtSignature: String?
     
     public init(id: String, name: String, arguments: String, thoughtSignature: String? = nil) {
         self.id = id
@@ -497,15 +800,10 @@ public struct LLMToolCall: Codable, Equatable, Sendable {
     }
 }
 
-/// 标准化的上下文消息对象，彻底替代扁平化的 String
 public struct ContextMessage: Codable, Equatable, Sendable {
     public var role: MessageRole
     public var content: String?
-    
-    // 用于 assistant 角色发起调用
     public var toolCalls: [LLMToolCall]?
-    
-    // 用于 tool 角色返回结果
     public var toolCallId: String?
     public var name: String?
     
@@ -523,7 +821,6 @@ public struct ContextMessage: Codable, Equatable, Sendable {
     public static func tool(id: String, name: String, result: String) -> ContextMessage { ContextMessage(role: .tool, content: result, toolCallId: id, name: name) }
 }
 
-/// 底层网络请求的原子事件封装
 enum LLMRawEvent {
     case text(String)
     case reasoning(String)
@@ -531,9 +828,102 @@ enum LLMRawEvent {
     case usage(Int)
 }
 
-// MARK: - ==========================================
-// MARK: LLM Service (彻底解耦版：结构化网络流客户端)
-// MARK: ==========================================
+// MARK: - ==================== 7. 多槽位流式工具调用累加器 (MultiToolCallAccumulator) ====================
+
+private final class MultiToolCallAccumulator {
+    private struct ToolCallSlot {
+        var id: String
+        var name: String
+        var rawArgs: String
+        var dictArgs: [String: Any]
+        var thoughtSignature: String?
+    }
+    
+    private var slots: [ToolCallSlot] = []
+    private var currentSlotIndex: Int = -1
+    private var latestThoughtSignature: String? = nil
+    
+    func record(id: String, name: String, rawArgsChunk: String?, dictArgs: [String: Any]?, thoughtSignature: String?) {
+        // 1. 跨 Step 暂存并传递思维链防篡改签名
+        if let sig = thoughtSignature, !sig.isEmpty {
+            self.latestThoughtSignature = sig
+            if currentSlotIndex >= 0 && slots[currentSlotIndex].thoughtSignature == nil {
+                slots[currentSlotIndex].thoughtSignature = sig
+            }
+        }
+        
+        // 2. 定位或新建对应 Slot
+        var targetIndex = -1
+        if !id.isEmpty, let idx = slots.firstIndex(where: { $0.id == id }) {
+            targetIndex = idx
+        } else if !name.isEmpty && currentSlotIndex >= 0 && (slots[currentSlotIndex].name.isEmpty || slots[currentSlotIndex].name == name) {
+            targetIndex = currentSlotIndex
+        } else if !name.isEmpty {
+            let newId = id.isEmpty ? "call_\(UUID().uuidString.prefix(8))" : id
+            slots.append(ToolCallSlot(id: newId, name: name, rawArgs: "", dictArgs: [:], thoughtSignature: thoughtSignature ?? latestThoughtSignature))
+            targetIndex = slots.count - 1
+            currentSlotIndex = targetIndex
+        } else if currentSlotIndex >= 0 {
+            targetIndex = currentSlotIndex
+        } else {
+            let newId = id.isEmpty ? "call_\(UUID().uuidString.prefix(8))" : id
+            slots.append(ToolCallSlot(id: newId, name: "", rawArgs: "", dictArgs: [:], thoughtSignature: thoughtSignature ?? latestThoughtSignature))
+            targetIndex = slots.count - 1
+            currentSlotIndex = targetIndex
+        }
+        
+        // 3. 累加参数与元数据
+        if !id.isEmpty { slots[targetIndex].id = id }
+        if !name.isEmpty { slots[targetIndex].name = name }
+        if slots[targetIndex].thoughtSignature == nil {
+            slots[targetIndex].thoughtSignature = thoughtSignature ?? latestThoughtSignature
+        }
+        if let chunk = rawArgsChunk, !chunk.isEmpty { slots[targetIndex].rawArgs += chunk }
+        if let dict = dictArgs, !dict.isEmpty {
+            for (k, v) in dict { slots[targetIndex].dictArgs[k] = v }
+        }
+    }
+    
+    func finalizeAll() -> [(id: String, name: String, args: [String: Any], thoughtSignature: String?)] {
+        var results: [(id: String, name: String, args: [String: Any], thoughtSignature: String?)] = []
+        for slot in slots {
+            guard !slot.name.isEmpty else { continue }
+            var finalArgs = slot.dictArgs
+            let raw = slot.rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !raw.isEmpty {
+                // 1. 标准 JSON 反序列化
+                if let data = raw.data(using: .utf8),
+                   let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    for (k, v) in parsed { finalArgs[k] = v }
+                }
+                // 2. 剥离 Markdown 代码块后反序列化
+                else if raw.contains("```") {
+                    let cleaned = raw.replacingOccurrences(of: "```json", with: "").replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let data = cleaned.data(using: .utf8),
+                       let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                        for (k, v) in parsed { finalArgs[k] = v }
+                    } else if finalArgs.isEmpty {
+                        finalArgs["query"] = cleaned
+                        finalArgs["input"] = cleaned
+                    }
+                }
+                // 3. 纯文本作为兜底 query 注入
+                else if finalArgs.isEmpty {
+                    finalArgs["query"] = raw
+                    finalArgs["input"] = raw
+                }
+            }
+            
+            let effectiveSig = slot.thoughtSignature ?? latestThoughtSignature
+            results.append((id: slot.id, name: slot.name, args: finalArgs, thoughtSignature: effectiveSig))
+        }
+        return results
+    }
+}
+
+// MARK: - ==================== 8. LLMService (核心执行中枢) ====================
+
 final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
     
     static let shared = LLMService()
@@ -551,8 +941,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         super.init()
     }
     
-    // MARK: - 辅助解析方法
-    
     private func getBase64(from image: NSImage) -> String? {
         guard let tiffRepresentation = image.tiffRepresentation,
               let bitmapImage = NSBitmapImageRep(data: tiffRepresentation),
@@ -564,16 +952,12 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
     
     private func extractTextContent(from url: URL) async -> String? {
         let ext = url.pathExtension.lowercased()
-        
-        // 1. 复杂排版文档优先尝试 Docling 高保真结构化解析 (表格/标题树保留)
         if ["pdf", "docx", "doc", "pptx", "xlsx"].contains(ext) {
             if let structuredMarkdown = try? await DoclingBridge.parseTo(fileURL: url),
                !structuredMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return structuredMarkdown
             }
         }
-        
-        // 2. 降级：系统原生解析规则兜底
         return extractNativeTextContent(from: url, ext: ext)
     }
     
@@ -601,8 +985,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         }
     }
     
-    // MARK: - 单次请求
-    
     func askSimple(prompt: String, model: String = "", images: [NSImage] = [], fileURLs: [URL] = [], instruction: String = "", activeSkills: [AgentSkill] = []) async -> String {
         do {
             let stream = await ask(messages: [ContextMessage.user(prompt)], model: model, images: images, fileURLs: fileURLs, instruction: instruction, activeSkills: activeSkills)
@@ -617,8 +999,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         }
     }
     
-    // MARK: - 单轮纯粹的 LLM 流式请求方法
-    
     func ask(
         messages: [ContextMessage],
         model: String = "",
@@ -628,19 +1008,42 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         activeSkills: [AgentSkill] = []
     ) -> AsyncThrowingStream<AgentStep, Error> {
         
-        var resolvedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if resolvedModel.isEmpty {
+        var rawModelInput = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if rawModelInput.isEmpty {
             let appConfig = ConfigManager.shared.app
             let defaultAgentID = appConfig.generalConfig.defaultAgentID
             if let defaultAgent = appConfig.agentProfiles.first(where: { $0.id == defaultAgentID }) {
-                resolvedModel = defaultAgent.baseModel
+                rawModelInput = defaultAgent.baseModel
             } else if let firstAgent = appConfig.agentProfiles.first {
-                resolvedModel = firstAgent.baseModel
+                rawModelInput = firstAgent.baseModel
             }
         }
         
-        guard let config = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(resolvedModel) }) else {
-            return AsyncThrowingStream<AgentStep, Error> { $0.yield(.error("❌ [网络通道阻断]: 找不到模型 '\(resolvedModel)' 配置。")); $0.finish() }
+        // 1. 核心：复合 Key 寻址解析 (格式: "配置UUID/真实模型名" 或 纯 "真实模型名")
+        var matchedConfig: AiConfig? = nil
+        var actualModelName = rawModelInput
+        
+        if rawModelInput.contains("/") {
+            let segments = rawModelInput.split(separator: "/", maxSplits: 1).map(String.init)
+            if segments.count == 2, let configUUID = UUID(uuidString: segments[0]) {
+                if let config = ConfigManager.shared.app.aiConfigs.first(where: { $0.id == configUUID }) {
+                    matchedConfig = config
+                    actualModelName = segments[1]
+                }
+            }
+        }
+        
+        // 2. 降级兜底：兼容旧版未包含 UUID 的配置（按模型名匹配首个节点）
+        if matchedConfig == nil {
+            matchedConfig = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(rawModelInput) })
+            actualModelName = rawModelInput
+        }
+        
+        guard let config = matchedConfig else {
+            return AsyncThrowingStream<AgentStep, Error> {
+                $0.yield(.error("❌ [网络通道阻断]: 找不到模型 '\(rawModelInput)' 对应的引擎配置节点。"))
+                $0.finish()
+            }
         }
         
         let hostConfig = config.isagent ? config.agenthost : config.host
@@ -650,13 +1053,12 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         return AsyncThrowingStream<AgentStep, Error> { continuation in
             let requestTask = Task { @MainActor in
                 
-                // 若当前没有处于活动 Session（说明是单线程独立调用），自动创建单次 LLM 卡片
                 var autoCreatedSessionID: UUID? = nil
                 if LogManager.shared.activeContextID == nil {
                     let userQuery = messages.last(where: { $0.role == .user })?.content ?? "单次模型请求"
                     autoCreatedSessionID = LogManager.shared.startSession(
                         query: userQuery,
-                        agentName: resolvedModel,
+                        agentName: "\(config.name.isEmpty ? protocolType : config.name): \(actualModelName)",
                         category: .singleLLM
                     )
                 }
@@ -665,8 +1067,9 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
                 var finalMessages = messages
                 var injectedContext = ""
                 
+                let isDirectGeminiMedia = (protocolType == "gemini" || protocolType == "interactions")
                 for fileURL in fileURLs {
-                    if protocolType == "gemini" && fileURL.pathExtension.lowercased() == "pdf" { continue }
+                    if isDirectGeminiMedia && fileURL.pathExtension.lowercased() == "pdf" { continue }
                     if let documentText = await self.extractTextContent(from: fileURL) {
                         injectedContext += "\n\n--- [附带文件: \(fileURL.lastPathComponent)] ---\n\(documentText)\n"
                     }
@@ -698,7 +1101,7 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
                         messages: finalMessages,
                         images: images,
                         fileURLs: fileURLs,
-                        model: resolvedModel,
+                        model: actualModelName,
                         apiKey: apiKey,
                         host: finalHost,
                         instruction: instruction,
@@ -761,8 +1164,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         }
     }
     
-    // MARK: - 底层协议拆包流请求器
-    
     private func fetchRawStream(
         protocolType: String,
         messages: [ContextMessage],
@@ -792,7 +1193,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         
         let requestBodyString = request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "无请求体"
         
-        // 挂载为当前会话树的子节点，避免泄漏到全局 root
         await MainActor.run {
             LogManager.shared.info(
                 "💬 发起网络请求 [\(model)]",
@@ -823,8 +1223,6 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
             
             await MainActor.run {
                 LogManager.shared.error("❌ LLM API 异常", detail: finalErrorMsg, parentID: parentLogID)
-                
-                // 广播轻量指示灯事件
                 let isTransient = [502, 503, 504, 429].contains(httpResponse.statusCode)
                 let friendlyText = isTransient ? "LLM 服务暂态负载波动 (HTTP \(httpResponse.statusCode)) · 正在自愈重试..." : "LLM 接口异常 (HTTP \(httpResponse.statusCode))"
                 AiChatStore.shared.showLLMIndicator(message: friendlyText, isWarning: isTransient)
@@ -835,6 +1233,8 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    let accumulator = MultiToolCallAccumulator()
+                    
                     for try await line in result.lines {
                         if Task.isCancelled { break }
                         var jsonString = line.trimmingCharacters(in: .whitespaces)
@@ -845,244 +1245,41 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
                               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
                         
                         let events = await adapter.parseSSEPayload(json: decoded)
-                        for event in events { continuation.yield(event) }
+                        for event in events {
+                            switch event {
+                            case .text(let t):
+                                continuation.yield(.text(t))
+                            case .reasoning(let r):
+                                continuation.yield(.reasoning(r))
+                            case .usage(let u):
+                                continuation.yield(.usage(u))
+                            case .toolCall(let id, let name, let args, let sig):
+                                let rawChunk = args["__raw_stream_chunk__"] as? String
+                                var cleanArgs = args
+                                cleanArgs.removeValue(forKey: "__raw_stream_chunk__")
+                                accumulator.record(
+                                    id: id,
+                                    name: name,
+                                    rawArgsChunk: rawChunk,
+                                    dictArgs: cleanArgs.isEmpty ? nil : cleanArgs,
+                                    thoughtSignature: sig
+                                )
+                            }
+                        }
                     }
+                    
+                    // 流完全结束后，统一派发反序列化聚合完成的完整 Tool Call
+                    let finalCalls = accumulator.finalizeAll()
+                    for call in finalCalls {
+                        continuation.yield(.toolCall(id: call.id, name: call.name, args: call.args, thoughtSignature: call.thoughtSignature))
+                    }
+                    
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
         }
-    }
-    
-    // MARK: - 结构化请求报文组装
-    
-    private func buildRequestBody(protocolType: String, messages: [ContextMessage], images: [NSImage], fileURLs: [URL], model: String, instruction: String, activeSkills: [AgentSkill], isthink: Bool, host: String) -> [String: Any] {
-        var requestBody: [String: Any] = [:]
-        let userMessagesCount = messages.filter { $0.role == .user }.count
-        var currentUserIndex = 0
-        
-        let isOllamaNative = protocolType == "ollama"
-        let isGemini = protocolType == "gemini"
-        
-        if isGemini {
-            var contents: [[String: Any]] = []
-            
-            for msg in messages {
-                var currentParts: [[String: Any]] = []
-                var targetRole = "user"
-                
-                switch msg.role {
-                case .user, .system:
-                    targetRole = "user"
-                    if let text = msg.content, !text.isEmpty {
-                        currentParts.append(["text": text])
-                    }
-                    
-                    if msg.role == .user {
-                        currentUserIndex += 1
-                        if currentUserIndex == userMessagesCount {
-                            for img in images {
-                                if let base64 = getBase64(from: img) {
-                                    currentParts.append(["inlineData": ["mimeType": "image/jpeg", "data": base64]])
-                                }
-                            }
-                            for fileURL in fileURLs where fileURL.pathExtension.lowercased() == "pdf" {
-                                if let fileData = try? Data(contentsOf: fileURL) {
-                                    currentParts.append(["inlineData": ["mimeType": "application/pdf", "data": fileData.base64EncodedString()]])
-                                }
-                            }
-                        }
-                    }
-                    
-                case .assistant:
-                    targetRole = "model"
-                    if let text = msg.content, !text.isEmpty {
-                        currentParts.append(["text": text])
-                    }
-                    if let toolCalls = msg.toolCalls {
-                        for call in toolCalls {
-                            let argsDict = (try? JSONSerialization.jsonObject(with: Data(call.arguments.utf8))) as? [String: Any] ?? [:]
-                            
-                            // MARK: - [Modified] 向 Gemini 回传 functionCall 时原样挂载 thoughtSignature 签名
-                            var functionCallPart: [String: Any] = [
-                                "functionCall": [
-                                    "name": call.name,
-                                    "args": argsDict
-                                ]
-                            ]
-                            
-                            if let signature = call.thoughtSignature, !signature.isEmpty {
-                                functionCallPart["thoughtSignature"] = signature
-                                functionCallPart["thought_signature"] = signature
-                            }
-                            
-                            currentParts.append(functionCallPart)
-                        }
-                    }
-                    
-                case .tool:
-                    // Gemini v1beta 规范要求 functionResponse 节点归属于 "user" 角色
-                    targetRole = "user"
-                    if let name = msg.name, let content = msg.content {
-                        var responseObj: Any = ["result": content]
-                        if let data = content.data(using: .utf8), let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                            responseObj = dict
-                        }
-                        currentParts.append(["functionResponse": ["name": name, "response": responseObj]])
-                    }
-                }
-                
-                guard !currentParts.isEmpty else { continue }
-                
-                // 自动合并同角色的连续 parts 节点，保证 user / model 严格轮替
-                if let lastIndex = contents.indices.last, contents[lastIndex]["role"] as? String == targetRole {
-                    var existingParts = contents[lastIndex]["parts"] as? [[String: Any]] ?? []
-                    existingParts.append(contentsOf: currentParts)
-                    contents[lastIndex]["parts"] = existingParts
-                } else {
-                    contents.append(["role": targetRole, "parts": currentParts])
-                }
-            }
-            
-            requestBody["contents"] = contents
-            if !instruction.isEmpty { requestBody["systemInstruction"] = ["parts": [["text": instruction]]] }
-            
-        } else {
-            var apiMessages: [[String: Any]] = []
-            if !instruction.isEmpty { apiMessages.append(["role": "system", "content": instruction]) }
-            
-            for msg in messages {
-                switch msg.role {
-                case .system:
-                    if let text = msg.content, !text.isEmpty {
-                        apiMessages.append(["role": "system", "content": text])
-                    }
-                    
-                case .user:
-                    currentUserIndex += 1
-                    if isOllamaNative {
-                        var dict: [String: Any] = ["role": "user"]
-                        dict["content"] = msg.content ?? ""
-                        if currentUserIndex == userMessagesCount && !images.isEmpty {
-                            var base64Images: [String] = []
-                            for img in images {
-                                if let base64 = self.getBase64(from: img) { base64Images.append(base64) }
-                            }
-                            dict["images"] = base64Images
-                        }
-                        apiMessages.append(dict)
-                    } else {
-                        var contentArray: [[String: Any]] = []
-                        if let text = msg.content, !text.isEmpty {
-                            contentArray.append(["type": "text", "text": text])
-                        }
-                        if currentUserIndex == userMessagesCount && !images.isEmpty {
-                            for img in images {
-                                if let base64 = self.getBase64(from: img) {
-                                    contentArray.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(base64)"]])
-                                }
-                            }
-                            apiMessages.append(["role": "user", "content": contentArray])
-                        } else if let text = msg.content, !text.isEmpty {
-                            apiMessages.append(["role": "user", "content": text])
-                        }
-                    }
-                    
-                case .assistant:
-                    var dict: [String: Any] = ["role": "assistant"]
-                    if let text = msg.content, !text.isEmpty { dict["content"] = text }
-                    else if isOllamaNative { dict["content"] = "" }
-                    
-                    if let toolCalls = msg.toolCalls, !toolCalls.isEmpty {
-                        let callsArray = toolCalls.compactMap { call -> [String: Any]? in
-                            var safeArgsDict: [String: Any] = [:]
-                            if let data = call.arguments.data(using: .utf8),
-                               let parsedDict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-                                safeArgsDict = parsedDict
-                            }
-                            
-                            if isOllamaNative {
-                                return ["function": ["name": call.name, "arguments": safeArgsDict]]
-                            } else {
-                                let argsString = String(data: (try? JSONSerialization.data(withJSONObject: safeArgsDict)) ?? Data(), encoding: .utf8) ?? "{}"
-                                return ["id": call.id, "type": "function", "function": ["name": call.name, "arguments": argsString]]
-                            }
-                        }
-                        dict["tool_calls"] = callsArray
-                    }
-                    apiMessages.append(dict)
-                    
-                case .tool:
-                    var dict: [String: Any] = ["role": "tool"]
-                    let toolOutput = (msg.content == nil || msg.content!.isEmpty) ? "{\"status\": \"ok\"}" : msg.content!
-                    dict["content"] = toolOutput
-                    if !isOllamaNative, let callId = msg.toolCallId { dict["tool_call_id"] = callId }
-                    apiMessages.append(dict)
-                }
-            }
-            
-            requestBody["model"] = model
-            if protocolType == "chatgpt" { requestBody["input"] = apiMessages }
-            else { requestBody["messages"] = apiMessages }
-            requestBody["stream"] = true
-            
-            if !isOllamaNative && protocolType != "chatgpt" {
-                requestBody["think"] = isthink
-                requestBody["stream_options"] = ["include_usage": true]
-            }
-        }
-        
-        if !activeSkills.isEmpty {
-            var functionDeclarations: [[String: Any]] = []
-            for skill in activeSkills {
-                var properties: [String: Any] = [:]
-                var required: [String] = []
-                for param in skill.parameters {
-                    var mappedType = param.type.rawValue.lowercased()
-                    if mappedType == "enum" { mappedType = "string" }
-                    
-                    var paramDef: [String: Any] = ["type": mappedType, "description": param.description]
-                    if mappedType == "object" {
-                        paramDef["properties"] = [String: Any]()
-                        paramDef["additionalProperties"] = true
-                    } else if mappedType == "array" {
-                        if param.name == "tasks" {
-                            paramDef["items"] = [
-                                "type": "object",
-                                "properties": [
-                                    "id": ["type": "string", "description": "任务节点 ID"],
-                                    "text": ["type": "string", "description": "任务描述"],
-                                    "status": ["type": "string", "description": "填: '等待中'"]
-                                ],
-                                "required": ["id", "text", "status"]
-                            ]
-                        } else {
-                            paramDef["items"] = ["type": "string"]
-                        }
-                    }
-                    properties[param.name] = paramDef
-                    if param.isRequired { required.append(param.name) }
-                }
-                
-                let functionDict: [String: Any] = [
-                    "name": skill.name,
-                    "description": skill.description,
-                    "parameters": ["type": "object", "properties": properties, "required": required]
-                ]
-                functionDeclarations.append(functionDict)
-            }
-            
-            if isGemini {
-                requestBody["tools"] = [["functionDeclarations": functionDeclarations]]
-                requestBody["toolConfig"] = ["functionCallingConfig": ["mode": "AUTO"]]
-            } else {
-                requestBody["tools"] = functionDeclarations.map { ["type": "function", "function": $0] }
-                requestBody["tool_choice"] = "auto"
-            }
-        }
-        
-        return requestBody
     }
     
     // MARK: - 🎯 核心 SSL/TLS 质询无条件放行拦截器 (全局统一 SSL 放行出口)

@@ -311,7 +311,6 @@ struct PersonaMentalDeltaHook: PostExecutionHook {
         guard let pID = personaID,
               let deltaJSON = fullText.extractPersonaDelta() else { return }
         PersonaManager.shared.applyMentalDelta(for: pID, deltaJSON: deltaJSON)
-        PersonaManager.shared.recordInteraction(personaID: pID)
     }
 }
 
