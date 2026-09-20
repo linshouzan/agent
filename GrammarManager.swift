@@ -2,7 +2,7 @@
 // 文件名：GrammarManager.swift
 // 文件说明：适用于 macOS 14+ 的 Agent 智能体意图与真值语义收敛中枢
 //
-// 核心架构与运行逻辑说明：
+// 核心解构架构拓扑 (Domain-Driven Architecture):
 //
 //////////////////////////////////////////////////////////////////
 
@@ -16,66 +16,109 @@ import Foundation
 // MARK: - 1. 物理真值校验收敛器 (Physical Truth Verifier)
 public struct PhysicalTruthVerifier: Sendable {
     
-    /// 结构化显式错误特征前缀
-    private static let explicitErrorMarkers: Set<String> = [
-        "❌", "⚠️", "Exception:", "Error:", "FATAL:", "panic:", "Traceback (most recent call last):"
-    ]
-    
     /// 工具返回结构体字典中的错误键
     private static let errorJsonKeys: Set<String> = [
-        "error", "err_code", "failed", "exception", "errorMessage"
+        "error", "err_code", "failed", "exception", "errorMessage", "err", "errorCode", "errMsg"
     ]
     
-    /// 综合判别物理操作是否发生实质性失败
+    /// 综合判别物理操作是否发生实质性失败 (统一重定向至分层真值确权入口，杜绝单字符误杀)
     /// - Parameters:
     ///   - output: 工具执行原始返回文本
     ///   - exitCode: 进程物理退出码 (非 0 即判定失败)
     public static func hasPhysicalError(output: String, exitCode: Int? = nil) -> Bool {
-        if let code = exitCode, code != 0 { return true }
-        
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return false }
-        
-        // 1. 匹配显式错误特征
-        if explicitErrorMarkers.contains(where: { trimmed.contains($0) }) {
-            return true
-        }
-        
-        // 2. 探查顶层结构化 JSON 是否携带错误键
-        if trimmed.hasPrefix("{"),
-           let data = trimmed.data(using: .utf8),
-           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return errorJsonKeys.contains(where: { dict[$0] != nil })
-        }
-        
-        return false
+        return isExecutionFailed(toolName: "", output: output, exitCode: exitCode)
     }
     
     // MARK: - 统一入口：结合工具语义与只读防误杀机制
-    /// 综合判别工具执行状态 (彻底避免手册文档/只读正文中出现 "error" 等词汇造成的误杀)
+    /// 综合判别工具执行状态 (彻底避免手册文档/只读正文中出现 "command not found" 等词汇造成的误杀)
+    /// - Parameters:
+    ///   - toolName: 执行的工具名称 (如 "read_skill_manual", "weaver-e9-assistant" 等)
+    ///   - output: 工具执行原始返回文本
+    ///   - exitCode: 进程物理退出码 (可选)
     public static func isExecutionFailed(toolName: String, output: String, exitCode: Int? = nil) -> Bool {
-        if let code = exitCode, code != 0 { return true }
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return false }
         
-        // 1. 显式以错误标识前缀开头
-        if trimmed.hasPrefix("❌") || trimmed.hasPrefix("Fatal:") || trimmed.hasPrefix("FATAL:") || trimmed.hasPrefix("panic:") || trimmed.hasPrefix("Traceback (most recent call last):") {
+        let lower = trimmed.lowercased()
+        let lowerName = toolName.lowercased()
+        
+        // MARK: - Level 0: 只读元工具与技术文档沙盒豁免 (Meta-Tools Sandboxing)
+        // 技术手册、代码说明与排障指南中必然包含 "command not found"、"error"、"syntax error" 等排查示例
+        // 绝不可使用检测物理进程崩溃的标准去扫描只读技术文档的正文
+        let isMetaTool = lowerName == "read_skill_manual" ||
+                         lowerName == "knowledge_search" ||
+                         lowerName == "skill_memory_manager" ||
+                         lowerName == "finish_task" ||
+                         lowerName.contains("manual") ||
+                         lowerName.contains("read") ||
+                         lowerName.contains("doc")
+        
+        if isMetaTool {
+            let explicitMetaErrorPrefixes = [
+                "❌ 参数错误",
+                "❌ 安全拦截",
+                "❌ 拒绝执行",
+                "❌ 未找到",
+                "❌ 找不到",
+                "⚠️ 未找到对应文档",
+                "⚠️ 找不到指定文档",
+                "找不到文档",
+                "文件不存在"
+            ]
+            return explicitMetaErrorPrefixes.contains(where: { trimmed.hasPrefix($0) })
+        }
+        
+        // MARK: - Level 1: 系统底层框架明确拦截
+        if trimmed.hasPrefix("❌ 参数错误") ||
+           trimmed.hasPrefix("❌ 安全拦截") ||
+           trimmed.hasPrefix("❌ 拒绝执行") ||
+           trimmed.hasPrefix("❌ 执行引擎异常") ||
+           trimmed.hasPrefix("❌ CLI 进程启动异常") ||
+           trimmed.hasPrefix("❌ AppleScript 执行失败") ||
+           trimmed.hasPrefix("❌ API 请求异常") ||
+           trimmed.hasPrefix("❌ MCP 节点阻断") ||
+           trimmed.hasPrefix("Fatal:") ||
+           trimmed.hasPrefix("FATAL:") ||
+           trimmed.hasPrefix("panic:") {
             return true
         }
         
-        // 2. 结构化 JSON 错误字段探查 (排查 {"error": null} 或 {"status": "success"} 的假阳性)
+        // MARK: - Level 2: 正向事实终审优先 (Positive Dominance)
+        // 只要明确输出了可用、可达或成功结论，优先推翻所有局部警告与未配置标记
+        let positiveSignatures = [
+            "✅",
+            "可用",
+            "能取数据",
+            "可达",
+            "已连接",
+            "执行成功",
+            "操作成功",
+            "\"success\": true",
+            "\"success\":true",
+            "\"status\": \"ok\"",
+            "\"status\":\"ok\"",
+            "\"status\": \"success\"",
+            "type:SUCCESS",
+            "ready",
+            "verified"
+        ]
+        if positiveSignatures.contains(where: { trimmed.contains($0) }) {
+            return false
+        }
+        
+        // MARK: - Level 3: 结构化 JSON 协议对账
         if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")),
            let data = trimmed.data(using: .utf8),
            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             for key in errorJsonKeys {
                 if let val = dict[key] {
-                    if let str = val as? String, !str.isEmpty && str.lowercased() != "null" && str.lowercased() != "ok" {
+                    if let str = val as? String, !str.isEmpty && str.lowercased() != "null" && str.lowercased() != "ok" && str.lowercased() != "success" {
                         return true
                     }
                     if let boolVal = val as? Bool, boolVal {
                         return true
                     }
-                    if let intVal = val as? Int, intVal != 0 {
+                    if let intVal = val as? Int, intVal != 0 && intVal != 200 {
                         return true
                     }
                 }
@@ -83,17 +126,70 @@ public struct PhysicalTruthVerifier: Sendable {
             if let status = dict["status"] as? String, status.lowercased() == "failed" || status.lowercased() == "error" {
                 return true
             }
+            return false
         }
         
-        // 3. 只读/查阅文档/知识库检索类工具防误杀判定
-        let lowerName = toolName.lowercased()
-        let isDocOrQueryTool = lowerName.contains("manual") || lowerName.contains("read") || lowerName.contains("search") || lowerName.contains("knowledge") || lowerName.contains("fetch") || lowerName.contains("list") || lowerName.contains("doc")
-        if isDocOrQueryTool {
+        // MARK: - Level 4: 物理进程崩溃与 CLI 语法报错 (仅对真实命令调用生效)
+        let isCommandLineCrash = lower.contains("command not found") ||
+                                 lower.contains("not executable") ||
+                                 lower.contains("segmentation fault") ||
+                                 lower.contains("syntaxerror:") ||
+                                 lower.contains("traceback (most recent call last):") ||
+                                 lower.contains("unknown command:") ||
+                                 lower.contains("unknown flag:") ||
+                                 lower.contains("unknown option:") ||
+                                 lower.contains("invalid option") ||
+                                 lower.contains("flag provided but not defined") ||
+                                 lower.contains("usage: install [") ||
+                                 lower.contains("code 127")
+        if isCommandLineCrash {
+            return true
+        }
+        
+        // MARK: - Level 5: 环境探针面板与行级键值属性过滤
+        let isProbeOutput = trimmed.contains("[--check]") ||
+                            trimmed.contains("探活") ||
+                            trimmed.contains("状态 ·") ||
+                            trimmed.contains("认证状态") ||
+                            trimmed.contains("table_info")
+        if isProbeOutput {
             return trimmed.hasPrefix("❌") || trimmed.hasPrefix("⚠️ 未找到") || trimmed.hasPrefix("找不到")
         }
         
-        // 4. 通用 CLI / 物理变异写入类指令判定
-        return hasPhysicalError(output: output, exitCode: exitCode)
+        let lines = trimmed.components(separatedBy: .newlines)
+        var fatalErrorLineCount = 0
+        
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmedLine.isEmpty else { continue }
+            
+            // 过滤格式边框线
+            if trimmedLine.hasPrefix("=") || trimmedLine.hasPrefix("-") || trimmedLine.hasPrefix("─") || trimmedLine.hasPrefix("═") {
+                continue
+            }
+            
+            // 状态面板中的普通属性说明行（例如: "encPwd ❌ 未配置", "feature: disabled"）
+            let isAttributeLine = (trimmedLine.contains(":") || trimmedLine.contains("：") || trimmedLine.contains("  ")) &&
+                                  (trimmedLine.contains("未配置") || trimmedLine.contains("未开启") || trimmedLine.contains("disabled") || trimmedLine.contains("none") || trimmedLine.contains("noToken"))
+            if isAttributeLine {
+                continue
+            }
+            
+            if trimmedLine.hasPrefix("❌ ") || trimmedLine.hasPrefix("error:") || trimmedLine.hasPrefix("Error:") {
+                fatalErrorLineCount += 1
+            }
+        }
+        
+        if fatalErrorLineCount > 0 {
+            return true
+        }
+        
+        // MARK: - Level 6: 退出码终审
+        if let code = exitCode, code != 0 {
+            return true
+        }
+        
+        return false
     }
 }
 

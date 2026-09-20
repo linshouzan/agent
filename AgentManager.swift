@@ -2,7 +2,7 @@
 // 文件名：AgentManager.swift
 // 文件说明：适用于 macOS 14+ 的 Agent 智能体编排、模型原生自主内省与 AI 引擎配置中心 (Swift 6 Ready)
 //
-// 核心架构与运行逻辑说明：
+// 核心解构架构拓扑 (Domain-Driven Architecture):
 // 1. 模型原生自主内省与轻量名录架构 (Model-Native Autonomous Introspection):
 //    - 释放大模型原生深度思考 (Deep Thinking) 能力，通过动态生成 <available_skills_directory> 引导自主检索。
 //    - 默认装配静态核心元工具箱：read_skill_manual（支持渐进式多级文档查阅与沙盒安全防线）与 execute_skill（通用具身动态执行代理）。
@@ -108,6 +108,15 @@ enum AgentToolDispatcher {
             let dialogueInput = invokedToolArgs["dialogue_input"] as? String ?? ""
             let sceneContext = invokedToolArgs["scene_context"] as? String ?? ""
             
+            // 补齐 UI 事件流：派发开始调用通知并定制卡片标题
+            let displayTitle = targetPersonaName.isEmpty ? "🎭 数字分身对戏" : "🎭 [\(targetPersonaName)] 角色对戏"
+            continuation.yield(.toolCallInfo(
+                id: invokedToolId,
+                name: displayTitle,
+                args: invokedToolArgs,
+                thoughtSignature: invokedThoughtSignature
+            ))
+            
             let personaResult = await runPersonaSandbox(
                 personaName: targetPersonaName,
                 dialogueInput: dialogueInput,
@@ -115,7 +124,7 @@ enum AgentToolDispatcher {
                 allowedPersonaIDs: currentAgent.allowedPersonaIDs,
                 continuation: continuation
             )
-            return (invokedToolId, invokedToolName, personaResult, nil, nil, false)
+            return (invokedToolId, displayTitle, personaResult, nil, nil, false)
         }
         
         // 3. 终态结单与无头公证员纯逻辑对账 (Proof-Carrying Gate)
@@ -199,7 +208,10 @@ enum AgentToolDispatcher {
                 rawArgs["raw_command"] = inputStr
             }
         }
-        let safeArgs = coerceArguments(args: rawArgs, skill: skill)
+        
+        // 提取并安全剥离虚拟意图参数，杜绝污染底层脚本执行环境与 REST API
+        var safeArgs = coerceArguments(args: rawArgs, skill: skill)
+        safeArgs.removeValue(forKey: "_action_intent")
         
         // 5. 人类在环授权拦截 (HITL)
         if skill.requiresConfirmation && !autoApprove {
@@ -218,13 +230,14 @@ enum AgentToolDispatcher {
             displayToolName = realSkillName
         }
         
-        continuation.yield(.toolCallInfo(id: invokedToolId, name: displayToolName, args: safeArgs, thoughtSignature: invokedThoughtSignature))
+        // 向 UI 投递携带原始 _action_intent 的 invokedToolArgs，供前端即时呈现意图徽标
+        continuation.yield(.toolCallInfo(id: invokedToolId, name: displayToolName, args: invokedToolArgs, thoughtSignature: invokedThoughtSignature))
         
         // 7. 执行底层引擎并解析 Base64 多模态负载
         let rawResult = await agentVM.executeTool(skill: skill, args: safeArgs, skipConfirmation: true)
         let (processedResult, extractedImg, savedURL) = rawResult.processBase64ImagePayload()
 
-        let isMetaTool = ["finish_task", "read_skill_manual", "execute_skill", "call_sub_agent", "skill_memory_manager"].contains(invokedToolName)
+        let isMetaTool = ["finish_task", "read_skill_manual", "execute_skill", "call_sub_agent", "call_digital_persona", "skill_memory_manager"].contains(invokedToolName)
 
         if !isMetaTool {
             let isExecutionFailed = PhysicalTruthVerifier.hasPhysicalError(output: processedResult)
@@ -425,7 +438,7 @@ enum AgentToolDispatcher {
             .user(dialogueInput)
         ]
         
-        let fallbackModel = ConfigManager.shared.app.agentProfiles.first?.baseModel ?? "gemini-2.0-flash"
+        let fallbackModel = ConfigManager.shared.app.agentProfiles.first?.baseModel ?? ""
         let stream = LLMService.shared.ask(
             messages: sandboxMessages,
             model: fallbackModel,
@@ -497,6 +510,19 @@ enum AgentAutonomyEngine {
             agentManager.agentVM.sharedContext[k] = v
         }
         
+        // 流水线首轮守卫 —— 若请求没有携带历史轮次消息（首轮冷启动），
+        // 强制重置当前便签，杜绝上一任务跨会话残留的 Scratchpad 注入到新任务中
+        if request.historyMessages.isEmpty {
+            agentManager.agentVM.sharedContext.removeValue(forKey: AgentLongTermMemory.scratchpadKey)
+            agentManager.agentVM.sharedContext.removeValue(forKey: StructuredTagContextPlugin.structuredSlotsJsonKey)
+        } else if (agentManager.agentVM.sharedContext[StructuredTagContextPlugin.structuredSlotsJsonKey] ?? "").isEmpty {
+            // 委托拦截器管线自愈恢复历史插槽，杜绝旧会话载入时丢槽
+            AgentContextInterceptorPipeline.shared.restoreFromHistory(
+                messages: request.historyMessages,
+                sharedContext: &agentManager.agentVM.sharedContext
+            )
+        }
+        
         // 1. 解析当前唤醒的 Agent 实体
         let currentAgent: AgentProfile
         if let aID = request.agentID,
@@ -505,7 +531,7 @@ enum AgentAutonomyEngine {
         } else {
             currentAgent = ConfigManager.shared.app.agentProfiles.first ?? AgentProfile(
                 name: "默认助手",
-                baseModel: "gemini-2.0-flash",
+                baseModel: "qwen3.5:4b",
                 systemPrompt: "你是由系统调用的专家，请直接输出高质量专业解答。"
             )
         }
@@ -518,13 +544,16 @@ enum AgentAutonomyEngine {
         let skillsBasePath = ConfigManager.shared.skillsPath?.path ?? ""
         var dynamicActiveSkills: [AgentSkill] = []
         
-        dynamicActiveSkills.removeAll(where: { $0.name == "call_digital_persona" })
+        // 1. 动态挂载数字分身工具 (若当前 Agent 配置了允许访问的分身)
         let boundPersonas = PersonaManager.shared.personas.filter { currentAgent.allowedPersonaIDs.contains($0.id) }
         if !boundPersonas.isEmpty {
             dynamicActiveSkills.append(Skill_CallPersona(boundPersonas: boundPersonas))
         }
         
-        dynamicActiveSkills.sort { $0.name.lowercased() < $1.name.lowercased() }
+        // 2. 动态挂载下属专家委派工具 (若配置了允许委派的 Sub-Agent)
+        if !currentAgent.allowedSubAgentIDs.isEmpty {
+            dynamicActiveSkills.append(Skill_CallAgent())
+        }
 
         // 3. 构造轻量可用技能名录与工具通道
         let hasExecuteSkill = allConfiguredSkills.contains(where: { $0.name == "execute_skill" })
@@ -551,9 +580,11 @@ enum AgentAutonomyEngine {
             
             lightweightCatalog = AgentContextOrchestrator.buildLightweightCatalog(for: equippedBusinessSkills)
         } else {
-            // 简单 Agent 直接挂载业务技能，极简路径无多余元工具代理
-            dynamicActiveSkills = equippedBusinessSkills
+            // 简单 Agent 模式：直接将业务技能合入活跃工具集，不覆盖已有元工具
+            dynamicActiveSkills.append(contentsOf: equippedBusinessSkills)
         }
+        
+        dynamicActiveSkills.sort { $0.name.lowercased() < $1.name.lowercased() }
         
         let activeModelConfig = ConfigManager.shared.app.aiConfigs.first(where: { $0.models.contains(currentAgent.baseModel) })
         let maxContextTokens = activeModelConfig?.maxContextTokens ?? 32000
@@ -573,8 +604,14 @@ enum AgentAutonomyEngine {
             loopMessages.insert(.system(lightweightCatalog), at: 0)
         }
         
-        // 4. 纯净静态系统指令注入
+        // 4. 纯净系统指令注入与团队/分身协作白皮书挂载
         var systemInstruction = currentAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // 注入团队专家与数字分身名录白皮书
+        let teamManifest = agentManager.agentVM.generateTeamManifest(for: currentAgent)
+        if !teamManifest.isEmpty {
+            systemInstruction += "\n" + teamManifest
+        }
         
         // 注入分身性格与口吻信息（仅附加真人活力，不替换 Agent 主体提示词与工具集）
         if let pID = request.personaID {
@@ -626,13 +663,8 @@ enum AgentAutonomyEngine {
 
             // 仅对长任务 Agent 开启 Scratchpad 长期记忆蒸馏
             if hasExecuteSkill {
-                let protectedCount = max(2, currentAgent.keepRecentTurns * 2)
-                let evictingSlice: [ContextMessage] = loopMessages.count > protectedCount
-                    ? Array(loopMessages[0..<(loopMessages.count - protectedCount)])
-                    : []
                 let condensedPad = await AgentLongTermMemory.maybeCondense(
-                    loopMessages: currentRoundMessages,
-                    evicting: evictingSlice,
+                    loopMessages: loopMessages,
                     round: currentIteration,
                     agent: currentAgent,
                     summarizerModel: currentAgent.baseModel,
@@ -642,9 +674,11 @@ enum AgentAutonomyEngine {
                 if let condensedPad {
                     agentManager.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey] = condensedPad
                 }
-                if let padBlock = AgentLongTermMemory.buildInjectionBlock(sharedContext: agentManager.agentVM.sharedContext) {
-                    currentRoundMessages.insert(.system(padBlock), at: 0)
-                }
+            }
+
+            // 普惠注入：无论当前 Agent 是否配备 execute_skill，只要长效记忆槽有值，均在头部稳定注入
+            if let padBlock = AgentLongTermMemory.buildInjectionBlock(sharedContext: agentManager.agentVM.sharedContext) {
+                currentRoundMessages.insert(.system(padBlock), at: 0)
             }
 
             let requestStartTime = Date()
@@ -717,11 +751,9 @@ enum AgentAutonomyEngine {
                 let nsError = error as NSError
                 let lowerError = errorMsg.lowercased()
                 
-                LogManager.shared.error("❌ 模型响应异常", detail: errorMsg, parentID: roundLogID)
-                
                 if error is CancellationError { throw error }
                 
-                // 429 账户额度耗尽 / 欠费拦截
+                // 429 账户额度耗尽 / 欠费拦截 (不可自动重试的硬限制)
                 let isQuotaExceeded = lowerError.contains("quota") || lowerError.contains("billing") || lowerError.contains("exceeded your current quota") || lowerError.contains("insufficient_quota")
                 if isQuotaExceeded {
                     let quotaNotice = """
@@ -737,13 +769,15 @@ enum AgentAutonomyEngine {
                 
                 // 502/503/504 服务端瞬时过载或并发限流自动指数退避重试
                 let isRateLimit = lowerError.contains("rate limit") || lowerError.contains("resource_exhausted") || lowerError.contains("429")
-                let isServerOverload = errorMsg.contains("503") || errorMsg.contains("502") || errorMsg.contains("504") || lowerError.contains("overloaded") || (nsError.domain == "HTTPError" && [429, 502, 503, 504].contains(nsError.code))
+                let isServerOverload = errorMsg.contains("503") || errorMsg.contains("502") || errorMsg.contains("504") || lowerError.contains("overloaded")
+                    || ([429, 502, 503, 504].contains(nsError.code) && (nsError.domain == "HTTPError" || nsError.domain == "LLMClient"))
                 
                 if isServerOverload || isRateLimit {
                     consecutiveErrors += 1
                     if consecutiveErrors >= 5 {
                         let timeoutNotice = "\n\n> ❌ **服务端高负载 / 速率限制重试超时**: 多次自动重试未恢复 (\(errorMsg))，推演已停止。"
                         continuation.yield(.textDelta(timeoutNotice))
+                        LogManager.shared.error("🛑 服务端过载重试超限 (5次)，终止推演", detail: errorMsg, parentID: roundLogID)
                         break
                     }
                     
@@ -756,10 +790,11 @@ enum AgentAutonomyEngine {
                 }
                 
                 // Gemini thought_signature 丢失容错重试
-                if errorMsg.contains("thought_signature") || (nsError.domain == "HTTPError" && nsError.code == 400) {
+                if errorMsg.contains("thought_signature") || ((nsError.domain == "HTTPError" || nsError.domain == "LLMClient") && nsError.code == 400) {
                     consecutiveErrors += 1
                     if consecutiveErrors >= 3 {
                         continuation.yield(.textDelta("\n\n> ❌ **模型交互协议异常**: 无法建立上下文签名 (\(errorMsg))。"))
+                        LogManager.shared.error("🛑 协议上下文签名连续重试失败", detail: errorMsg, parentID: roundLogID)
                         break
                     }
                     loopMessages.append(.assistant(text: "我已感知到系统状态，正在重新规划方案。"))
@@ -767,9 +802,11 @@ enum AgentAutonomyEngine {
                     continue
                 }
                 
+                // 其他未知致命通信错误
                 consecutiveErrors += 1
                 if consecutiveErrors >= 3 {
                     continuation.yield(.textDelta("\n\n> ❌ **模型通信中断**: 连续重试失败: \(errorMsg)"))
+                    LogManager.shared.error("🛑 模型通信中断", detail: errorMsg, parentID: roundLogID)
                     break
                 }
                 
@@ -780,6 +817,13 @@ enum AgentAutonomyEngine {
             }
             
             let rawCleanText = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            // 委托管线提取当轮输出特征，原子化合入底层底账，主业务逻辑零污染
+            AgentContextInterceptorPipeline.shared.ingestEmitted(
+                roundResponseText,
+                sharedContext: &agentManager.agentVM.sharedContext
+            )
+            
             if !hasToolCallInThisRound && rawCleanText.isEmpty && !roundReasoningText.isEmpty {
                 LogManager.shared.warning("⚠️ 检测到推演完成但正文为空且无动作，触发正向自愈", parentID: roundLogID)
                 loopMessages.append(.system("【系统指引】: 逻辑推演已就绪，请通过标准 Tool Call 接口调用物理工具，或直接在正文中输出解答。"))
@@ -816,6 +860,27 @@ enum AgentAutonomyEngine {
                 parentID: roundLogID
             )
             
+            // 只要模型正文中输出了 <card>，零延迟立刻解析并落盘至 sharedContext，消除跨轮滞后
+            if roundResponseText.contains("<card") {
+                var registry = GenericTagBlockRegistry()
+                // 如果当前 Scratchpad 已有旧状态，先保留作为底账
+                if let existingPad = agentManager.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey] {
+                    registry.ingest(text: existingPad)
+                }
+                // 吞噬当前轮次模型刚吐出的新鲜卡片
+                registry.ingest(text: roundResponseText)
+                
+                let updatedPad = registry.formattedMarkdown()
+                if !updatedPad.isEmpty {
+                    agentManager.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey] = updatedPad
+                    LogManager.shared.info(
+                        "🧠 即时同步：结构化卡片已原子化沉淀至 SCRATCHPAD",
+                        detail: "活跃角色/世界网关已写入长效记忆槽",
+                        parentID: roundLogID
+                    )
+                }
+            }
+            
             if hasToolCallInThisRound {
                 textOnlyRounds = 0
                 
@@ -845,18 +910,27 @@ enum AgentAutonomyEngine {
                 }
                 
                 var newlyCapturedImages: [NSImage] = []
+                var lastFailedSkillName = currentAgent.name
+                
                 for res in executionResults {
-                    // 统一接入 PhysicalTruthVerifier 进行高保真物理真值判定，防误杀只读文档
-                    let isExecutionFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: res.name, output: res.result)
+                    let currentArgsDict = currentToolCalls.first(where: { $0.id == res.id })?.args ?? [:]
+                    let targetManualSkill = (currentArgsDict["skill_name"] as? String)
+                        ?? (currentArgsDict["target_skill_name"] as? String)
+                        ?? (res.name == "execute_skill" ? currentAgent.name : res.name)
 
-                    if isExecutionFailed {
+                    // 核心改进：采用零业务硬编码的通用底层调用失败判定
+                    let isInvocationFailed = isGenericInvocationFailure(toolName: res.name, output: res.result)
+
+                    if isInvocationFailed {
                         consecutiveToolFailures += 1
+                        lastFailedSkillName = targetManualSkill
                     } else {
                         consecutiveToolFailures = 0
                     }
 
+                    // 仅对真正的底层语法/执行失败注入自愈诊断，对于业务状态输出保持原样呈现
                     var prunedResultText: String
-                    if isExecutionFailed {
+                    if isInvocationFailed {
                         let diagnostic = ToolExecutionDiagnostic.analyze(errorMessage: res.result)
                         let matchedLessons = await MemoryManager.shared.getToolLessons(for: [res.name], topKPerTool: 2)
                         var reflection = diagnostic.structuredHealingPrompt
@@ -875,24 +949,24 @@ enum AgentAutonomyEngine {
                     
                     let toolName = res.name
                     let trimmedResult = prunedResultText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let currentArgsDict = currentToolCalls.first(where: { $0.id == res.id })?.args ?? [:]
                     let currentArgsSummary = (try? JSONSerialization.data(withJSONObject: currentArgsDict, options: [.sortedKeys]))
                         .flatMap { String(data: $0, encoding: .utf8) } ?? "\(currentArgsDict)"
 
-                    // 仅在自主协议且非报错时进行重复盲猜判定
-                    if hasExecuteSkill && !trimmedResult.isEmpty && !isExecutionFailed {
+                    // 只读元工具（查阅手册、知识库检索、长效记忆）具备幂等性，豁免重复状态阻断
+                    let isReadOnlyMetaTool = toolName == "read_skill_manual" || toolName == "knowledge_search" || toolName == "skill_memory_manager"
+
+                    // 仅对非只读的真实执行指令在重复产生相同非报错反馈时做正向重定向
+                    if hasExecuteSkill && !isReadOnlyMetaTool && !trimmedResult.isEmpty && !isInvocationFailed {
                         if let previousInput = historicalToolExecutionMap[toolName]?[trimmedResult] {
                             prunedResultText = """
-                            【系统强阻断 · 状态一致与命令未命中】:
-                            你下发的指令 [\(currentArgsSummary)] 产生的结果与历史调用 [\(previousInput)] 完全相同（返回了通用帮助或重复数据），表明当前命令或参数系凭空猜测，未命中有效物理功能。
+                            【状态对账提示 · 探测输出未发生变更】:
+                            下发的指令 [\(currentArgsSummary)] 产生的结果与历史调用 [\(previousInput)] 完全相同，表明当前参数未改变目标系统状态。
 
-                            【强制行动指引】:
-                            1. 立即停止下发 execute_skill 尝试盲猜命令。
-                            2. 你的下一个 Tool Call 必须调用 `read_skill_manual(target_skill_name: "\(toolName)", doc_path: "...")` 精读对应业务子文档。
-                            3. 掌握手册中记载的真实子命令与参数格式后，方可继续下发物理执行。
+                            【后续执行指引】:
+                            请调用 `read_skill_manual(target_skill_name: "\(targetManualSkill)", doc_path: "...")` 核对参数或业务前置条件后，再行推进。
                             """
                             LogManager.shared.warning(
-                                "🛑 捕捉到工具 [\(toolName)] 盲猜并重复输出，已注入强阻断深潜指令",
+                                "🛑 捕捉到工具 [\(toolName)] 重复执行且回显未变，已注入重定向校准指引",
                                 parentID: roundLogID
                             )
                         } else {
@@ -905,7 +979,7 @@ enum AgentAutonomyEngine {
                     continuation.yield(.toolCallResult(name: res.name, result: res.result))
                     
                     LogManager.shared.log(
-                        level: isExecutionFailed ? .error : .success,
+                        level: isInvocationFailed ? .error : .success,
                         title: "⚡️ 动作执行 [\(res.name)]",
                         detail: "【执行反馈】:\n\(res.result)",
                         parentID: roundLogID
@@ -915,18 +989,18 @@ enum AgentAutonomyEngine {
                     if let img = res.image { newlyCapturedImages.append(img) }
                 }
 
-                // 物理执行熔断器
+                // 物理执行熔断器 (仅在底层语法调用连续失败达到阈值时触发)
                 let breakerActive = currentAgent.enableCircuitBreaker || currentAgent.executionMode == .fullyAuto
                 if breakerActive && consecutiveToolFailures >= max(1, currentAgent.maxRepetitions) && hasExecuteSkill {
                     let breakerMsg = """
-                    【系统熔断 · 连续 \(consecutiveToolFailures) 次物理执行失败】
-                    已触发异常熔断，禁止继续盲猜下发 execute_skill。
-                    你的下一个动作必须调用 read_skill_manual(target_skill_name: "<最近失败的技能名>", doc_path: "...") 深潜对应业务子文档，
-                    重新校验指令拼写与参数契约、定位失败根因后，方可继续下发物理执行。
+                    【执行保护 · 连续 \(consecutiveToolFailures) 次物理调用异常】
+                    系统已激活执行保护机制。为确保任务推进的确定性，当前执行假设需重新校准。
+                    请优先调用 `read_skill_manual(target_skill_name: "\(lastFailedSkillName)", doc_path: "...")` 精读对应业务子文档，
+                    重新核对指令拼写与参数契约后，方可继续下发物理执行。
                     """
                     loopMessages.append(.system(breakerMsg))
                     LogManager.shared.error(
-                        "🛑 触发物理执行熔断（连续 \(consecutiveToolFailures) 次失败），强制重定向至 read_skill_manual",
+                        "🛑 触发物理执行保护（连续 \(consecutiveToolFailures) 次失败），已重定向至 read_skill_manual",
                         parentID: roundLogID
                     )
                     consecutiveToolFailures = 0
@@ -940,28 +1014,50 @@ enum AgentAutonomyEngine {
                 }
                 
             } else {
-                // 纯文本轮次流转优化
+                // 纯文本交互识别、HITL 人机确认放行与系统推进流转
                 textOnlyRounds += 1
                 let cleanRound = roundResponseText.filterTHINK().filterStopTokens().trimmingCharacters(in: .whitespacesAndNewlines)
-                let isExplicitGivingUp = cleanRound.contains("无法继续") || cleanRound.contains("已终止") || cleanRound.contains("放弃任务")
                 
+                // 1. 明确终止意图识别
+                let isExplicitGivingUp = cleanRound.contains("无法继续") || cleanRound.contains("已终止") || cleanRound.contains("放弃任务")
                 if isExplicitGivingUp && textOnlyRounds >= 2 {
                     isTaskFinished = true
                     LogManager.shared.info("🛑 检测到模型明确表达终止意图，平仓退出推演", parentID: roundLogID)
-                } else if currentAgent.enableAutonomy && currentIteration < maxIterations && textOnlyRounds <= 2 && hasExecuteSkill {
+                    break
+                }
+                
+                // 2. 通用人机协同 (HITL) 交互探测：识别问句、选项或授权征询意图 (零特定业务词绑定)
+                let isHumanInteractionIntent: Bool = {
+                    guard !cleanRound.isEmpty else { return false }
+                    let hasQuestion = cleanRound.contains("？") || cleanRound.contains("?")
+                    let hasInquiryKeywords = cleanRound.contains("是否") || cleanRound.contains("确认") || cleanRound.contains("请选择") || cleanRound.contains("您同意") || cleanRound.contains("你同意") || cleanRound.contains("授权") || cleanRound.localizedCaseInsensitiveContains("consent")
+                    let hasNumberedOptions = cleanRound.contains("1.") || cleanRound.contains("1、") || cleanRound.contains("【1】") || cleanRound.contains("选项")
+                    
+                    return (hasQuestion && hasInquiryKeywords) || (hasInquiryKeywords && hasNumberedOptions)
+                }()
+                
+                if isHumanInteractionIntent {
+                    // 模型正在主动向用户征询意见、确认选项或请求授权，立即结单交付当前文本，等待用户回复
+                    isTaskFinished = true
+                    LogManager.shared.info("💬 捕捉到模型主动发起人机交互/授权确认，暂停推演并交付用户", parentID: roundLogID)
+                    break
+                }
+                
+                // 3. 自主推演非交互性单次停顿调度
+                if currentAgent.enableAutonomy && currentIteration < maxIterations && textOnlyRounds <= 2 && hasExecuteSkill {
                     let isFailedLast = checkLastToolExecutionFailure(in: loopMessages)
                     let promptGuidance = isFailedLast
-                        ? "【系统纠偏指引】: 前序命令未命中有效功能。请调用 read_skill_manual 精读对应子文档获取确切语法后，再下发 Tool Call 推进。"
-                        : "【系统推进指引】: 规划与阶段探查已就绪，请继续通过 Tool Call 下发确切的物理执行或读回验证命令。"
+                        ? "【系统提示】: 前序指令存在拼写或语法未就绪异常。请调用 read_skill_manual 精读相关文档获取确切语法后，再下发 Tool Call 推进。"
+                        : "【系统推进指引】: 阶段实况已就绪。如需执行具体操作，请通过 Tool Call 下发命令；若需向用户确认或提问，请直接在正文中说明。"
                     
                     let lastMessageContent = loopMessages.last?.content ?? ""
-                    if !lastMessageContent.contains("系统推进指引") && !lastMessageContent.contains("系统纠偏指引") {
+                    if !lastMessageContent.contains("系统推进指引") && !lastMessageContent.contains("系统提示") {
                         loopMessages.append(.system(promptGuidance))
-                        LogManager.shared.info("🔄 拦截到纯文本停顿，已注入单次推进指令驱动模型继续执行", parentID: roundLogID)
+                        LogManager.shared.info("🔄 拦截到纯文本停顿，已注入正向推进指引", parentID: roundLogID)
                     }
                     continue
                 } else {
-                    // 简单 Agent 或单轮问答，直接完成交付退出
+                    // 简单 Agent、单轮问答或预算完成，正常交付退出
                     isTaskFinished = true
                 }
             }
@@ -1017,8 +1113,55 @@ enum AgentAutonomyEngine {
               let toolOutput = lastToolMsg.content else {
             return false
         }
-        let toolName = lastToolMsg.toolCallId ?? ""
-        return PhysicalTruthVerifier.isExecutionFailed(toolName: toolName, output: toolOutput)
+        let toolName = lastToolMsg.name ?? lastToolMsg.toolCallId ?? ""
+        return isGenericInvocationFailure(toolName: toolName, output: toolOutput)
+    }
+    
+    // MARK: - isGenericInvocationFailure: 纯通用 CLI 语法与未就绪故障识别引擎
+    /// 通用底层调用失败判定：区分底层语法/可执行文件异常与上层业务回显
+    /// 纯粹基于 POSIX 退出码规范与通用 CLI 解析器行为，零特定业务名词依赖
+    /// - Parameters:
+    ///   - toolName: 执行的工具名称
+    ///   - output: 工具控制台回包文本
+    /// - Returns: 是否为真正的指令未识别/语法解析失败
+    private static func isGenericInvocationFailure(toolName: String, output: String) -> Bool {
+        let metaTools: Set<String> = ["read_skill_manual", "knowledge_search", "skill_memory_manager", "finish_task"]
+        if metaTools.contains(toolName) {
+            return output.hasPrefix("❌ 参数错误") || output.hasPrefix("❌ 安全拦截")
+        }
+        
+        let lower = output.lowercased()
+        
+        // 1. POSIX 命令未找到或未就绪 (Code 127 / command not found)
+        if lower.contains("command not found") ||
+           lower.contains("not found:") ||
+           lower.contains("code 127") ||
+           lower.contains("not executable") {
+            return true
+        }
+        
+        // 2. 通用 CLI 参数解析语法错误 (Usage / Unknown option / Unknown command)
+        let syntaxErrorSignatures = [
+            "unknown command:",
+            "unknown flag:",
+            "unknown option:",
+            "invalid option",
+            "unrecognized option",
+            "unrecognized argument",
+            "flag provided but not defined",
+            "usage: install [", // 系统 /usr/bin/install 参数未对齐
+            "code 64"           // sysexits.h EX_USAGE
+        ]
+        
+        for sig in syntaxErrorSignatures {
+            if lower.contains(sig) {
+                return true
+            }
+        }
+        
+        // 3. 诊断输出：只要不属于上述通用语法报错，其余所有回显（包含提示、警告、状态清单或认证提示）
+        // 均视为目标物理系统返回的真实客观状态，判定为有效执行回显
+        return false
     }
 }
 
@@ -1254,7 +1397,6 @@ struct AgentManagerView: View {
                 Label("知识库语料", systemImage: "books.vertical.fill").tag(3)
                 Label("长效记忆区", systemImage: "brain.head.profile").tag(4)
                 Label("自动化触发器", systemImage: "bolt.badge.automatic.fill").tag(5)
-                Label("系统提示词", systemImage: "quote.bubble.fill").tag(6)
                 Label("对话记录", systemImage: "clock.arrow.2.circlepath").tag(7)
                 Label("运行日志", systemImage: "list.bullet.rectangle").tag(8)
             }
@@ -1749,6 +1891,12 @@ struct AgentProfileEditor: View {
                                             Stepper("", value: $profile.keepRecentTurns, in: 4...20)
                                                 .labelsHidden()
                                                 .controlSize(.mini)
+                                                .onChange(of: profile.keepRecentTurns) { _, newKeep in
+                                                    // 防呆保护，无损保留轮次不得低于蒸馏周期
+                                                    if profile.summarizeEveryNRounds > newKeep {
+                                                        profile.summarizeEveryNRounds = newKeep
+                                                    }
+                                                }
                                         }
 
                                         HStack {
@@ -1759,6 +1907,12 @@ struct AgentProfileEditor: View {
                                             Stepper("", value: $profile.summarizeEveryNRounds, in: 2...10)
                                                 .labelsHidden()
                                                 .controlSize(.mini)
+                                                .onChange(of: profile.summarizeEveryNRounds) { _, newSummary in
+                                                    // 防呆保护，蒸馏周期不得高于无损保留轮次
+                                                    if profile.keepRecentTurns < newSummary {
+                                                        profile.keepRecentTurns = newSummary
+                                                    }
+                                                }
                                         }
                                     }
                                 }

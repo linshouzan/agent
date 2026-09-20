@@ -4,12 +4,12 @@
 //
 // 核心解构架构拓扑 (Domain-Driven Architecture):
 // ├── 1. ChatModels             : 消息实体、RAG 命中、技能执行日志与会话持久化模型
-// ├── 2. ChatParsers            : Markdown 增量渲染缓存、AST 块级解析器与流式提取器
+// ├── 2. ChatParsers            : Markdown 增量渲染缓存、AST 块级解析器与流式提取器 (带内存上限与自动回收)
 // ├── 3. ChatStore & Managers   : 响应式全局会话状态池 (AiChatStore) 与语音识别服务
 // ├── 4. ChatBlockViews         : 块级 Markdown 渲染组件群 (Header, Code, Table, Think, Divider)
 // ├── 5. ChatInteractiveCards   : 具身工具时间轴、HITL 授权卡片、任务结单与 RAG 切片查看器
 // ├── 6. ChatInputComponents    : 光标物理感知输入框 (NativeMacTextView)、@ 专家与 # 选项浮窗
-// └── 7. ChatMainView           : 主对话窗口容器、消息气泡行 (RowView) 与 Siri 活跃流光背景
+// └── 7. ChatMainView           : 主对话窗口容器 (LazyVStack 虚拟化渲染)、消息气泡行 (RowView) 与 Siri 活跃流光背景
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -119,6 +119,7 @@ enum PartType: Equatable, Sendable {
     case think(isClosed: Bool)
     case table(headers: [String], rows: [[String]])
     case divider
+    case card(attributes: [String: String], content: String, isClosed: Bool) // 🌟 卡片一等公民
 }
 
 struct MessagePart: Equatable, Sendable {
@@ -146,9 +147,11 @@ struct ChatSession: Identifiable, Codable, Equatable, Sendable {
     var archiveCategory: String? = "常规会话"
     var personaID: UUID? = nil
     var blackboardPlan: String? = nil
+    var scratchpad: String? = nil
+    var isLocked: Bool? = false
     
     enum CodingKeys: String, CodingKey {
-        case id, title, updatedAt, agentID, messages, activatedPrivateQAIDs, isArchived, archiveCategory, personaID, blackboardPlan
+        case id, title, updatedAt, agentID, messages, activatedPrivateQAIDs, isArchived, archiveCategory, personaID, blackboardPlan, scratchpad, isLocked
     }
     
     init(from decoder: Decoder) throws {
@@ -163,6 +166,8 @@ struct ChatSession: Identifiable, Codable, Equatable, Sendable {
         self.archiveCategory = try container.decodeIfPresent(String.self, forKey: .archiveCategory) ?? "常规会话"
         self.personaID = try container.decodeIfPresent(UUID.self, forKey: .personaID)
         self.blackboardPlan = try container.decodeIfPresent(String.self, forKey: .blackboardPlan)
+        self.scratchpad = try container.decodeIfPresent(String.self, forKey: .scratchpad)
+        self.isLocked = try container.decodeIfPresent(Bool.self, forKey: .isLocked) ?? false
     }
     
     init(
@@ -175,7 +180,9 @@ struct ChatSession: Identifiable, Codable, Equatable, Sendable {
         isArchived: Bool = false,
         archiveCategory: String = "常规会话",
         personaID: UUID? = nil,
-        blackboardPlan: String? = nil
+        blackboardPlan: String? = nil,
+        scratchpad: String? = nil,
+        isLocked: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -187,6 +194,8 @@ struct ChatSession: Identifiable, Codable, Equatable, Sendable {
         self.archiveCategory = archiveCategory
         self.personaID = personaID
         self.blackboardPlan = blackboardPlan
+        self.scratchpad = scratchpad
+        self.isLocked = isLocked
     }
 }
 
@@ -244,46 +253,57 @@ extension ChatMessage {
         )
     }
     
+    // MARK: - 包裹 autoreleasepool，避免大量会话反序列化时中间堆对象逃逸
     static func fromSaved(_ saved: SavedChatMessage) -> ChatMessage {
-        let decodedSkillLogs = saved.skillLogs.map { savedLog -> SkillExecutionLog in
-            let argsDict = (try? JSONSerialization.jsonObject(with: savedLog.argsJSON.data(using: .utf8) ?? Data())) as? [String: Any] ?? [:]
-            return SkillExecutionLog(id: savedLog.id, skillName: savedLog.skillName, displayName: savedLog.displayName, args: argsDict, resultOutput: savedLog.resultOutput, confirmationId: savedLog.confirmationId, executorName: savedLog.executorName, uiTemplate: savedLog.uiTemplate ?? "")
-        }
-        
-        let decodedRagHits = saved.ragHits.map { RAGHitLog(title: $0.title, path: $0.path, content: $0.content) }
-        
-        var restoredImages: [NSImage] = []
-        if let b64Strings = saved.imageB64Strings {
-            restoredImages = b64Strings.compactMap { str in
-                guard let data = Data(base64Encoded: str) else { return nil }
-                return NSImage(data: data)
+        autoreleasepool {
+            let decodedSkillLogs = saved.skillLogs.map { savedLog -> SkillExecutionLog in
+                let argsDict = (try? JSONSerialization.jsonObject(with: savedLog.argsJSON.data(using: .utf8) ?? Data())) as? [String: Any] ?? [:]
+                return SkillExecutionLog(id: savedLog.id, skillName: savedLog.skillName, displayName: savedLog.displayName, args: argsDict, resultOutput: savedLog.resultOutput, confirmationId: savedLog.confirmationId, executorName: savedLog.executorName, uiTemplate: savedLog.uiTemplate ?? "")
             }
+            
+            let decodedRagHits = saved.ragHits.map { RAGHitLog(title: $0.title, path: $0.path, content: $0.content) }
+            
+            var restoredImages: [NSImage] = []
+            if let b64Strings = saved.imageB64Strings {
+                restoredImages = b64Strings.compactMap { str in
+                    guard let data = Data(base64Encoded: str) else { return nil }
+                    return NSImage(data: data)
+                }
+            }
+            
+            var restoredURLs: [URL] = []
+            if let urlStrings = saved.fileURLStrings {
+                restoredURLs = urlStrings.compactMap { URL(string: $0) }
+            }
+            
+            return ChatMessage(
+                id: saved.id,
+                isUser: saved.isUser,
+                text: saved.text,
+                images: restoredImages,
+                fileURLs: restoredURLs,
+                ragHits: decodedRagHits,
+                skillLogs: decodedSkillLogs,
+                feedback: saved.feedback ?? .none
+            )
         }
-        
-        var restoredURLs: [URL] = []
-        if let urlStrings = saved.fileURLStrings {
-            restoredURLs = urlStrings.compactMap { URL(string: $0) }
-        }
-        
-        return ChatMessage(
-            id: saved.id,
-            isUser: saved.isUser,
-            text: saved.text,
-            images: restoredImages,
-            fileURLs: restoredURLs,
-            ragHits: decodedRagHits,
-            skillLogs: decodedSkillLogs,
-            feedback: saved.feedback ?? .none
-        )
     }
 }
 
 // MARK: - ==================== 2. ChatParsers (AST 解析与渲染缓存引擎) ====================
 
+// MARK: - 削减缓存上限并提供主动清理入口
 final class MessageASTCache: @unchecked Sendable {
     static let shared = MessageASTCache()
     private let cache = NSCache<NSString, AnyObject>()
-    private init() { cache.countLimit = 1000 }
+    
+    private init() {
+        cache.countLimit = 128
+    }
+    
+    func clearCache() {
+        cache.removeAllObjects()
+    }
     
     func getParsedParts(id: UUID, text: String, isGenerating: Bool) -> [MessagePart] {
         if isGenerating {
@@ -301,17 +321,29 @@ final class MessageASTCache: @unchecked Sendable {
     }
 }
 
-// MARK: - 原生 macOS 极致排版 MarkdownRenderCache
+// MARK: - 紧凑受控的 MarkdownRenderCache (设置 16MB 内存硬顶与主动释放能力)
 class MarkdownRenderCache: @unchecked Sendable {
     static let shared = MarkdownRenderCache()
     
     private final class CacheWrapper: Sendable {
         let attrString: AttributedString
-        init(_ attrString: AttributedString) { self.attrString = attrString }
+        let estimatedCost: Int
+        init(_ attrString: AttributedString) {
+            self.attrString = attrString
+            self.estimatedCost = max(64, attrString.characters.count * 8)
+        }
     }
     
     private let cache = NSCache<NSString, CacheWrapper>()
-    private init() { cache.countLimit = 2000 }
+    
+    private init() {
+        cache.countLimit = 128
+        cache.totalCostLimit = 16 * 1024 * 1024 // 16MB 硬顶
+    }
+    
+    func clearCache() {
+        cache.removeAllObjects()
+    }
     
     private static let newlineRegex = try! NSRegularExpression(pattern: #"\n{3,}"#)
     private static let inlineCodeRegex = try! NSRegularExpression(pattern: #"(?<!`)`([^`\n\r]+)`(?!`)"#)
@@ -350,141 +382,163 @@ class MarkdownRenderCache: @unchecked Sendable {
         return paragraph.copy() as! NSParagraphStyle
     }()
     
+    // MARK: - 采用 autoreleasepool 防止局部正则与字符串分配滞留
     func get(from text: String, isUser: Bool) -> AttributedString {
         let cacheKey = "\(isUser ? "U" : "A")_\(text.hashValue)" as NSString
         if let cached = cache.object(forKey: cacheKey) { return cached.attrString }
         
-        var safeText = text.replacingOccurrences(of: "\r\n", with: "\n")
-        safeText = safeText.replacingOccurrences(of: "\u{00A0}", with: " ")
-        
-        // 1. 替换 LaTeX 常用特殊字符
-        let latexMatches = Self.latexSymbolRegex.matches(in: safeText, options: [], range: NSRange(safeText.startIndex..., in: safeText))
-        for match in latexMatches.reversed() {
-            guard let totalRange = Range(match.range, in: safeText),
-                  let symbolRange = Range(match.range(at: 1), in: safeText) else { continue }
-            let symbolKey = String(safeText[symbolRange])
-            if let unicodeReplacement = Self.latexSymbolMap[symbolKey] {
-                safeText.replaceSubrange(totalRange, with: unicodeReplacement)
-            }
-        }
-        
-        // 2. 注入微空格 (\u{200A}) 形成行内代码呼吸感
-        safeText = Self.inlineCodeRegex.stringByReplacingMatches(
-            in: safeText,
-            options: [],
-            range: scRange(safeText),
-            withTemplate: "`\u{200A}$1\u{200A}`"
-        )
-        
-        // 3. 结构化标记规范化
-        safeText = Self.newlineRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "\n\n")
-        safeText = Self.listItemRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[•](style://listitem) $1")
-        safeText = Self.blockquoteRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[▎](style://blockquote) $1")
-        
-        // 4. 自定义高亮标签样式映射
-        safeText = Self.highlightRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://highlight)")
-        safeText = Self.errorRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://error)")
-        safeText = Self.infoRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://info)")
-        safeText = Self.successRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://success)")
-        safeText = Self.sparkRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://spark)")
-        
-        safeText = safeText.replacingOccurrences(of: "\n", with: "  \n")
-        
-        var options = AttributedString.MarkdownParsingOptions()
-        options.interpretedSyntax = .inlineOnlyPreservingWhitespace
-        options.failurePolicy = .returnPartiallyParsedIfPossible
-        
-        var result = (try? AttributedString(markdown: safeText, options: options)) ?? AttributedString(text)
-        
-        // 5. 正文基准字体
-        var baseAttr = AttributeContainer()
-        baseAttr.font = Font.system(size: 14, weight: .regular)
-        baseAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor).opacity(0.92)
-        result.mergeAttributes(baseAttr, mergePolicy: .keepNew)
-        
-        // 6. 遍历 Run 进行精细排版
-        for run in result.runs {
-            var runAttr = AttributeContainer()
+        return autoreleasepool {
+            var safeText = text.replacingOccurrences(of: "\r\n", with: "\n")
+            safeText = safeText.replacingOccurrences(of: "\u{00A0}", with: " ")
             
-            if let inlineIntent = run.inlinePresentationIntent {
-                if inlineIntent.contains(.code) {
-                    runAttr.font = Font.system(size: 12.0, weight: .medium, design: .monospaced)
-                    runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.88)
-                    runAttr.backgroundColor = isUser ? Color.white.opacity(0.18) : Color.primary.opacity(0.048)
-                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
-                } else if inlineIntent.contains(.stronglyEmphasized) && inlineIntent.contains(.emphasized) {
-                    runAttr.font = Font.system(size: 14.0, weight: .bold).italic()
-                    runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
-                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
-                } else if inlineIntent.contains(.stronglyEmphasized) {
-                    runAttr.font = Font.system(size: 14.0, weight: .bold)
-                    runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
-                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
-                } else if inlineIntent.contains(.emphasized) {
-                    runAttr.font = Font.system(size: 14.0, weight: .semibold).italic()
-                    runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.96)
-                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
-                }
-            } else if let url = run.link, let scheme = url.scheme, let host = url.host {
-                runAttr.underlineStyle = nil
-                
-                if scheme == "action" && host == "inspect_tool" {
-                    runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
-                    runAttr.baselineOffset = 3.0
-                    runAttr.backgroundColor = .clear
-                    
-                    let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
-                    let status = queryParams?.first(where: { $0.name == "status" })?.value ?? "running"
-                    
-                    switch status {
-                    case "success":
-                        runAttr.foregroundColor = Color(hex: "#10B981")
-                    case "failed":
-                        runAttr.foregroundColor = Color(hex: "#EF4444")
-                    case "waiting":
-                        runAttr.foregroundColor = Color.orange
-                    default:
-                        runAttr.foregroundColor = Color.purple.opacity(0.9)
-                    }
-                } else if scheme == "action" && host == "inspect_rag" {
-                    runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
-                    runAttr.baselineOffset = 3.0
-                    runAttr.backgroundColor = .clear
-                    runAttr.foregroundColor = Color.cyan
-                } else if scheme == "style" {
-                    switch host {
-                    case "highlight":
-                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
-                        runAttr.foregroundColor = Color.orange
-                    case "error":
-                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
-                        runAttr.foregroundColor = Color.red
-                    case "info":
-                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
-                        runAttr.foregroundColor = Color.blue
-                    case "success":
-                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
-                        runAttr.foregroundColor = Color(hex: "#00897B")
-                    case "spark":
-                        runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
-                        runAttr.foregroundColor = Color.purple
-                    case "blockquote":
-                        runAttr.font = Font.system(size: 14, weight: .bold)
-                        runAttr.foregroundColor = Color.cyan.opacity(0.8)
-                        runAttr.paragraphStyle = Self.sharedQuoteParagraphStyle
-                    case "listitem":
-                        runAttr.font = Font.system(size: 14, weight: .bold)
-                        runAttr.foregroundColor = Color.cyan
-                        runAttr.paragraphStyle = Self.sharedListParagraphStyle
-                    default: break
+            // 1. 替换 LaTeX 常用特殊字符（有对应特征时才扫描）
+            if safeText.contains("\\") {
+                let latexMatches = Self.latexSymbolRegex.matches(in: safeText, options: [], range: NSRange(safeText.startIndex..., in: safeText))
+                for match in latexMatches.reversed() {
+                    guard let totalRange = Range(match.range, in: safeText),
+                          let symbolRange = Range(match.range(at: 1), in: safeText) else { continue }
+                    let symbolKey = String(safeText[symbolRange])
+                    if let unicodeReplacement = Self.latexSymbolMap[symbolKey] {
+                        safeText.replaceSubrange(totalRange, with: unicodeReplacement)
                     }
                 }
-                result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
             }
+            
+            // 2. 注入微空格 (\u{200A}) 形成行内代码呼吸感
+            if safeText.contains("`") {
+                safeText = Self.inlineCodeRegex.stringByReplacingMatches(
+                    in: safeText,
+                    options: [],
+                    range: scRange(safeText),
+                    withTemplate: "`\u{200A}$1\u{200A}`"
+                )
+            }
+            
+            // 3. 结构化标记规范化
+            safeText = Self.newlineRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "\n\n")
+            if safeText.contains("* ") || safeText.contains("- ") {
+                safeText = Self.listItemRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[•](style://listitem) $1")
+            }
+            if safeText.contains(">") {
+                safeText = Self.blockquoteRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[▎](style://blockquote) $1")
+            }
+            
+            // 4. 自定义高亮标签样式映射
+            if safeText.contains("==") {
+                safeText = Self.highlightRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://highlight)")
+            }
+            if safeText.contains("!!") {
+                safeText = Self.errorRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://error)")
+            }
+            if safeText.contains("??") {
+                safeText = Self.infoRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://info)")
+            }
+            if safeText.contains("++") {
+                safeText = Self.successRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://success)")
+            }
+            if safeText.contains("~~") {
+                safeText = Self.sparkRegex.stringByReplacingMatches(in: safeText, options: [], range: scRange(safeText), withTemplate: "[$1](style://spark)")
+            }
+            
+            safeText = safeText.replacingOccurrences(of: "\n", with: "  \n")
+            
+            var options = AttributedString.MarkdownParsingOptions()
+            options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+            options.failurePolicy = .returnPartiallyParsedIfPossible
+            
+            var result = (try? AttributedString(markdown: safeText, options: options)) ?? AttributedString(text)
+            
+            // 5. 正文基准字体
+            var baseAttr = AttributeContainer()
+            baseAttr.font = Font.system(size: 14, weight: .regular)
+            baseAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor).opacity(0.92)
+            result.mergeAttributes(baseAttr, mergePolicy: .keepNew)
+            
+            // 6. 遍历 Run 进行精细排版
+            for run in result.runs {
+                var runAttr = AttributeContainer()
+                
+                if let inlineIntent = run.inlinePresentationIntent {
+                    if inlineIntent.contains(.code) {
+                        runAttr.font = Font.system(size: 12.0, weight: .medium, design: .monospaced)
+                        runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.88)
+                        runAttr.backgroundColor = isUser ? Color.white.opacity(0.18) : Color.primary.opacity(0.048)
+                        result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                    } else if inlineIntent.contains(.stronglyEmphasized) && inlineIntent.contains(.emphasized) {
+                        runAttr.font = Font.system(size: 14.0, weight: .bold).italic()
+                        runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
+                        result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                    } else if inlineIntent.contains(.stronglyEmphasized) {
+                        runAttr.font = Font.system(size: 14.0, weight: .bold)
+                        runAttr.foregroundColor = isUser ? Color.white : Color(nsColor: .labelColor)
+                        result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                    } else if inlineIntent.contains(.emphasized) {
+                        runAttr.font = Font.system(size: 14.0, weight: .semibold).italic()
+                        runAttr.foregroundColor = isUser ? Color.white.opacity(0.95) : Color(nsColor: .labelColor).opacity(0.96)
+                        result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                    }
+                } else if let url = run.link, let scheme = url.scheme, let host = url.host {
+                    runAttr.underlineStyle = nil
+                    
+                    if scheme == "action" && host == "inspect_tool" {
+                        runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
+                        runAttr.baselineOffset = 3.0
+                        runAttr.backgroundColor = .clear
+                        
+                        let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                        let status = queryParams?.first(where: { $0.name == "status" })?.value ?? "running"
+                        
+                        switch status {
+                        case "success":
+                            runAttr.foregroundColor = Color(hex: "#10B981")
+                        case "failed":
+                            runAttr.foregroundColor = Color(hex: "#EF4444")
+                        case "waiting":
+                            runAttr.foregroundColor = Color.orange
+                        default:
+                            runAttr.foregroundColor = Color.purple.opacity(0.9)
+                        }
+                    } else if scheme == "action" && host == "inspect_rag" {
+                        runAttr.font = Font.system(size: 11.0, weight: .bold, design: .rounded)
+                        runAttr.baselineOffset = 3.0
+                        runAttr.backgroundColor = .clear
+                        runAttr.foregroundColor = Color.cyan
+                    } else if scheme == "style" {
+                        switch host {
+                        case "highlight":
+                            runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                            runAttr.foregroundColor = Color.orange
+                        case "error":
+                            runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                            runAttr.foregroundColor = Color.red
+                        case "info":
+                            runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                            runAttr.foregroundColor = Color.blue
+                        case "success":
+                            runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                            runAttr.foregroundColor = Color(hex: "#00897B")
+                        case "spark":
+                            runAttr.font = Font.system(size: 14.0, weight: .bold, design: .rounded)
+                            runAttr.foregroundColor = Color.purple
+                        case "blockquote":
+                            runAttr.font = Font.system(size: 14, weight: .bold)
+                            runAttr.foregroundColor = Color.cyan.opacity(0.8)
+                            runAttr.paragraphStyle = Self.sharedQuoteParagraphStyle
+                        case "listitem":
+                            runAttr.font = Font.system(size: 14, weight: .bold)
+                            runAttr.foregroundColor = Color.cyan
+                            runAttr.paragraphStyle = Self.sharedListParagraphStyle
+                        default: break
+                        }
+                    }
+                    result[run.range].mergeAttributes(runAttr, mergePolicy: .keepNew)
+                }
+            }
+            
+            let wrapper = CacheWrapper(result)
+            cache.setObject(wrapper, forKey: cacheKey, cost: wrapper.estimatedCost)
+            return result
         }
-        
-        cache.setObject(CacheWrapper(result), forKey: cacheKey)
-        return result
     }
     
     @inline(__always) private func scRange(_ str: String) -> NSRange {
@@ -574,37 +628,84 @@ struct MessageParser {
         return parts
     }
     
+    // MARK: - 正则化提取带属性 <card> 标签块 (支持流式未闭合容错)
+    private static let cardRegex = try! NSRegularExpression(
+        pattern: #"(?s)<card\b(?<attrs>[^>]*)>(?<content>.*?)(?:</card>|$)"#,
+        options: []
+    )
+    private static let cardAttrRegex = try! NSRegularExpression(
+        pattern: #"([a-zA-Z0-9_-]+)=["']([^"']*)["']"#,
+        options: []
+    )
+
     private static func parseCardsAndBlocks(_ text: String) -> [MessagePart] {
+        guard text.contains("<card") else {
+            return parseBlocks(text)
+        }
+        
         var parts: [MessagePart] = []
-        var remainingText = text
+        let nsText = text as NSString
+        let matches = cardRegex.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length))
         
-        let cardOpen = "<card>"
-        let cardClose = "</card>"
+        if matches.isEmpty {
+            return parseBlocks(text)
+        }
         
-        while !remainingText.isEmpty {
-            if let openRange = remainingText.range(of: cardOpen) {
-                let precedingText = String(remainingText[..<openRange.lowerBound])
-                if !precedingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    parts.append(contentsOf: parseBlocks(precedingText))
+        var lastIndex = 0
+        for match in matches {
+            let matchRange = match.range
+            if matchRange.location > lastIndex {
+                let preceding = nsText.substring(with: NSRange(location: lastIndex, length: matchRange.location - lastIndex))
+                let trimmed = preceding.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    parts.append(contentsOf: parseBlocks(trimmed))
                 }
-                
-                let searchRest = String(remainingText[openRange.upperBound...])
-                if let endRange = searchRest.range(of: cardClose) {
-                    let cardContent = String(searchRest[..<endRange.lowerBound])
-                    parts.append(MessagePart(type: .text, text: "<card>\(cardContent)</card>"))
-                    remainingText = String(searchRest[endRange.upperBound...])
-                } else {
-                    parts.append(MessagePart(type: .text, text: "<card>\(searchRest)</card>"))
-                    remainingText = ""
-                }
-            } else {
-                parts.append(contentsOf: parseBlocks(remainingText))
-                remainingText = ""
+            }
+            
+            var rawAttrs = ""
+            if let r = Range(match.range(withName: "attrs"), in: text) {
+                rawAttrs = String(text[r])
+            }
+            
+            var content = ""
+            if let r = Range(match.range(withName: "content"), in: text) {
+                content = String(text[r]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            
+            let fullMatchedString = nsText.substring(with: matchRange)
+            let isClosed = fullMatchedString.hasSuffix("</card>")
+            let attrs = parseCardAttributes(from: rawAttrs)
+            
+            parts.append(MessagePart(type: .card(attributes: attrs, content: content, isClosed: isClosed), text: content))
+            lastIndex = matchRange.location + matchRange.length
+        }
+        
+        if lastIndex < nsText.length {
+            let trailing = nsText.substring(from: lastIndex).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trailing.isEmpty {
+                parts.append(contentsOf: parseBlocks(trailing))
             }
         }
+        
         return parts
     }
     
+    private static func parseCardAttributes(from raw: String) -> [String: String] {
+        var dict: [String: String] = [:]
+        let nsRaw = raw as NSString
+        let matches = cardAttrRegex.matches(in: raw, options: [], range: NSRange(location: 0, length: nsRaw.length))
+        for m in matches {
+            if let kRange = Range(m.range(at: 1), in: raw),
+               let vRange = Range(m.range(at: 2), in: raw) {
+                let k = String(raw[kRange]).lowercased()
+                let v = String(raw[vRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                dict[k] = v
+            }
+        }
+        return dict
+    }
+    
+    // MARK: - 代码块与普通 Markdown 块切分
     private static func parseBlocks(_ text: String) -> [MessagePart] {
         var parts: [MessagePart] = []
         let components = text.components(separatedBy: "```")
@@ -624,6 +725,7 @@ struct MessageParser {
         return parts
     }
     
+    // MARK: - 表格与标题解析
     private static func parseTablesAndHeaders(from text: String) -> [MessagePart] {
         var parts: [MessagePart] = []
         let lines = text.components(separatedBy: .newlines)
@@ -744,6 +846,7 @@ class AiChatStore: ObservableObject {
     }
     
     let onClearEvent = PassthroughSubject<Void, Never>()
+    let onSessionLoaded = PassthroughSubject<Void, Never>()
     var currentGenerationTask: Task<Void, Never>?
     
     private init() {
@@ -766,6 +869,7 @@ class AiChatStore: ObservableObject {
         saveCurrentState()
     }
     
+    // MARK: - 清空对话时联动清空解析与排版缓存
     func clearChat() {
         messages.removeAll()
         isLoading = false
@@ -778,37 +882,56 @@ class AiChatStore: ObservableObject {
         blackboardPlan = nil
         AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
         AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_GLOBAL_MEMO")
+        AgentManager.shared.agentVM.sharedContext.removeValue(forKey: AgentLongTermMemory.scratchpadKey)
+        
+        MarkdownRenderCache.shared.clearCache()
+        MessageASTCache.shared.clearCache()
         
         onClearEvent.send()
     }
     
+    // MARK: - 载入历史会话时清空旧缓存并包裹隔离池
     func loadSession(_ session: ChatSession) {
-        self.currentSessionID = session.id
-        self.messages = session.messages.map { ChatMessage.fromSaved($0) }
-        self.activatedPrivateQAIDs.removeAll()
+        MarkdownRenderCache.shared.clearCache()
+        MessageASTCache.shared.clearCache()
         
-        self.blackboardPlan = session.blackboardPlan
-        if let plan = session.blackboardPlan, !plan.isEmpty {
-            AgentManager.shared.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = plan
-        } else {
-            AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
-        }
+        autoreleasepool {
+            self.currentSessionID = session.id
+            self.messages = session.messages.map { ChatMessage.fromSaved($0) }
+            self.activatedPrivateQAIDs.removeAll()
+            
+            self.blackboardPlan = session.blackboardPlan
+            if let plan = session.blackboardPlan, !plan.isEmpty {
+                AgentManager.shared.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"] = plan
+            } else {
+                AgentManager.shared.agentVM.sharedContext.removeValue(forKey: "AGENT_BLACKBOARD_PLAN")
+            }
 
-        if ConfigManager.shared.app.agentProfiles.contains(where: { $0.id == session.agentID }) {
-            self.selectedAgentID = session.agentID
+            // 若历史会话存在提炼记忆，即刻恢复至运行时上下文；若无则安全清退
+            if let pad = session.scratchpad, !pad.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                AgentManager.shared.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey] = pad
+                LogManager.shared.info("🧠 历史会话长效记忆已激活恢复", detail: "恢复摘要: \(pad.prefix(100))...")
+            } else {
+                AgentManager.shared.agentVM.sharedContext.removeValue(forKey: AgentLongTermMemory.scratchpadKey)
+            }
+
+            if ConfigManager.shared.app.agentProfiles.contains(where: { $0.id == session.agentID }) {
+                self.selectedAgentID = session.agentID
+            }
+            
+            if let pID = session.personaID, PersonaManager.shared.personas.contains(where: { $0.id == pID }) {
+                self.selectedPersonaID = pID
+            } else {
+                self.selectedPersonaID = nil
+            }
+            
+            self.isLoading = false
+            self.selectedImages.removeAll()
+            self.selectedFiles.removeAll()
+            self.isContextEnabled = true
         }
-        
-        if let pID = session.personaID, PersonaManager.shared.personas.contains(where: { $0.id == pID }) {
-            self.selectedPersonaID = pID
-        } else {
-            self.selectedPersonaID = nil
-        }
-        
-        self.isLoading = false
-        self.selectedImages.removeAll()
-        self.selectedFiles.removeAll()
-        self.isContextEnabled = true
         onClearEvent.send()
+        onSessionLoaded.send()
     }
     
     func deleteMessage(id: UUID) {
@@ -828,12 +951,17 @@ class AiChatStore: ObservableObject {
         guard !messages.isEmpty else { return }
         let title = messages.first(where: { $0.isUser })?.text.prefix(15) ?? "新对话"
         
+        let currentScratchpad = AgentManager.shared.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey]
+        let currentPlan = blackboardPlan ?? AgentManager.shared.agentVM.sharedContext["AGENT_BLACKBOARD_PLAN"]
+        
         ChatHistoryManager.shared.saveSession(
             id: currentSessionID,
             title: String(title),
             agentID: selectedAgentID,
             messages: messages,
-            personaID: selectedPersonaID
+            personaID: selectedPersonaID,
+            blackboardPlan: currentPlan,
+            scratchpad: currentScratchpad
         )
     }
     
@@ -1331,7 +1459,7 @@ struct ActionChipModel: Hashable {
     let title: String
 }
 
-// MARK: - MessageContentView (已移除频繁监听 GeometryReader 状态震荡)
+// MARK: - MessageContentView (短路正则判定与堆内存轻量化)
 struct MessageContentView: View, Equatable {
     var messageID: UUID = UUID()
     var text: String
@@ -1341,12 +1469,6 @@ struct MessageContentView: View, Equatable {
     var ragHits: [RAGHitLog] = []
     var onAction: ((String) -> Void)? = nil
     
-    @State private var inspectingLog: SkillExecutionLog? = nil
-    @State private var showInspectPopover: Bool = false
-    
-    @State private var inspectingRagHit: RAGHitLog? = nil
-    @State private var showRagPopover: Bool = false
-    
     static func == (lhs: MessageContentView, rhs: MessageContentView) -> Bool {
         return lhs.messageID == rhs.messageID &&
                lhs.text == rhs.text &&
@@ -1355,46 +1477,427 @@ struct MessageContentView: View, Equatable {
                lhs.ragHits == rhs.ragHits
     }
     
-    private func extractActionTags(from text: String) -> (String, [ActionChipModel]) {
-        var cleanText = text
-        var chips: [ActionChipModel] = []
+    var body: some View {
+        let parts = MessageASTCache.shared.getParsedParts(id: messageID, text: text, isGenerating: isGenerating)
         
-        let pattern = "\\[(.*?)\\]\\(action://(ask|skill)(?:/([^)]*))?\\)"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return (text, []) }
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: text.utf16.count))
-        
-        for match in matches.reversed() {
-            if let range = Range(match.range, in: cleanText),
-               let titleRange = Range(match.range(at: 1), in: cleanText),
-               let typeRange = Range(match.range(at: 2), in: cleanText) {
-                
-                let title = String(cleanText[titleRange])
-                let typeString = String(cleanText[typeRange])
-                
-                let rawPayload: String
-                if match.range(at: 3).location != NSNotFound, let payloadRange = Range(match.range(at: 3), in: cleanText) {
-                    rawPayload = String(cleanText[payloadRange])
-                } else {
-                    rawPayload = title
+        VStack(alignment: .leading, spacing: 6) {
+            if parts.isEmpty {
+                if isGenerating { TypingIndicatorView() }
+                else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
+            } else {
+                ForEach(0..<parts.count, id: \.self) { idx in
+                    renderMessagePart(parts[idx])
                 }
-                
-                let payload = rawPayload.removingPercentEncoding ?? rawPayload
-                let type: ActionChipType = (typeString == "skill") ? .skill : .ask
-                let chip = ActionChipModel(type: type, payload: payload, title: title)
-                
-                chips.insert(chip, at: 0)
-                cleanText.replaceSubrange(range, with: title)
             }
         }
-        return (cleanText, chips)
+        .environment(\.openURL, OpenURLAction { url in
+            // 🌟 核心拦截：支持富文本内 action://ask 与 action://skill 的点击响应兜底
+            if url.scheme?.lowercased() == "action" {
+                let host = url.host?.lowercased() ?? ""
+                let rawPath = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let payload = rawPath.removingPercentEncoding ?? rawPath
+                
+                if host == "ask" {
+                    if !payload.isEmpty { onAction?(payload) }
+                    return .handled
+                } else if host == "skill" {
+                    if !payload.isEmpty {
+                        onAction?("请直接调用此技能(tool)：\(payload)。无需多余废话，直接执行。")
+                    }
+                    return .handled
+                }
+            }
+            
+            let handled = LocalLinkOpener.openSmartLink(url)
+            return handled ? .handled : .systemAction
+        })
+    }
+    
+    @ViewBuilder
+    private func renderMessagePart(_ part: MessagePart) -> some View {
+        switch part.type {
+        case .card(let attrs, let content, let isClosed):
+            CardBlockContainerView(attributes: attrs, content: content, isClosed: isClosed, isUser: isUser)
+        case .header(let level):
+            HeaderBlockView(level: level, text: part.text, isUser: isUser)
+        case .code(let language):
+            CodeBlockView(code: part.text, language: language).textSelection(.enabled)
+        case .table(let headers, let rows):
+            TableBlockView(headers: headers, rows: rows).textSelection(.enabled)
+        case .think(let isClosed):
+            ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed).textSelection(.enabled)
+        case .divider:
+            HorizontalRuleBlockView()
+        case .text:
+            TextMessagePartView(
+                rawText: part.text,
+                isUser: isUser,
+                skillLogs: skillLogs,
+                ragHits: ragHits,
+                onAction: onAction
+            )
+        }
+    }
+}
+
+struct CardBlockContainerView: View {
+    let attributes: [String: String]
+    let content: String
+    let isClosed: Bool
+    let isUser: Bool
+    
+    @State private var isExpanded: Bool = true
+    @State private var isHovered: Bool = false
+    @State private var isCopied: Bool = false
+    
+    // MARK: - 核心解耦：声明式属性驱动 + 通用自适应保底
+    private var cardTheme: (title: String, badge: String, icon: String, color: Color) {
+        let explicitColor = attributes["color"]
+        let explicitIcon = attributes["icon"]
+        let explicitBadge = attributes["badge"]
+        let explicitTitle = attributes["title"]
+        
+        let type = attributes["type"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let role = attributes["role"]?.trimmingCharacters(in: CharacterSet(charactersIn: "[] \t\n\r")) ?? ""
+        
+        // 1. 颜色推导：支持模型显式传入名称（如 pink, blue）、HEX 代码（如 #8B5CF6），或基于 type 的确定性调色板哈希保底
+        let fallbackKey = !type.isEmpty ? type : (!role.isEmpty ? role : "default")
+        let themeColor = resolveColor(explicitColor, fallbackKey: fallbackKey)
+        
+        // 2. 徽标推导：显式 badge 优先，次之 type，兜底显示 "CARD"
+        let badgeText: String
+        if let b = explicitBadge, !b.isEmpty {
+            badgeText = b
+        } else if !type.isEmpty {
+            badgeText = type
+        } else {
+            badgeText = "CARD"
+        }
+        
+        // 3. 标题推导：显式 title 优先，次之 role，兜底自动提取正文首行的纯净文本
+        let titleText: String
+        if let t = explicitTitle, !t.isEmpty {
+            titleText = t
+        } else if !role.isEmpty {
+            titleText = role
+        } else {
+            let firstLine = content.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first(where: { !$0.isEmpty }) ?? "结构化卡片"
+            let clean = firstLine.replacingOccurrences(of: "++", with: "")
+                .replacingOccurrences(of: "【", with: "")
+                .replacingOccurrences(of: "】", with: "")
+                .replacingOccurrences(of: "##", with: "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "#* \t"))
+            titleText = clean.isEmpty ? "结构化卡片" : clean
+        }
+        
+        // 4. 图标推导：显式 SF Symbol 属性优先，次之通用基础设施场景推导
+        let iconName = resolveIcon(explicitIcon, type: type)
+        
+        return (titleText, badgeText, iconName, themeColor)
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 卡片顶栏
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(cardTheme.color.opacity(0.16))
+                        .frame(width: 24, height: 24)
+                    Image(systemName: cardTheme.icon)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(cardTheme.color)
+                }
+                
+                HStack(spacing: 6) {
+                    Text(cardTheme.title)
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                        .foregroundColor(.primary)
+                    
+                    Text(cardTheme.badge)
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(cardTheme.color.opacity(0.14))
+                        .foregroundColor(cardTheme.color)
+                        .cornerRadius(4)
+                }
+                
+                Spacer()
+                
+                if !isClosed {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("生成中...")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                Button(action: copyCardContent) {
+                    HStack(spacing: 3) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                        Text(isCopied ? "已复制" : "复制")
+                    }
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(isCopied ? .green : .secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(Color.primary.opacity(0.04))
+                    .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+                .help("复制该卡片纯文本")
+                
+                Button(action: {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+                        isExpanded.toggle()
+                    }
+                }) {
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(cardTheme.color.opacity(isHovered ? 0.08 : 0.04))
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+                    isExpanded.toggle()
+                }
+            }
+            
+            // 卡片展开正文
+            if isExpanded {
+                Divider().opacity(0.25)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(MarkdownRenderCache.shared.get(from: content, isUser: isUser))
+                        .lineSpacing(5)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(NSColor.controlBackgroundColor).opacity(0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(cardTheme.color.opacity(isHovered ? 0.45 : 0.22), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 1)
+        .padding(.vertical, 4)
+        .onHover { h in isHovered = h }
+    }
+    
+    // MARK: - 辅助解析：色彩与图标通用引擎
+    private func resolveColor(_ rawColor: String?, fallbackKey: String) -> Color {
+        if let raw = rawColor?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty {
+            switch raw {
+            case "blue": return .blue
+            case "cyan": return .cyan
+            case "purple": return .purple
+            case "pink": return .pink
+            case "green": return .green
+            case "orange": return .orange
+            case "red": return .red
+            case "indigo": return .indigo
+            case "teal": return .teal
+            case "yellow": return .yellow
+            default:
+                if raw.hasPrefix("#") {
+                    return Color(hex: raw)
+                }
+            }
+        }
+        // 确定性调色板哈希保底：相同 key 保持恒定色彩
+        let palette: [Color] = [.blue, .purple, .pink, .cyan, .green, .orange, .indigo, .teal]
+        let hashVal = abs(fallbackKey.hashValue)
+        return palette[hashVal % palette.count]
+    }
+    
+    private func resolveIcon(_ explicitIcon: String?, type: String) -> String {
+        if let icon = explicitIcon?.trimmingCharacters(in: .whitespacesAndNewlines), !icon.isEmpty {
+            return icon
+        }
+        // 通用基础设施特征推导
+        let lower = type.lowercased()
+        if lower.contains("user") || lower.contains("person") || lower.contains("role") || lower.contains("char") {
+            return "person.crop.rectangle.stack.fill"
+        }
+        if lower.contains("server") || lower.contains("cluster") || lower.contains("node") || lower.contains("k8s") {
+            return "server.rack"
+        }
+        if lower.contains("code") || lower.contains("dev") || lower.contains("script") || lower.contains("sql") {
+            return "curlybraces"
+        }
+        if lower.contains("warn") || lower.contains("alert") || lower.contains("danger") {
+            return "exclamationmark.triangle.fill"
+        }
+        if lower.contains("global") || lower.contains("world") || lower.contains("net") {
+            return "globe.asia.australia.fill"
+        }
+        return "creditcard.fill"
+    }
+    
+    private func copyCardContent() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(content, forType: .string)
+        withAnimation { isCopied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            withAnimation { isCopied = false }
+        }
+    }
+}
+
+// MARK: - TextMessagePartView: 动作胶囊原位就地装配，向子视图透明下发 onAction
+struct TextMessagePartView: View {
+    let rawText: String
+    let isUser: Bool
+    let skillLogs: [SkillExecutionLog]
+    let ragHits: [RAGHitLog]
+    var onAction: ((String) -> Void)?
+    
+    var body: some View {
+        let flowSegments = resolveSegments(from: rawText)
+        
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(flowSegments) { seg in
+                switch seg.kind {
+                case .card(let cardContent):
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(MarkdownRenderCache.shared.get(from: cardContent, isUser: isUser))
+                            .lineSpacing(6)
+                            .multilineTextAlignment(.leading)
+                            .tint(.cyan)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.cyan.opacity(0.07)))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.cyan.opacity(0.38), lineWidth: 1.5))
+                    .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
+                    .padding(.vertical, 4)
+                    .compositingGroup()
+                    
+                case .markdown(let mdText):
+                    Text(MarkdownRenderCache.shared.get(from: mdText, isUser: isUser))
+                        .lineSpacing(6)
+                        .multilineTextAlignment(.leading)
+                        .tint(.cyan)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .compositingGroup()
+                    
+                case .inlineFile(let prefix, let file, let suffix):
+                    let cleanPrefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let cleanSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    if prefix.count > 35 {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if !cleanPrefix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: prefix, isUser: isUser)).lineSpacing(6).textSelection(.enabled)
+                            }
+                            FileDeliverableCapsuleView(file: file)
+                            if !cleanSuffix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: suffix, isUser: isUser)).lineSpacing(6).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    } else {
+                        HStack(alignment: .center, spacing: 6) {
+                            if !cleanPrefix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: prefix, isUser: isUser)).textSelection(.enabled)
+                            }
+                            FileDeliverableCapsuleView(file: file)
+                            if !cleanSuffix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: suffix, isUser: isUser)).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 1.5)
+                    }
+                    
+                // 原位就地渲染动作徽标 (无论是 tool、rag 还是 ask、skill，均在原本位置同行展示)
+                case .inlineBadges(let prefix, let badges, let suffix):
+                    let cleanPrefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let cleanSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    if prefix.count > 35 {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if !cleanPrefix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: prefix, isUser: isUser)).lineSpacing(6).textSelection(.enabled)
+                            }
+                            if badges.count == 1 {
+                                ActionBadgeCapsuleView(badge: badges[0], skillLogs: skillLogs, ragHits: ragHits, onAction: onAction)
+                            } else {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 6) {
+                                        ForEach(badges) { badge in
+                                            ActionBadgeCapsuleView(badge: badge, skillLogs: skillLogs, ragHits: ragHits, onAction: onAction)
+                                        }
+                                    }
+                                    .padding(.horizontal, 1)
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                            if !cleanSuffix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: suffix, isUser: isUser)).lineSpacing(6).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 1.5)
+                    } else {
+                        HStack(alignment: .center, spacing: 6) {
+                            if !cleanPrefix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: prefix, isUser: isUser)).textSelection(.enabled)
+                            }
+                            ForEach(badges) { badge in
+                                ActionBadgeCapsuleView(badge: badge, skillLogs: skillLogs, ragHits: ragHits, onAction: onAction)
+                            }
+                            if !cleanSuffix.isEmpty {
+                                Text(MarkdownRenderCache.shared.get(from: suffix, isUser: isUser)).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 1.5)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func resolveSegments(from text: String) -> [FlowSegment] {
+        let cardSegments = splitByCardTag(text)
+        var flowSegments: [FlowSegment] = []
+        for cardSeg in cardSegments {
+            if cardSeg.isCard {
+                flowSegments.append(FlowSegment(kind: .card(cardSeg.content)))
+            } else {
+                let inPlaceSegs = InPlaceContentParser.parse(from: cardSeg.content)
+                flowSegments.append(contentsOf: inPlaceSegs)
+            }
+        }
+        return flowSegments
     }
     
     private func splitByCardTag(_ text: String) -> [(content: String, isCard: Bool)] {
+        guard text.contains("<card>") else { return [(content: text, isCard: false)] }
+        
         var segments: [(content: String, isCard: Bool)] = []
         let pattern = "(?s)<card>(.*?)</card>"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return [(content: text, isCard: false)]
-        }
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [(content: text, isCard: false)] }
         
         let nsString = text as NSString
         let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count))
@@ -1423,165 +1926,6 @@ struct MessageContentView: View, Equatable {
             }
         }
         return segments.isEmpty ? [(content: text, isCard: false)] : segments
-    }
-    
-    var body: some View {
-        let parts = MessageASTCache.shared.getParsedParts(id: messageID, text: text, isGenerating: isGenerating)
-        
-        VStack(alignment: .leading, spacing: 6) {
-            if parts.isEmpty {
-                if isGenerating { TypingIndicatorView() }
-                else { Text(" ").font(.system(size: 14)).foregroundColor(.secondary) }
-            } else {
-                ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
-                    switch part.type {
-                    case .header(let level):
-                        HeaderBlockView(level: level, text: part.text, isUser: isUser)
-                        
-                    case .code(let language):
-                        CodeBlockView(code: part.text, language: language)
-                            .textSelection(.enabled)
-                    case .table(let headers, let rows):
-                        TableBlockView(headers: headers, rows: rows)
-                            .textSelection(.enabled)
-                    case .think(let isClosed):
-                        ThinkBlockView(content: part.text, isGenerating: isGenerating, isClosed: isClosed)
-                            .textSelection(.enabled)
-                    case .divider:
-                        HorizontalRuleBlockView()
-                    case .text:
-                        let (cleanText, actionChips) = extractActionTags(from: part.text)
-                        let segments = splitByCardTag(cleanText)
-                        
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(0..<segments.count, id: \.self) { segIdx in
-                                let seg = segments[segIdx]
-                                
-                                if seg.isCard {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
-                                            .lineSpacing(6)
-                                            .multilineTextAlignment(.leading)
-                                            .tint(.cyan)
-                                            .textSelection(.enabled)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 11)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(Color.cyan.opacity(0.07))
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .stroke(Color.cyan.opacity(0.38), lineWidth: 1.5)
-                                    )
-                                    .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
-                                    .padding(.vertical, 4)
-                                    .compositingGroup()
-                                } else {
-                                    Text(MarkdownRenderCache.shared.get(from: seg.content, isUser: isUser))
-                                        .lineSpacing(6)
-                                        .multilineTextAlignment(.leading)
-                                        .tint(.cyan)
-                                        .textSelection(.enabled)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .compositingGroup()
-                                }
-                            }
-                            
-                            if !actionChips.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 8) {
-                                        ForEach(actionChips, id: \.self) { chip in
-                                            Button(action: {
-                                                if chip.type == .skill {
-                                                    let systemInvokePrompt = "请直接调用此技能(tool)：\(chip.payload)。无需多余废话，直接执行。"
-                                                    onAction?(systemInvokePrompt)
-                                                } else {
-                                                    onAction?(chip.payload)
-                                                }
-                                            }) {
-                                                HStack(spacing: 4) {
-                                                    Image(systemName: chip.type == .skill ? "wrench.and.screwdriver.fill" : "paperplane.fill")
-                                                        .font(.system(size: 10))
-                                                    Text(chip.title).font(.system(size: 12, weight: .bold))
-                                                }
-                                                .foregroundColor(chip.type == .skill ? .purple : .cyan)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 5)
-                                                .background((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.15))
-                                                .cornerRadius(6)
-                                                .overlay(
-                                                    RoundedRectangle(cornerRadius: 6)
-                                                        .stroke((chip.type == .skill ? Color.purple : Color.cyan).opacity(0.3), lineWidth: 1)
-                                                )
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                    }
-                                    .padding(.vertical, 2)
-                                }
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .popover(isPresented: $showInspectPopover, arrowEdge: .top) {
-            if let log = inspectingLog {
-                let isExec = log.resultOutput == "执行中..." || log.resultOutput == "等待授权..."
-                let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
-                DetailedSkillView(
-                    log: log,
-                    themeColor: log.executorName != nil ? .purple : (isExec ? .blue : (isFailed ? .red : .green)),
-                    isExecuting: isExec
-                )
-            }
-        }
-        .popover(isPresented: $showRagPopover, arrowEdge: .top) {
-            if let hit = inspectingRagHit {
-                RAGChunkInspectorPopover(hit: hit)
-            }
-        }
-        .environment(\.openURL, OpenURLAction { url in
-            guard url.scheme == "action" else {
-                let handled = LocalLinkOpener.openSmartLink(url)
-                return handled ? .handled : .systemAction
-            }
-            
-            if url.host == "inspect_tool" {
-                let targetToolName = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                let queryParams = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
-                let callId = queryParams?.first(where: { $0.name == "call_id" })?.value
-                
-                if let callId = callId, !callId.isEmpty,
-                   let matchedLog = skillLogs.first(where: { $0.confirmationId == callId || $0.id.uuidString == callId }) {
-                    self.inspectingLog = matchedLog
-                    self.showInspectPopover = true
-                    return .handled
-                }
-                
-                if let matchedLog = skillLogs.last(where: {
-                    $0.skillName.lowercased() == targetToolName.lowercased() ||
-                    $0.displayName.lowercased() == targetToolName.lowercased()
-                }) ?? skillLogs.last {
-                    self.inspectingLog = matchedLog
-                    self.showInspectPopover = true
-                    return .handled
-                }
-            } else if url.host == "inspect_rag" {
-                let hitId = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                if let matchedHit = ragHits.first(where: { $0.id.uuidString == hitId || $0.title == hitId }) {
-                    self.inspectingRagHit = matchedHit
-                    self.showRagPopover = true
-                    return .handled
-                }
-            }
-            
-            return .handled
-        })
     }
 }
 
@@ -2771,15 +3115,22 @@ struct KnowledgeHitRowView: View {
     @State private var isExpanded: Bool = false
     @State private var isHovered: Bool = false
     
+    // 判定是否具备独立于文档名称的有效章节标题
+    private var hasValidSectionTitle: Bool {
+        let cleanSection = hit.sectionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !cleanSection.isEmpty && cleanSection != hit.title
+    }
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "doc.text.viewfinder")
-                    .foregroundColor(.cyan.opacity(0.8))
-                    .padding(.top, 2)
+            // 1. 顶层栏：文档库名称与真实得分
+            HStack(alignment: .center, spacing: 6) {
+                Image(systemName: "books.vertical.fill")
+                    .foregroundColor(.cyan.opacity(0.85))
+                    .font(.system(size: 11))
                 
                 Text(hit.title)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
                     .foregroundColor(.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -2787,7 +3138,7 @@ struct KnowledgeHitRowView: View {
                 Spacer()
                 
                 Text(String(format: "%.4f", hit.score))
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(scoreColor(hit.score).opacity(0.15))
                     .foregroundColor(scoreColor(hit.score))
@@ -2796,62 +3147,79 @@ struct KnowledgeHitRowView: View {
                 Image(systemName: "chevron.right")
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.secondary)
-                    .padding(.top, 3)
+                    .foregroundColor(.secondary.opacity(0.8))
                     .padding(.leading, 2)
             }
             
+            // 2. 章节小标题（仅在具有与文档名不重叠的独立子标题时才展示，彻底解决红框重复问题）
+            if hasValidSectionTitle {
+                HStack(spacing: 5) {
+                    Image(systemName: "text.quote")
+                        .font(.system(size: 8.5))
+                        .foregroundColor(.secondary)
+                    
+                    Text(hit.sectionTitle)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary.opacity(0.92))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.leading, 18)
+            }
+            
+            // 3. 标签流
             if !hit.tags.isEmpty || !hit.prohibited.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(hit.tags, id: \.self) { tag in
                             HStack(spacing: 3) {
-                                Image(systemName: "tag.fill").font(.system(size: 8))
+                                Image(systemName: "tag.fill").font(.system(size: 7.5))
                                 Text(tag).font(.system(size: 9, weight: .medium))
                             }
-                            .padding(.horizontal, 6)
+                            .padding(.horizontal, 5)
                             .padding(.vertical, 2)
-                            .background(Color.cyan.opacity(0.15))
+                            .background(Color.cyan.opacity(0.12))
                             .foregroundColor(.cyan)
                             .cornerRadius(4)
                         }
                         
                         ForEach(hit.prohibited, id: \.self) { proh in
                             HStack(spacing: 3) {
-                                Image(systemName: "nosign").font(.system(size: 8))
+                                Image(systemName: "nosign").font(.system(size: 7.5))
                                 Text(proh).font(.system(size: 9, weight: .medium))
                             }
-                            .padding(.horizontal, 6)
+                            .padding(.horizontal, 5)
                             .padding(.vertical, 2)
-                            .background(Color.red.opacity(0.12))
+                            .background(Color.red.opacity(0.10))
                             .foregroundColor(.red)
                             .cornerRadius(4)
                         }
                     }
                 }
-                .padding(.leading, 20)
+                .padding(.leading, 18)
                 .padding(.top, 1)
             }
             
+            // 4. 纯净正文摘要（已彻底剥离属性代码残留）
             if isExpanded {
                 Divider().opacity(0.3).padding(.vertical, 2)
                 
                 Text(hit.rawContent.trimmingCharacters(in: .whitespacesAndNewlines))
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 11.5, design: .monospaced))
                     .foregroundColor(.primary.opacity(0.85))
                     .lineSpacing(4)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 20)
+                    .padding(.leading, 18)
                     .padding(.bottom, 4)
             } else {
                 Text(hit.snippet)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
-                    .lineLimit(3)
+                    .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 20)
+                    .padding(.leading, 18)
             }
         }
         .padding(10)
@@ -2872,7 +3240,8 @@ struct KnowledgeHitRowView: View {
     
     private func scoreColor(_ score: Float) -> Color {
         if score >= 0.8 { return .green }
-        if score >= 0.5 { return .orange }
+        if score >= 0.5 { return .cyan }
+        if score >= 0.35 { return .orange }
         return .red
     }
 }
@@ -3788,7 +4157,6 @@ struct OptionDrawerPopoverView: View {
 
 // MARK: - ==================== 7. ChatMainView (主视图装配与渲染管线) ====================
 
-// MARK: - [Modified] ChatMessageRowView (支持悬浮同时展示上下双工具栏，零性能损耗)
 struct ChatMessageRowView: View, Equatable {
     let msg: ChatMessage
     var isGenerating: Bool
@@ -3860,12 +4228,12 @@ struct ChatMessageRowView: View, Equatable {
         let hasSkillLogs = !msg.skillLogs.isEmpty
         
         VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 3) {
-            // 1. 气泡顶部浮动工具条（AI 回复专属，鼠标移入时显现）
+            // 1. 气泡顶部浮动工具条
             if !msg.isUser {
                 actionButtons
                     .padding(.horizontal, 4)
                     .padding(.bottom, 1)
-                    .opacity(actionOpacity)
+                    .opacity(isHovered && !isGenerating ? 1.0 : 0.0)
             }
             
             // 2. 主消息气泡容器
@@ -3913,10 +4281,12 @@ struct ChatMessageRowView: View, Equatable {
                     if hasSkillLogs {
                         VStack(alignment: .leading, spacing: 8) {
                             let isAutonomousLoop = AiChatStore.shared.currentAgent.enableAutonomy
+                            let shouldShowTimeline = ConfigManager.shared.app.generalConfig.showSkillTimeline
                             
-                            if isAutonomousLoop {
+                            // 仅在用户开启设置且处于多轮推演模式时渲染技能链时间轴
+                            if isAutonomousLoop && shouldShowTimeline {
                                 AgentActionTimelineView(skillLogs: msg.skillLogs, isGenerating: isGenerating)
-                            } else {
+                            } else if !isAutonomousLoop {
                                 VStack(alignment: .leading, spacing: 10) {
                                     ForEach(msg.skillLogs) { log in
                                         ToolCardBubbleView(log: log, parentContent: msg.text, onAction: onAppendInstruction)
@@ -3988,15 +4358,20 @@ struct ChatMessageRowView: View, Equatable {
                 }
             }
             
-            // 3. 气泡底部浮动工具条（用户消息右对齐，AI 消息左对齐，鼠标移入时显现）
+            // 3. 气泡底部浮动工具条
             actionButtons
                 .padding(.horizontal, 4)
                 .padding(.top, 2)
-                .opacity(actionOpacity)
+                .opacity(isHovered && !isGenerating ? 1.0 : 0.0)
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-        .onHover { hover in withAnimation(.easeOut(duration: 0.15)) { isHovered = hover } }
+        .onHover { hover in
+            // 限制高频触发，加入轻量防抖保护
+            if isHovered != hover {
+                isHovered = hover
+            }
+        }
         .onAppear { renderedText = msg.text }
         .onChange(of: msg.text) { _, newText in
             if !isGenerating { renderedText = newText } else {
@@ -4007,7 +4382,6 @@ struct ChatMessageRowView: View, Equatable {
         .onChange(of: isGenerating) { _, gen in if !gen { renderedText = msg.text } }
     }
     
-    // 操作按钮组
     @ViewBuilder private var actionButtons: some View {
         HStack(spacing: 5) {
             if !msg.isUser {
@@ -4037,8 +4411,8 @@ struct ChatMessageRowView: View, Equatable {
             Button(action: {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(displaySafeText, forType: .string)
-                withAnimation { isCopied = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
+                isCopied = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { isCopied = false }
             }) {
                 Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard.fill")
                     .font(.system(size: 10.5))
@@ -4083,37 +4457,32 @@ struct ChatMessageRowView: View, Equatable {
             .buttonStyle(.plain)
             .help("删除消息")
         }
-        .allowsHitTesting(isHovered && !isGenerating)
     }
     
     private func toggleFeedback(_ type: MessageFeedback) {
         guard let idx = AiChatStore.shared.messages.firstIndex(where: { $0.id == msg.id }) else { return }
         
-        withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
-            if AiChatStore.shared.messages[idx].feedback == type {
-                AiChatStore.shared.messages[idx].feedback = .none
-            } else {
-                AiChatStore.shared.messages[idx].feedback = type
-                if type != .none {
-                    let targetId = msg.id
-                    let allMessagesSnapshot = AiChatStore.shared.messages
-                    let currentModel = AiChatStore.shared.currentAgent.baseModel
-                    
-                    Task(priority: .utility) {
-                        await MemoryManager.shared.harvestFeedbackExperience(
-                            recentMessages: allMessagesSnapshot,
-                            targetMessageId: targetId,
-                            feedback: type,
-                            model: currentModel
-                        )
-                    }
+        if AiChatStore.shared.messages[idx].feedback == type {
+            AiChatStore.shared.messages[idx].feedback = .none
+        } else {
+            AiChatStore.shared.messages[idx].feedback = type
+            if type != .none {
+                let targetId = msg.id
+                let allMessagesSnapshot = AiChatStore.shared.messages
+                let currentModel = AiChatStore.shared.currentAgent.baseModel
+                
+                Task(priority: .utility) {
+                    await MemoryManager.shared.harvestFeedbackExperience(
+                        recentMessages: allMessagesSnapshot,
+                        targetMessageId: targetId,
+                        feedback: type,
+                        model: currentModel
+                    )
                 }
             }
-            AiChatStore.shared.saveCurrentState()
         }
+        AiChatStore.shared.saveCurrentState()
     }
-    
-    private var actionOpacity: Double { (isHovered && !isGenerating) ? 1.0 : 0.0 }
 }
 
 struct UserMessageContentView: View {
@@ -4169,7 +4538,7 @@ struct UserMessageContentView: View {
     }
 }
 
-// MARK: - [Modified] AiChatView (固定唯一标识并消除全量层叠重绘)
+// MARK: - AiChatView (升级 LazyVStack 虚拟化渲染，解决多轮历史全量常驻问题)
 @MainActor
 struct AiChatView: View {
     @ObservedObject private var store = AiChatStore.shared
@@ -4202,7 +4571,8 @@ struct AiChatView: View {
                 
                 ContextTokenDividerBar(
                     currentTokens: store.currentContextTokenCount + realtimeInputTokens,
-                    maxTokens: maxTokens
+                    maxTokens: maxTokens,
+                    agentVM: orchestrator.agentVM
                 )
             } else {
                 Divider().background(Color(NSColor.separatorColor))
@@ -4398,40 +4768,91 @@ struct AiChatView: View {
             Spacer(minLength: 4)
             
             Menu {
-                let sessions = ChatHistoryManager.shared.sessions
-                if sessions.isEmpty {
+                let allSessions = ChatHistoryManager.shared.sessions
+                let currentAgentID = store.selectedAgentID
+                let currentAgent = ConfigManager.shared.app.agentProfiles.first(where: { $0.id == currentAgentID })
+                let currentAgentSessions = allSessions.filter { $0.agentID == currentAgentID }
+                let otherSessions = allSessions.filter { $0.agentID != currentAgentID }
+                
+                if allSessions.isEmpty {
                     Text("暂无历史记录").foregroundColor(.secondary)
                 } else {
-                    let activeSessions = sessions.filter { !$0.isArchived! }
-                    let archivedSessions = sessions.filter { $0.isArchived! }
-                    
-                    if !activeSessions.isEmpty {
-                        Text("活跃会话").font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
-                        ForEach(activeSessions.prefix(8)) { session in
-                            Button(action: { withAnimation { store.loadSession(session) } }) {
-                                HStack {
-                                    Text(session.title)
-                                    if store.currentSessionID == session.id { Image(systemName: "checkmark") }
+                    // 1. 当前智能体专属历史 (优先呈现最近 6 条)
+                    Section(header: Text("当前智能体: \(currentAgent?.name ?? "默认")")) {
+                        if currentAgentSessions.isEmpty {
+                            Text("暂无此智能体的历史记录").foregroundColor(.secondary)
+                        } else {
+                            ForEach(currentAgentSessions.prefix(6)) { session in
+                                Button(action: { withAnimation { store.loadSession(session) } }) {
+                                    HStack {
+                                        if session.isLocked == true {
+                                            Image(systemName: "lock.fill")
+                                        }
+                                        Text(session.title)
+                                        if store.currentSessionID == session.id {
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     
-                    if !archivedSessions.isEmpty {
+                    // 2. 其它智能体历史分级收拢 (子菜单展开，点击自动跨角色联动切换)
+                    if !otherSessions.isEmpty {
                         Divider()
-                        Text("📦 已归档经验库").font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
-                        ForEach(archivedSessions.prefix(8)) { session in
-                            Button(action: { withAnimation { store.loadSession(session) } }) {
-                                HStack {
-                                    Text(session.title)
-                                    if store.currentSessionID == session.id { Image(systemName: "checkmark") }
+                        
+                        let allProfiles = ConfigManager.shared.app.agentProfiles
+                        let sortByFreq = ConfigManager.shared.app.generalConfig.historySortByFrequency
+                        let distinctOtherAgentIDs = Array(Set(otherSessions.map { $0.agentID }))
+                        
+                        // 默认按 agentProfiles 顺序；若勾选频率排序，则按会话数降序排列（同频时以原始顺序稳定保底）
+                        let sortedOtherAgentIDs = distinctOtherAgentIDs.sorted { id1, id2 in
+                            if sortByFreq {
+                                let count1 = otherSessions.filter { $0.agentID == id1 }.count
+                                let count2 = otherSessions.filter { $0.agentID == id2 }.count
+                                if count1 != count2 {
+                                    return count1 > count2
+                                }
+                            }
+                            let idx1 = allProfiles.firstIndex(where: { $0.id == id1 }) ?? Int.max
+                            let idx2 = allProfiles.firstIndex(where: { $0.id == id2 }) ?? Int.max
+                            if idx1 != idx2 {
+                                return idx1 < idx2
+                            }
+                            return id1.uuidString < id2.uuidString
+                        }
+                        
+                        Menu("其它智能体历史 (\(otherSessions.count))") {
+                            ForEach(sortedOtherAgentIDs, id: \.self) { agentID in
+                                let agent = allProfiles.first(where: { $0.id == agentID })
+                                let agentName = agent?.name ?? "其它历史"
+                                let agentIcon = agent?.icon ?? "person.crop.square"
+                                let groupSessions = otherSessions.filter { $0.agentID == agentID }
+                                
+                                Menu {
+                                    ForEach(groupSessions.prefix(8)) { session in
+                                        Button(action: { withAnimation { store.loadSession(session) } }) {
+                                            HStack {
+                                                if session.isLocked == true {
+                                                    Image(systemName: "lock.fill")
+                                                }
+                                                Text(session.title)
+                                                if store.currentSessionID == session.id {
+                                                    Image(systemName: "checkmark")
+                                                }
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Label("\(agentName) (\(groupSessions.count))", systemImage: agentIcon)
                                 }
                             }
                         }
                     }
                     
                     Divider()
-                    Button("管理全部对话...") {
+                    Button("管理全部历史对话...") {
                         AgentManager.shared.show()
                         NotificationCenter.default.post(name: NSNotification.Name("SwitchAgentManagerTab"), object: 7)
                     }
@@ -4476,6 +4897,7 @@ struct AiChatView: View {
         .padding(.vertical, 6)
     }
     
+    // MARK: - 采用 LazyVStack 实施视口惰性化排盘
     private var messageListView: some View {
         ScrollView {
             ScrollViewReader { proxy in
@@ -4526,12 +4948,40 @@ struct AiChatView: View {
                     }
                     Color.clear.frame(height: 1).id("BOTTOM_MARKER")
                 }
-                .padding(.horizontal, 16).padding(.vertical, 12).frame(minWidth: 420, maxWidth: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .frame(minWidth: 420, maxWidth: .infinity, alignment: .topLeading)
                 .onChange(of: store.isLoading) { _, loading in
-                    if !loading && autoScrollEnabled { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo("BOTTOM_MARKER", anchor: .bottom) } } }
+                    if !loading && autoScrollEnabled {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                proxy.scrollTo("BOTTOM_MARKER", anchor: .bottom)
+                            }
+                        }
+                    }
+                }
+                .onReceive(store.onSessionLoaded) { _ in
+                    autoScrollEnabled = true
+                    // 历史会话加载时安全顺延至下一帧，精准平滑定位到最后一轮提问气泡顶部
+                    DispatchQueue.main.async {
+                        if let lastUserID = store.messages.last(where: { $0.isUser })?.id {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo(lastUserID, anchor: .top)
+                            }
+                        } else {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo("BOTTOM_MARKER", anchor: .bottom)
+                            }
+                        }
+                    }
                 }
             }
-        }.scrollContentBackground(.hidden).forceOverlayScrollbars().defaultScrollAnchor(.bottom).onReceive(NotificationCenter.default.publisher(for: NSScrollView.willStartLiveScrollNotification)) { _ in autoScrollEnabled = false }
+        }
+        .scrollContentBackground(.hidden)
+        .forceOverlayScrollbars()
+        .onReceive(NotificationCenter.default.publisher(for: NSScrollView.willStartLiveScrollNotification)) { _ in
+            autoScrollEnabled = false
+        }
     }
     
     @ViewBuilder private var imagePreviewView: some View {
@@ -4549,9 +4999,11 @@ struct AiChatView: View {
 struct ContextTokenDividerBar: View {
     let currentTokens: Int
     let maxTokens: Int
+    var agentVM: AgentViewModel? = nil
     
     @State private var isExpanded: Bool = false
     @State private var isHovered: Bool = false
+    @State private var showScratchpadPopover: Bool = false
     
     var usageRatio: Double {
         return Double(currentTokens) / Double(maxTokens)
@@ -4561,6 +5013,30 @@ struct ContextTokenDividerBar: View {
         if usageRatio > 0.9 { return .red }
         if usageRatio > 0.75 { return .orange }
         return .cyan
+    }
+    
+    private var currentScratchpadMarkdown: String {
+        agentVM?.sharedContext[AgentLongTermMemory.scratchpadKey]
+            ?? StructuredTagContextPlugin.currentScratchpadMarkdown
+            ?? ""
+    }
+    
+    private var currentSlotsJSON: String {
+        agentVM?.sharedContext[StructuredTagContextPlugin.structuredSlotsJsonKey]
+            ?? StructuredTagContextPlugin.currentSlotsJSON
+            ?? "{}"
+    }
+    
+    private var slotCount: Int {
+        if let data = currentSlotsJSON.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            return dict.count
+        }
+        return currentScratchpadMarkdown.isEmpty ? 0 : 1
+    }
+    
+    private var hasScratchpad: Bool {
+        !currentScratchpadMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     
     var body: some View {
@@ -4582,9 +5058,47 @@ struct ContextTokenDividerBar: View {
                         }
                     }
                     .frame(height: 4)
-                    .frame(maxWidth: 160)
+                    .frame(maxWidth: 140)
                     
                     Spacer()
+                    
+                    // 🧠 长期记忆底账查看入口 (Scratchpad Inspector)
+                    Button(action: { showScratchpadPopover.toggle() }) {
+                        HStack(spacing: 4.5) {
+                            Image(systemName: "brain.head.profile")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(hasScratchpad ? "状态基准 (\(slotCount)个槽位)" : "状态基准 (空)")
+                                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                            Image(systemName: "text.viewfinder")
+                                .font(.system(size: 9))
+                                .opacity(0.7)
+                        }
+                        .foregroundColor(hasScratchpad ? .purple : .secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(hasScratchpad ? Color.purple.opacity(0.12) : Color.primary.opacity(0.04))
+                        )
+                        .overlay(
+                            Capsule()
+                                .stroke(hasScratchpad ? Color.purple.opacity(0.35) : Color.primary.opacity(0.08), lineWidth: 0.8)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .popover(isPresented: $showScratchpadPopover, arrowEdge: .top) {
+                        ScratchpadInspectorPopoverView(
+                            scratchpadText: currentScratchpadMarkdown,
+                            slotsJSON: currentSlotsJSON,
+                            onClear: {
+                                agentVM?.sharedContext.removeValue(forKey: AgentLongTermMemory.scratchpadKey)
+                                agentVM?.sharedContext.removeValue(forKey: StructuredTagContextPlugin.structuredSlotsJsonKey)
+                                StructuredTagContextPlugin.resetRegistry()
+                                showScratchpadPopover = false
+                            }
+                        )
+                    }
+                    .help("查看已沉淀的长效记忆 (SCRATCHPAD) 与物理状态槽位")
                     
                     HStack(spacing: 6) {
                         Circle()
@@ -4592,7 +5106,7 @@ struct ContextTokenDividerBar: View {
                             .frame(width: 6, height: 6)
                         
                         if usageRatio > 1.0 {
-                            Text("记忆容量超限，早期上下文将被折叠")
+                            Text("记忆超限将折叠")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(.red)
                         } else {
@@ -4624,9 +5138,208 @@ struct ContextTokenDividerBar: View {
             .onTapGesture {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) { isExpanded.toggle() }
             }
-            .help(isExpanded ? "点击收起上下文大盘" : "点击展开上下文负载状态")
+            .help(isExpanded ? "点击收起上下文大盘" : "点击展开上下文负载与长期记忆")
         }
         .zIndex(100)
+    }
+}
+
+// MARK: - ==================== ScratchpadInspectorPopoverView ====================
+
+struct ScratchpadInspectorPopoverView: View {
+    let scratchpadText: String
+    let slotsJSON: String
+    let onClear: () -> Void
+    
+    @State private var displayMode: Int = 0 // 0: 分槽卡片, 1: 原始 Markdown
+    @State private var isCopied: Bool = false
+    
+    private var stateSlots: [String: String] {
+        if let data = slotsJSON.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+           !dict.isEmpty {
+            return dict
+        }
+        return [:]
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // 浮窗顶栏
+            HStack(spacing: 8) {
+                ZStack {
+                    Circle()
+                        .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing).opacity(0.2))
+                        .frame(width: 26, height: 26)
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.purple)
+                }
+                
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 6) {
+                        Text("长期记忆底账 (SCRATCHPAD)")
+                            .font(.system(size: 12.5, weight: .bold))
+                        
+                        HStack(spacing: 3) {
+                            Circle().fill(Color.green).frame(width: 5, height: 5)
+                            Text("Buffer: Pass")
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .foregroundColor(.green)
+                        }
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(Color.green.opacity(0.12))
+                        .cornerRadius(4)
+                    }
+                    Text("系统侧物理真值，跨轮次自动维护与独立注入")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                Picker("", selection: $displayMode) {
+                    Text("分槽卡片").tag(0)
+                    Text("原始文本").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 130)
+                
+                Spacer()
+                
+                Button(action: copyAll) {
+                    Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                        .font(.system(size: 11))
+                        .foregroundColor(isCopied ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help("复制完整 Markdown")
+                
+                Button(action: onClear) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                        .foregroundColor(.red.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .help("清空并重置长效记忆底账")
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(Color.primary.opacity(0.02))
+            
+            Divider()
+            
+            // 浮窗主视图
+            ScrollView(.vertical, showsIndicators: true) {
+                if scratchpadText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "brain.head.profile")
+                            .font(.system(size: 32))
+                            .foregroundColor(.secondary.opacity(0.3))
+                        Text("当前会话暂无沉淀的长效记忆槽位")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                        Text("当模型输出 <card> 面板或系统触发记忆蒸馏时，状态机将在此处归集。")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 60)
+                } else if displayMode == 0 && !stateSlots.isEmpty {
+                    // 分槽卡片模式
+                    LazyVStack(spacing: 10) {
+                        let sortedKeys = stateSlots.keys.sorted { k1, k2 in
+                            func p(_ k: String) -> Int {
+                                if k.contains("world_gateway") { return 0 }
+                                if k.contains("角色档案") { return 1 }
+                                if k.contains("瞬态契约") { return 2 }
+                                if k.contains("结算记录") { return 3 }
+                                return 4
+                            }
+                            let p1 = p(k1), p2 = p(k2)
+                            return p1 != p2 ? p1 < p2 : k1 < k2
+                        }
+                        
+                        ForEach(sortedKeys, id: \.self) { key in
+                            if let content = stateSlots[key] {
+                                SlotInspectCardRow(slotKey: key, content: content)
+                            }
+                        }
+                    }
+                    .padding(12)
+                } else {
+                    // 原始文本模式
+                    Text(scratchpadText.trimmingCharacters(in: .whitespacesAndNewlines))
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.9))
+                        .lineSpacing(4)
+                        .textSelection(.enabled)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .frame(width: 480, height: 380)
+        .background(.regularMaterial)
+    }
+    
+    private func copyAll() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(scratchpadText, forType: .string)
+        withAnimation { isCopied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { isCopied = false } }
+    }
+}
+
+struct SlotInspectCardRow: View {
+    let slotKey: String
+    let content: String
+    @State private var isCopied = false
+    
+    private var slotBadgeColor: Color {
+        if slotKey.contains("world_gateway") { return .blue }
+        if slotKey.contains("角色档案") { return .pink }
+        if slotKey.contains("瞬态契约") { return .purple }
+        if slotKey.contains("结算记录") { return .green }
+        return .cyan
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(slotKey)
+                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(slotBadgeColor)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(slotBadgeColor.opacity(0.12))
+                    .cornerRadius(4)
+                
+                Spacer()
+                
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(content, forType: .string)
+                    withAnimation { isCopied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { withAnimation { isCopied = false } }
+                }) {
+                    Image(systemName: isCopied ? "checkmark" : "doc.on.clipboard")
+                        .font(.system(size: 10))
+                        .foregroundColor(isCopied ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            
+            Text(content.trimmingCharacters(in: .whitespacesAndNewlines))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.85))
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
+        .cornerRadius(7)
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(slotBadgeColor.opacity(0.25), lineWidth: 0.8))
     }
 }
 
@@ -4777,6 +5490,8 @@ struct LLMBeaconView: View {
 public enum ActionBadgeType: Equatable, Sendable {
     case tool(name: String, callId: String, status: String)
     case rag(id: String, score: String?)
+    case ask(payload: String)
+    case skill(payload: String)
     case custom(scheme: String, payload: String)
 }
 
@@ -4795,26 +5510,29 @@ public struct ActionBadgeModel: Identifiable, Equatable, Sendable {
 }
 
 public struct ActionBadgeParser {
-    public static func extractBadges(from text: String) -> (cleanText: String, badges: [ActionBadgeModel]) {
-        var cleanText = text
+    // Raw String 下使用单反斜杠 \ 即可精确匹配 [ ] ( )
+    private static let badgePattern = #"\[(.*?)\]\((action://(inspect_tool|inspect_rag|ask|skill|custom)(?:/([^?)]*))?(?:\?([^)]*))?)\)"#
+    private static let regex = try! NSRegularExpression(pattern: badgePattern, options: [])
+    
+    /// 按行精准提取 action:// 动作徽标，并提取出前缀引导词与后缀
+    public static func parseBadgesInLine(_ line: String) -> (prefix: String, badges: [ActionBadgeModel], suffix: String)? {
+        guard line.contains("action://") else { return nil }
+        let nsLine = line as NSString
+        let matches = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+        guard !matches.isEmpty else { return nil }
+        
         var badges: [ActionBadgeModel] = []
-        
-        let pattern = "\\[(.*?)\\]\\((action://(inspect_tool|inspect_rag|custom)(?:/([^?)]*))?(?:\\?([^)]*))?)\\)"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return (text, []) }
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: text.utf16.count))
-        
-        for match in matches.reversed() {
-            guard let totalRange = Range(match.range, in: cleanText),
-                  let titleRange = Range(match.range(at: 1), in: cleanText),
-                  let urlRange = Range(match.range(at: 2), in: cleanText),
-                  let hostRange = Range(match.range(at: 3), in: cleanText) else { continue }
+        for match in matches {
+            guard match.range(at: 1).location != NSNotFound,
+                  match.range(at: 2).location != NSNotFound,
+                  match.range(at: 3).location != NSNotFound else { continue }
             
-            let title = String(cleanText[titleRange])
-            let rawUrl = String(cleanText[urlRange])
-            let host = String(cleanText[hostRange])
+            let title = nsLine.substring(with: match.range(at: 1))
+            let rawUrl = nsLine.substring(with: match.range(at: 2))
+            let host = nsLine.substring(with: match.range(at: 3)).lowercased()
             
-            let path = match.range(at: 4).location != NSNotFound ? (Range(match.range(at: 4), in: cleanText).map { String(cleanText[$0]) } ?? "") : ""
-            let query = match.range(at: 5).location != NSNotFound ? (Range(match.range(at: 5), in: cleanText).map { String(cleanText[$0]) } ?? "") : ""
+            let path = match.range(at: 4).location != NSNotFound ? nsLine.substring(with: match.range(at: 4)) : ""
+            let query = match.range(at: 5).location != NSNotFound ? nsLine.substring(with: match.range(at: 5)) : ""
             
             var queryParams: [String: String] = [:]
             for pair in query.components(separatedBy: "&") {
@@ -4838,28 +5556,60 @@ public struct ActionBadgeParser {
                 let score = queryParams["score"]
                 badgeType = .rag(id: path.removingPercentEncoding ?? path, score: score)
                 badgeId = path
+            } else if host == "ask" {
+                let rawPayload = path.isEmpty ? title : path
+                let payload = rawPayload.removingPercentEncoding ?? rawPayload
+                badgeType = .ask(payload: payload)
+                badgeId = UUID().uuidString
+            } else if host == "skill" {
+                let rawPayload = path.isEmpty ? title : path
+                let payload = rawPayload.removingPercentEncoding ?? rawPayload
+                badgeType = .skill(payload: payload)
+                badgeId = UUID().uuidString
             } else {
                 badgeType = .custom(scheme: host, payload: path)
                 badgeId = UUID().uuidString
             }
             
-            let badge = ActionBadgeModel(id: badgeId, type: badgeType, title: title, rawURLString: rawUrl)
-            badges.insert(badge, at: 0)
-            cleanText.removeSubrange(totalRange)
+            badges.append(ActionBadgeModel(id: badgeId, type: badgeType, title: title, rawURLString: rawUrl))
         }
         
-        return (cleanText.trimmingCharacters(in: .whitespacesAndNewlines), badges)
+        guard !badges.isEmpty else { return nil }
+        
+        let firstMatch = matches.first!
+        let lastMatch = matches.last!
+        let prefix = nsLine.substring(to: firstMatch.range.location)
+        let suffixStart = lastMatch.range.location + lastMatch.range.length
+        let suffix = suffixStart < nsLine.length ? nsLine.substring(from: suffixStart) : ""
+        
+        return (prefix, badges, suffix)
     }
 }
 
-// MARK: - 原生 macOS 极致圆角胶囊徽章组件
-
 struct ActionBadgeCapsuleView: View {
     let badge: ActionBadgeModel
-    let onTapTool: (String, String) -> Void
-    var onTapRAG: ((String) -> Void)? = nil
+    let skillLogs: [SkillExecutionLog]
+    var ragHits: [RAGHitLog] = []
+    var onAction: ((String) -> Void)? = nil
     
     @State private var isHovered: Bool = false
+    @State private var showPopover: Bool = false
+    
+    private var matchedSkillLog: SkillExecutionLog? {
+        guard case .tool(let name, let callId, _) = badge.type else { return nil }
+        if !callId.isEmpty, let log = skillLogs.first(where: { $0.confirmationId == callId || $0.id.uuidString == callId }) {
+            return log
+        }
+        return skillLogs.last(where: {
+            $0.skillName.lowercased() == name.lowercased() ||
+            $0.displayName.lowercased() == name.lowercased()
+        }) ?? skillLogs.last
+    }
+    
+    private var matchedRagHit: RAGHitLog? {
+        guard case .rag(let id, _) = badge.type else { return nil }
+        return ragHits.first(where: { $0.id.uuidString == id || $0.title == id })
+    }
     
     private var badgeThemeColor: Color {
         switch badge.type {
@@ -4870,8 +5620,10 @@ struct ActionBadgeCapsuleView: View {
             case "waiting": return Color.orange
             default:        return Color.purple
             }
-        case .rag:
+        case .rag, .ask:
             return Color.cyan
+        case .skill:
+            return Color.purple
         case .custom:
             return Color.indigo
         }
@@ -4888,6 +5640,10 @@ struct ActionBadgeCapsuleView: View {
             }
         case .rag:
             return "books.vertical.fill"
+        case .ask:
+            return "paperplane.fill"
+        case .skill:
+            return "wrench.and.screwdriver.fill"
         case .custom:
             return "link.circle.fill"
         }
@@ -4895,43 +5651,85 @@ struct ActionBadgeCapsuleView: View {
     
     var body: some View {
         Button(action: {
+            // 工具查看弹窗，快捷提问/技能直接触发执行
             switch badge.type {
-            case .tool(let name, let callId, _):
-                onTapTool(name, callId)
-            case .rag(let id, _):
-                onTapRAG?(id)
-            case .custom:
-                break
+            case .tool, .rag, .custom:
+                showPopover.toggle()
+            case .ask(let payload):
+                onAction?(payload)
+            case .skill(let payload):
+                let prompt = "请直接调用此技能(tool)：\(payload)。无需多余废话，直接执行。"
+                onAction?(prompt)
             }
         }) {
-            HStack(spacing: 4) {
+            HStack(spacing: 4.5) {
                 Image(systemName: iconName)
                     .font(.system(size: 9.5, weight: .bold))
                     .foregroundColor(badgeThemeColor)
                 
                 Text(cleanTitle)
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                    .foregroundColor(badgeThemeColor.opacity(0.95))
+                    .foregroundColor(badgeThemeColor.opacity(isHovered ? 1.0 : 0.92))
                     .lineLimit(1)
             }
-            .padding(.horizontal, 7)
+            .padding(.horizontal, 7.5)
             .padding(.vertical, 3)
             .background(
                 Capsule()
-                    .fill(badgeThemeColor.opacity(isHovered ? 0.20 : 0.10))
+                    .fill(badgeThemeColor.opacity(isHovered ? 0.22 : 0.10))
             )
             .overlay(
                 Capsule()
-                    .stroke(badgeThemeColor.opacity(isHovered ? 0.50 : 0.28), lineWidth: 0.8)
+                    .stroke(badgeThemeColor.opacity(isHovered ? 0.55 : 0.28), lineWidth: 0.8)
             )
-            .scaleEffect(isHovered ? 1.02 : 1.0)
+            .shadow(color: badgeThemeColor.opacity(isHovered ? 0.25 : 0.0), radius: 2.5, x: 0, y: 0.5)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .onHover { h in
-            withAnimation(.easeInOut(duration: 0.15)) { isHovered = h }
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = h }
             if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
-        .help("点击查看执行入参与返回详情")
+        .popover(isPresented: $showPopover, arrowEdge: .top) {
+            if let log = matchedSkillLog {
+                let isExec = log.resultOutput == "执行中..." || log.resultOutput == "等待授权..."
+                let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: log.skillName, output: log.resultOutput)
+                DetailedSkillView(
+                    log: log,
+                    themeColor: log.executorName != nil ? .purple : (isExec ? .blue : (isFailed ? .red : .green)),
+                    isExecuting: isExec
+                )
+            } else if let hit = matchedRagHit {
+                RAGChunkInspectorPopover(hit: hit)
+            } else {
+                VStack(spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "terminal.fill")
+                            .foregroundColor(badgeThemeColor)
+                        Text(cleanTitle)
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    }
+                    Text("当前动作已成功执行并被系统采纳。")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                .padding(12)
+                .frame(width: 220)
+                .background(.regularMaterial)
+            }
+        }
+        .help(helpText)
+    }
+    
+    private var helpText: String {
+        switch badge.type {
+        case .ask(let payload):
+            return "点击直接追问：\(payload)"
+        case .skill(let payload):
+            return "点击立即执行技能：\(payload)"
+        default:
+            return "点击查看执行入参与返回详情"
+        }
     }
     
     private var cleanTitle: String {
@@ -4942,5 +5740,232 @@ struct ActionBadgeCapsuleView: View {
             }
         }
         return str
+    }
+}
+
+// MARK: - 物理文件交付实体模型与智能解析器
+public struct DeliverableFileItem: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { fileURL.path }
+    public let fileName: String
+    public let fileURL: URL
+    public let fileSize: String
+    public let fileExtension: String
+}
+
+/// 语义流式图文片段实体 (采用原生 UUID，彻底消除 SwiftUI ForEach 渲染复用冲突)
+public struct FlowSegment: Identifiable {
+    public let id: UUID
+    public let kind: SegmentKind
+    
+    public enum SegmentKind {
+        case card(String)
+        case markdown(String)
+        case inlineFile(prefix: String, file: DeliverableFileItem, suffix: String)
+        case inlineBadges(prefix: String, badges: [ActionBadgeModel], suffix: String) // 🌟 [Added] 原位动作徽标行
+    }
+    
+    public init(id: UUID = UUID(), kind: SegmentKind) {
+        self.id = id
+        self.kind = kind
+    }
+}
+
+public struct InPlaceContentParser {
+    private static let pathPattern = #"(?:`|")?((?:~|\/)(?:[\w\.\-\u4e00-\u9fa5]+\/)+[\w\.\-\u4e00-\u9fa5]+\.(?:docx|doc|xlsx|xls|pptx|ppt|pdf|zip|tar|gz|tgz|7z|rar|csv|txt|json|png|jpg|jpeg|webp|dmg|pkg))(?:`|")?"#
+    private static let fileRegex = try! NSRegularExpression(pattern: pathPattern, options: [])
+    
+    /// 核心算法：按行精准分流，将徽标与文件严格留在原本所处的行就地渲染
+    public static func parse(from text: String) -> [FlowSegment] {
+        var segments: [FlowSegment] = []
+        let rawLines = text.components(separatedBy: .newlines)
+        var pendingMarkdownLines: [String] = []
+        
+        let flushMarkdown = {
+            let joined = pendingMarkdownLines.joined(separator: "\n")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                segments.append(FlowSegment(kind: .markdown(joined)))
+            }
+            pendingMarkdownLines.removeAll()
+        }
+        
+        for line in rawLines {
+            // 1. 优先检测当前行是否包含 action:// 动作徽标 (原位就地锚定)
+            if let (prefix, badges, suffix) = ActionBadgeParser.parseBadgesInLine(line) {
+                flushMarkdown()
+                segments.append(FlowSegment(kind: .inlineBadges(prefix: prefix, badges: badges, suffix: suffix)))
+                continue
+            }
+            
+            // 2. 检测当前行是否包含物理真实有效的交付文件
+            let nsLine = line as NSString
+            let fileMatches = fileRegex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+            var matchedFileInLine: (match: NSTextCheckingResult, fileItem: DeliverableFileItem)? = nil
+            
+            for m in fileMatches {
+                guard m.range(at: 1).location != NSNotFound else { continue }
+                let rawPath = nsLine.substring(with: m.range(at: 1))
+                let expandedPath = (rawPath as NSString).expandingTildeInPath
+                
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), !isDirectory.boolValue {
+                    let url = URL(fileURLWithPath: expandedPath)
+                    let ext = url.pathExtension.lowercased()
+                    
+                    var sizeText = ""
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: expandedPath),
+                       let size = attrs[.size] as? Int64 {
+                        let bcf = ByteCountFormatter()
+                        bcf.countStyle = .file
+                        sizeText = bcf.string(fromByteCount: size)
+                    }
+                    
+                    let item = DeliverableFileItem(
+                        fileName: url.lastPathComponent,
+                        fileURL: url,
+                        fileSize: sizeText,
+                        fileExtension: ext
+                    )
+                    matchedFileInLine = (m, item)
+                    break
+                }
+            }
+            
+            if let (match, fileItem) = matchedFileInLine {
+                flushMarkdown()
+                let prefix = nsLine.substring(to: match.range.location)
+                let suffixLocation = match.range.location + match.range.length
+                let suffix = suffixLocation < nsLine.length ? nsLine.substring(from: suffixLocation) : ""
+                
+                segments.append(FlowSegment(kind: .inlineFile(
+                    prefix: prefix,
+                    file: fileItem,
+                    suffix: suffix
+                )))
+                continue
+            }
+            
+            // 3. 普通文本行累加
+            pendingMarkdownLines.append(line)
+        }
+        
+        flushMarkdown()
+        return segments
+    }
+}
+
+// MARK: - 原生文件交付胶囊视图 (支持一键打开、访达定位与品牌色渲染)
+struct FileDeliverableCapsuleView: View {
+    let file: DeliverableFileItem
+    
+    @State private var isHovered: Bool = false
+    
+    private var themeColor: Color {
+        switch file.fileExtension {
+        case "docx", "doc":
+            return Color(hex: "#1E6FD9") // Word Blue
+        case "xlsx", "xls", "csv":
+            return Color(hex: "#107C41") // Excel Green
+        case "pptx", "ppt":
+            return Color(hex: "#D24726") // PowerPoint Orange-Red
+        case "pdf":
+            return Color(hex: "#E11D48") // PDF Rose
+        case "zip", "tar", "gz", "tgz", "7z", "rar":
+            return Color(hex: "#D97706") // Archive Amber
+        case "png", "jpg", "jpeg", "webp", "gif":
+            return Color(hex: "#06B6D4") // Image Cyan
+        case "py", "sh", "swift", "js", "ts", "json":
+            return Color(hex: "#8B5CF6") // Code Purple
+        default:
+            return Color(hex: "#3B82F6") // Generic Blue
+        }
+    }
+    
+    private var iconName: String {
+        switch file.fileExtension {
+        case "docx", "doc":
+            return "doc.text.fill"
+        case "xlsx", "xls", "csv":
+            return "tablecells.fill"
+        case "pptx", "ppt":
+            return "rectangle.fill.on.rectangle.fill"
+        case "pdf":
+            return "doc.viewfinder.fill"
+        case "zip", "tar", "gz", "tgz", "7z", "rar":
+            return "archivebox.fill"
+        case "png", "jpg", "jpeg", "webp", "gif":
+            return "photo.fill"
+        case "py", "sh", "swift", "js", "ts":
+            return "terminal.fill"
+        default:
+            return "doc.fill"
+        }
+    }
+    
+    var body: some View {
+        Button(action: {
+            // 单击直接唤起 macOS 系统默认应用 (如 Word / WPS / Pages)
+            NSWorkspace.shared.open(file.fileURL)
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: iconName)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(themeColor)
+                
+                Text(file.fileName)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundColor(themeColor.opacity(isHovered ? 1.0 : 0.95))
+                    .lineLimit(1)
+                
+                if !file.fileSize.isEmpty {
+                    Text(file.fileSize)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 1)
+                }
+                
+                // 辅助定位按钮
+                Button(action: {
+                    NSWorkspace.shared.activateFileViewerSelecting([file.fileURL])
+                }) {
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(themeColor.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .help("在访达中显示")
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4.5)
+            .background(
+                Capsule()
+                    .fill(themeColor.opacity(isHovered ? 0.22 : 0.10))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(themeColor.opacity(isHovered ? 0.60 : 0.28), lineWidth: 0.8)
+            )
+            .shadow(color: themeColor.opacity(isHovered ? 0.28 : 0.0), radius: 3, x: 0, y: 0.5)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { h in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = h }
+            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        // 原生上下文菜单支持
+        .contextMenu {
+            Button("打开此文件") {
+                NSWorkspace.shared.open(file.fileURL)
+            }
+            Button("在访达中定位") {
+                NSWorkspace.shared.activateFileViewerSelecting([file.fileURL])
+            }
+            Divider()
+            Button("拷贝完整文件路径") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(file.fileURL.path, forType: .string)
+            }
+        }
+        .help("单击直接打开文件\n物理路径: \(file.fileURL.path)\n右键可定位到访达或复制路径")
     }
 }

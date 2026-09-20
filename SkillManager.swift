@@ -401,6 +401,10 @@ public final class EnvironmentResolver {
         let fullPath = await getResolvedPATH()
         env["PATH"] = fullPath
         
+        // 核心加固：强制注入 UTF-8 编码，防止 GUI 管道中运行 Node/Python 遇到中文表格时闪退
+        env["LANG"] = "en_US.UTF-8"
+        env["LC_ALL"] = "en_US.UTF-8"
+        
         // 统一注入上下文变量 (CTX_XXX)
         for (k, v) in sharedContext {
             env["CTX_\(k.uppercased())"] = v
@@ -1083,12 +1087,14 @@ public struct LocalSkillScanner {
     ) -> (type: SkillType, entryPoint: String, executionBody: String) {
         let fileManager = FileManager.default
         
+        // 1. 显式声明优先
         if let explicit = explicitTypeStr, !explicit.isEmpty {
             let mapped = mapTypeString(explicit)
             let (ep, body) = extractBodyForType(type: mapped, defaultName: skillName, markdown: markdown)
             return (mapped, ep, body)
         }
         
+        // 2. 本地物理脚本文件检索 (Python / AppleScript / Shell)
         var candidates: [URL] = []
         if let rootFiles = try? fileManager.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil) {
             candidates.append(contentsOf: rootFiles)
@@ -1116,24 +1122,80 @@ public struct LocalSkillScanner {
             return (.shell, relPath, body)
         }
         
-        var potentialCommands: Set<String> = [
-            skillName,
-            skillName.replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression),
-            skillName.replacingOccurrences(of: "_", with: "-"),
-            dirURL.lastPathComponent.replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression)
+        // 3. CLI 宿主程序探针：建立确定性候选优先级队列
+        var orderedCandidates: [String] = []
+        var seenCandidates = Set<String>()
+        
+        func appendCandidate(_ cmd: String) {
+            let clean = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty, clean.count >= 2, !seenCandidates.contains(clean) else { return }
+            seenCandidates.insert(clean)
+            orderedCandidates.append(clean)
+        }
+        
+        // 系统命令与运行时黑名单 (严格排除 command, which, test 等系统封装脚本)
+        let systemToolBlacklist: Set<String> = [
+            "command", "which", "test", "env", "echo", "type", "true", "false",
+            "npm", "npx", "node", "nodejs", "pnpm", "pnpx", "yarn", "bun", "bunx",
+            "python", "python3", "pip", "pip3", "brew", "git", "bash", "sh", "zsh",
+            "cat", "curl", "wget", "rm", "cp", "mv", "chmod", "chown", "sudo",
+            "ls", "cd", "mkdir", "export", "source", "install", "unlink", "link",
+            "grep", "sed", "awk", "kill", "ps", "top", "open", "clear"
         ]
         
-        let cliRegex = try? NSRegularExpression(pattern: #"`([a-zA-Z0-9_-]+(?:-cli)?)\s+[^`]*`"#)
-        if let regex = cliRegex {
-            let matches = regex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown))
-            for m in matches.prefix(5) {
-                if let r = Range(m.range(at: 1), in: markdown) {
-                    potentialCommands.insert(String(markdown[r]))
+        // 优先级 A：从本地 package.json 提取 bin 执行体
+        let pkgURL = dirURL.appendingPathComponent("package.json")
+        if fileManager.fileExists(atPath: pkgURL.path),
+           let data = try? Data(contentsOf: pkgURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let binStr = json["bin"] as? String {
+                let base = (binStr as NSString).lastPathComponent
+                appendCandidate((base as NSString).deletingPathExtension)
+            } else if let binDict = json["bin"] as? [String: Any] {
+                for key in binDict.keys {
+                    appendCandidate(key)
                 }
             }
         }
         
-        for cmd in potentialCommands where !cmd.isEmpty {
+        // 优先级 B：从技能名拆解的短标识 (如 weaver-e9-assistant 拆解出 e9)
+        let subTokens = skillName.components(separatedBy: CharacterSet(charactersIn: "-_"))
+        for token in subTokens {
+            let clean = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean.count >= 2 && clean.count <= 6 && !systemToolBlacklist.contains(clean.lowercased()) {
+                appendCandidate(clean)
+            }
+        }
+        
+        // 优先级 C：从 Markdown 代码块及反引号中提取高频主命令
+        let codeBlockPattern = #"(?m)(?:```(?:bash|sh|zsh|cli)?[\r\n]+|`)([a-zA-Z0-9_-]{2,16})(?:\s+[^`\r\n]*)?(?:```|`)"#
+        if let regex = try? NSRegularExpression(pattern: codeBlockPattern) {
+            let matches = regex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown))
+            var freqMap: [String: Int] = [:]
+            for m in matches {
+                if let r = Range(m.range(at: 1), in: markdown) {
+                    let cmd = String(markdown[r]).lowercased()
+                    if !systemToolBlacklist.contains(cmd) {
+                        freqMap[cmd, default: 0] += 1
+                    }
+                }
+            }
+            for (cmd, _) in freqMap.sorted(by: { $0.value > $1.value }) {
+                appendCandidate(cmd)
+            }
+        }
+        
+        // 优先级 D：技能派生全名
+        let strippedName = skillName.replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression)
+        appendCandidate(skillName)
+        appendCandidate(strippedName)
+        appendCandidate(skillName.replacingOccurrences(of: "_", with: "-"))
+        appendCandidate(dirURL.lastPathComponent.replacingOccurrences(of: "^skill[-_]", with: "", options: .regularExpression))
+        
+        // 遍历有序候选集，在系统 PATH 中探测实体
+        for cmd in orderedCandidates {
+            if systemToolBlacklist.contains(cmd.lowercased()) { continue }
+            
             for searchPath in systemPaths {
                 let binaryPath = (searchPath as NSString).appendingPathComponent(cmd)
                 if fileManager.isExecutableFile(atPath: binaryPath) {
@@ -1142,6 +1204,7 @@ public struct LocalSkillScanner {
             }
         }
         
+        // 4. 文档内联代码块探针
         let pattern = "(?s)```(python|bash|sh|shell|zsh|applescript|cli)\\s*\\n(.*?)```"
         if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
             let nsString = markdown as NSString
@@ -1157,6 +1220,7 @@ public struct LocalSkillScanner {
             }
         }
         
+        // 5. 最终降级兜底：透传 Shell 代理执行
         let defaultShellScript = """
         if [ -n "$ARG_RAW_COMMAND" ]; then
             eval "$ARG_RAW_COMMAND"
@@ -1390,133 +1454,151 @@ public func Skill_CallPersona(boundPersonas: [DigitalPersona] = []) -> AgentSkil
     )
 }
 
-// MARK: - ==================== 5. SkillCommandBridge (通用指令与参数桥接器) ====================
+// MARK: - 终端命令执行器 (内置系统级技能)
+/// 提供在宿主机直接执行 Shell 命令与内联脚本的基础环境
+/// - Returns: 配置了完备自愈机制与 Word/文件操作范式的 AgentSkill
+public func Skill_Terminal() -> AgentSkill {
+    let manualContent = """
+    ---
+    name: system_terminal
+    description: 宿主机通用终端与脚本执行环境
+    category: 系统
+    ---
 
-public enum SkillCommandBridge {
+    # 💻 通用终端与自动化执行手册
+
+    本工具用于在宿主机环境执行 Shell 命令、临时 Python 脚本以及基础文件系统操作。专有业务领域接口请通过 execute_skill 对应调用。
+
+    ## 1. 富文本与 Office 文档生成范式 (Word / Excel)
+    当需要为用户生成 Word (.docx) 或数据表格时，推荐通过内联 Python 脚本一步完成。
+
+    ### Word (.docx) 标准执行模版：
+    ```bash
+    python3 - << 'EOF'
+    import sys, os
+
+    # 1. 依赖动态自愈检查
+    try:
+        import docx
+    except ImportError:
+        os.system("pip3 install -q python-docx")
+        import docx
+
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+
+    doc = Document()
+    doc.add_heading('文档标题', level=1)
+    doc.add_paragraph('正文段落内容...')
+
+    # 2. 规范交付路径：统一落地至用户 Downloads 目录
+    out_dir = os.path.expanduser("~/Downloads")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "交付文档.docx")
+
+    doc.save(out_path)
+    print(f"FILE_CREATED_SUCCESS: {out_path}")
+    EOF
+    ```
+
+    ## 2. 基础文件与归档操作范式
+    - 中间过程临时解压（用于安装、编译、检查文件内容等中间步骤）：
+      推荐优先解压到系统临时目录（如 `/tmp/<包名>`），系统会自动回收临时空间，保持宿主环境整洁。
+      示例：`unzip -q -o "archive.zip" -d "/tmp/pkg_temp" && cd "/tmp/pkg_temp"`
+    - 最终目标解压（用户明确要求解压文件到本地留存）：
+      解压至用户指定路径或 `~/Downloads/<目录>`，并向用户交付解压后的物理绝对路径。
+    - 归档检查：调用 `unzip -l "archive.zip"` 查看目录清单。
+    - 验证安装：`npm list -g --depth=0` 或 `which <cmd> && <cmd> --version`。
+
+    ## 3. 产物交付与凭据准则
+    - 脚本执行结束时，在控制台输出真实控制台回显。
+    - 结单阶段将控制台输出作为有效客观凭据交付。
+    """
+
+    let executionBody = #"""
+    #!/usr/bin/env zsh
+
+    # 1. 兼容多入参键名 (自适应 raw_command / input / command)
+    CMD="${ARG_RAW_COMMAND:-${ARG_INPUT:-$ARG_COMMAND}}"
+    if [ -z "$CMD" ]; then
+        echo "【自愈提示】: 未接收到执行指令，请传入具体的待执行命令或脚本。"
+        exit 1
+    fi
+
+    # 2. 静默与非交互式运行环境注入 (防死锁与 ANSI 颜色污染)
+    export TERM=dumb
+    export NO_COLOR=1
+    export CI=true
+    export DEBIAN_FRONTEND=noninteractive
+    export PYTHONUNBUFFERED=1
+
+    # 3. 波浪号绝对路径安全展开
+    CMD="${CMD/#\~/$HOME}"
+    CMD="${CMD//\~\//$HOME/}"
+
+    # 4. 局部虚拟环境（.venv / node_modules）自动感知与 PATH 优先注入
+    if [ -d "venv/bin" ]; then
+        export PATH="$(pwd)/venv/bin:$PATH"
+    elif [ -d ".venv/bin" ]; then
+        export PATH="$(pwd)/.venv/bin:$PATH"
+    fi
+    if [ -d "node_modules/.bin" ]; then
+        export PATH="$(pwd)/node_modules/.bin:$PATH"
+    fi
+
+    # 5. 执行指令 (关闭 stdin 防止终端交互阻塞，合并 stdout 与 stderr，原汁原味返回)
+    eval "$CMD" </dev/null 2>&1
+    exit $?
+    """#
+
+    return AgentSkill(
+        name: "system_terminal",
+        displayName: "💻 终端脚本执行器",
+        description: "【通用基础工具】用于在宿主机执行系统级基础操作（如文件解压归档、目录检查、临时 Python 脚本生成 Word/Excel 文档等）。专有业务领域接口请通过 execute_skill 对应调用。",
+        detailedInstruction: manualContent,
+        type: .shell,
+        parameters: [
+            SkillParameter(
+                name: "raw_command",
+                type: .string,
+                description: "要执行的 Shell 命令或内联脚本，例如: unzip -l archive.zip 或 npm list -g --depth=0",
+                isRequired: true
+            )
+        ],
+        executionBody: executionBody,
+        isEnabled: true,
+        requiresConfirmation: false,
+        outputKey: "shell_output",
+        isLocal: false,
+        category: "系统"
+    )
+}
+
+// MARK: - ==================== 5. Skill Execution & Manual Architecture (解耦架构) ====================
+
+// MARK: - 5.1 SkillBinaryResolver: 可执行实体识别与别名推导引擎
+/// 负责技能宿主程序、物理别名挖掘及系统环境工具黑名单管控
+public enum SkillBinaryResolver {
     
-    /// 自动识别并剥离模型在 input 中附带的解释器前缀（如 node, python, npx）、多级脚本路径及 CLI 二进制自引用名称
-    public static func normalizeCLICommand(command: String, skill: AgentSkill) -> String {
-        var raw = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return "" }
-        
-        let workingDir = skill.workingDirectory ?? ConfigManager.shared.skillsPath?.path ?? ""
-        let aliases = resolveDynamicPhysicalAliases(skill: skill, workingDirectory: workingDir)
-        
-        let runtimeWrappers: Set<String> = [
-            "node", "nodejs", "npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx",
-            "python", "python3", "py", "bash", "sh", "zsh", "env"
-        ]
-        
-        var hasMutated = true
-        var iterationCount = 0
-        let maxIterations = 4
-        
-        while hasMutated && iterationCount < maxIterations {
-            hasMutated = false
-            iterationCount += 1
-            
-            let tokens = splitCommandLineTokens(raw)
-            guard let firstToken = tokens.first else { break }
-            
-            let normalizedToken = cleanToken(firstToken)
-            let tokenBaseName = (normalizedToken as NSString).lastPathComponent.lowercased()
-            let tokenWithoutExt = (tokenBaseName as NSString).deletingPathExtension.lowercased()
-            
-            if runtimeWrappers.contains(tokenBaseName) || runtimeWrappers.contains(tokenWithoutExt) {
-                if tokens.count > 1 {
-                    raw = tokens.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-                    hasMutated = true
-                    continue
-                }
-            }
-            
-            let isMatched = aliases.contains(normalizedToken.lowercased())
-                || aliases.contains(tokenBaseName)
-                || aliases.contains(tokenWithoutExt)
-                || aliases.contains(where: { tokenBaseName.hasPrefix($0) || $0.hasPrefix(tokenBaseName) && tokenBaseName.count >= 3 })
-            
-            if isMatched {
-                if tokens.count > 1 {
-                    raw = tokens.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-                    hasMutated = true
-                    LogManager.shared.info(
-                        "🪄 [通用命令净化] 自动识别并剥离 CLI 入口自引用 [\(firstToken)]，实际执行子命令: [\(raw)]",
-                        parentID: LogManager.shared.activeContextID
-                    )
-                } else {
-                    raw = "--help"
-                    hasMutated = false
-                }
-            }
-        }
-        
-        return raw
-    }
+    /// POSIX 保留命令、系统包装脚本与包管理器黑名单（杜绝文档排错文本误抢占为工具实体）
+    public static let systemToolBlacklist: Set<String> = [
+        "command", "which", "test", "env", "echo", "type", "true", "false",
+        "npm", "npx", "node", "nodejs", "pnpm", "pnpx", "yarn", "bun", "bunx",
+        "python", "python3", "pip", "pip3", "brew", "git", "bash", "sh", "zsh",
+        "cat", "curl", "wget", "rm", "cp", "mv", "chmod", "chown", "sudo",
+        "ls", "cd", "mkdir", "export", "source", "install", "unlink", "link",
+        "grep", "sed", "awk", "kill", "ps", "top", "open", "clear"
+    ]
     
-    /// 自动将命令行中的内联 JSON 转存为工作区临时文件
-    public static func autoBridgeInlineJSONToTempFile(command: String, workingDirectory: String) -> String {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // 同时探测 Object 和 Array 的边界
-        let firstObj = trimmed.firstIndex(of: "{")
-        let lastObj = trimmed.lastIndex(of: "}")
-        let firstArr = trimmed.firstIndex(of: "[")
-        let lastArr = trimmed.lastIndex(of: "]")
-        
-        var start: String.Index? = nil
-        var end: String.Index? = nil
-        
-        if let fO = firstObj, let lO = lastObj, fO < lO {
-            start = fO; end = lO
-        }
-        if let fA = firstArr, let lA = lastArr, fA < lA {
-            // 如果两者都存在，取最外层边界
-            if start == nil || fA < start! { start = fA }
-            if end == nil || lA > end! { end = lA }
-        }
-        
-        guard let jsonStart = start, let jsonEnd = end, jsonStart < jsonEnd else {
-            return command
-        }
-        
-        let jsonCandidate = String(trimmed[jsonStart...jsonEnd])
-        
-        // 校验是否为合法 JSON
-        if let data = jsonCandidate.data(using: .utf8),
-           (try? JSONSerialization.jsonObject(with: data)) != nil {
-            
-            let tempFileName = "auto_payload_\(UUID().uuidString.prefix(8)).json"
-            let tempFileURL = URL(fileURLWithPath: workingDirectory).appendingPathComponent(tempFileName)
-            
-            do {
-                try jsonCandidate.write(to: tempFileURL, atomically: true, encoding: .utf8)
-                let prefix = String(trimmed[..<jsonStart]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
-                let suffix = String(trimmed[trimmed.index(after: jsonEnd)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
-                
-                // 智能处理用户是否传入了 @ 符号，保障文件路径衔接
-                let targetArgPath = tempFileURL.path
-                let spacer = prefix.hasSuffix("@") ? "" : " "
-                let bridgedCommand = "\(prefix)\(spacer)\(targetArgPath) \(suffix)".trimmingCharacters(in: .whitespaces)
-                
-                LogManager.shared.info(
-                    "🪄 [通用参数桥接] 已将内联 JSON 自动转存为临时文件 [\(targetArgPath)]",
-                    parentID: LogManager.shared.activeContextID
-                )
-                return bridgedCommand
-            } catch {
-                return command
-            }
-        }
-        
-        return command
-    }
-    
-    /// 动态挖掘技能的全部物理特征别名集合
+    /// 动态挖掘技能的全部物理特征别名集合 (覆盖完整名称、连字符短词及文档中的高频命令)
+    /// - Parameters:
+    ///   - skill: 目标技能实体
+    ///   - workingDirectory: 技能物理工作区目录
+    /// - Returns: 经过清洗的特征别名哈希集合
     public static func resolveDynamicPhysicalAliases(skill: AgentSkill, workingDirectory: String) -> Set<String> {
         var aliases: Set<String> = []
         
+        // 1. 提取执行体自身标识
         let execBody = skill.executionBody.trimmingCharacters(in: .whitespacesAndNewlines)
         if !execBody.isEmpty {
             let base = (execBody as NSString).lastPathComponent.lowercased()
@@ -1525,6 +1607,7 @@ public enum SkillCommandBridge {
             aliases.insert((base as NSString).deletingPathExtension)
         }
         
+        // 2. 提取入口脚本标识
         if let entry = skill.entryPoint?.trimmingCharacters(in: .whitespacesAndNewlines), !entry.isEmpty {
             let base = (entry as NSString).lastPathComponent.lowercased()
             aliases.insert(entry.lowercased())
@@ -1532,6 +1615,7 @@ public enum SkillCommandBridge {
             aliases.insert((base as NSString).deletingPathExtension)
         }
         
+        // 3. 提取技能标识及其连字符拆分词元 (如 weaver-e9-assistant 提取 e9)
         let sName = skill.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !sName.isEmpty {
             aliases.insert(sName)
@@ -1539,8 +1623,36 @@ public enum SkillCommandBridge {
             aliases.insert(stripped)
             let withoutCli = stripped.replacingOccurrences(of: "[-_]cli$", with: "", options: .regularExpression)
             if !withoutCli.isEmpty { aliases.insert(withoutCli) }
+            
+            let subTokens = sName.components(separatedBy: CharacterSet(charactersIn: "-_"))
+            for token in subTokens {
+                let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                if cleanToken.count >= 2 && cleanToken.count <= 6 && !systemToolBlacklist.contains(cleanToken) {
+                    aliases.insert(cleanToken)
+                }
+            }
         }
         
+        // 4. 从说明文档中提取最高频的反引号命令名称 (如 `e9 version` 提取 e9)
+        if !skill.detailedInstruction.isEmpty {
+            let cliRegex = try? NSRegularExpression(pattern: #"(?m)(?:```(?:bash|sh|zsh|cli)?[\r\n]+|`)([a-zA-Z0-9_-]{2,10})(?:\s+[^`\r\n]*)?(?:```|`)"#)
+            if let matches = cliRegex?.matches(in: skill.detailedInstruction, range: NSRange(skill.detailedInstruction.startIndex..., in: skill.detailedInstruction)) {
+                var frequencyMap: [String: Int] = [:]
+                for m in matches {
+                    if let r = Range(m.range(at: 1), in: skill.detailedInstruction) {
+                        let cmd = String(skill.detailedInstruction[r]).lowercased()
+                        if !systemToolBlacklist.contains(cmd) {
+                            frequencyMap[cmd, default: 0] += 1
+                        }
+                    }
+                }
+                if let topCmd = frequencyMap.sorted(by: { $0.value > $1.value }).first?.key {
+                    aliases.insert(topCmd)
+                }
+            }
+        }
+        
+        // 5. 探针本地 package.json 的 bin 声明
         if !workingDirectory.isEmpty {
             let pkgURL = URL(fileURLWithPath: workingDirectory).appendingPathComponent("package.json")
             if FileManager.default.fileExists(atPath: pkgURL.path),
@@ -1573,59 +1685,51 @@ public enum SkillCommandBridge {
         return aliases.filter { $0.count >= 2 }
     }
     
-    public static func purifyAndStructureManual(rawContent: String, skillName: String, folderURL: URL) -> String {
-        var cleanText = rawContent
-        var detectedSubDocs: [String] = []
-        let fileManager = FileManager.default
-        
-        if let enumerator = fileManager.enumerator(at: folderURL, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
-            for case let fileURL as URL in enumerator {
-                if fileURL.pathExtension.lowercased() == "md" && !fileURL.lastPathComponent.lowercased().contains("skill.md") {
-                    let relative = fileURL.path.replacingOccurrences(of: folderURL.path + "/", with: "")
-                    detectedSubDocs.append(relative)
-                }
-            }
+    /// 推导当前技能最具代表性的主程序可执行文件名 (优先选择最精炼的专属别名，如 e9)
+    /// - Parameters:
+    ///   - skill: 目标技能实体
+    ///   - workingDirectory: 工作区目录
+    ///   - aliases: 已生成的特征别名池
+    /// - Returns: 确定的主执行程序名称
+    public static func resolvePrimaryBinaryName(skill: AgentSkill, workingDirectory: String, aliases: Set<String>) -> String? {
+        // 1. 优先提取 2~6 字符且代表主程序的短标识 (如 e9)
+        let shortCandidates = aliases.filter {
+            !$0.contains("-cli") &&
+            !$0.contains("_cli") &&
+            !$0.contains(" ") &&
+            $0.count >= 2 &&
+            $0.count <= 6
+        }
+        if let bestShort = shortCandidates.sorted(by: { $0.count < $1.count }).first {
+            return bestShort
         }
         
-        var navigationHeader = """
-        【📖 手册结构透视与子文档索引】:
-        """
-        
-        if !detectedSubDocs.isEmpty {
-            navigationHeader += "\n本主手册仅为概览。要获取实际可执行的命令规范与参数契约，请务必继续调用 `read_skill_manual(target_skill_name: \"\(skillName)\", doc_path: \"子文档路径\")` 精读以下对应模块：\n"
-            for doc in detectedSubDocs.sorted() {
-                navigationHeader += "- 📄 `\(doc)`\n"
-            }
-        } else {
-            navigationHeader += "\n(当前技能目录下无独立子文档，所有规则均在下方完整呈现)\n"
-        }
-        navigationHeader += "\n---\n"
-        
-        let replacements: [(String, String)] = [
-            ("严禁在第一步盲目创建黑板", "在规划前先执行只读环境探测"),
-            ("不得以待手工配置为由", "配置项需通过物理读回证据核验一致"),
-            ("不得自写", "统一使用工具内置的"),
-            ("严禁", "必须严格按规范"),
-            ("禁止", "请避免")
-        ]
-        
-        for (pattern, target) in replacements {
-            cleanText = cleanText.replacingOccurrences(of: pattern, with: target)
+        // 2. 检查 executionBody 是否本身为单个二进制程序
+        let exec = skill.executionBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !exec.isEmpty && !exec.contains(" ") && !exec.contains("\n") {
+            return (exec as NSString).lastPathComponent
         }
         
-        return navigationHeader + cleanText
+        // 3. 兜底选取最短且无 cli 后缀的别名
+        let candidates = aliases.filter { !$0.contains("-cli") && !$0.contains("_cli") && $0.count <= 12 }
+        return candidates.sorted(by: { $0.count < $1.count }).first
     }
+}
+
+// MARK: - 5.2 CLICommandNormalizer: 命令行参数清洗、分词与桥接引擎
+/// 负责严格切词、剥除外层字面量引号、执行体对齐与内联 JSON 转存
+public enum CLICommandNormalizer {
     
-    public static func splitCommandLine(_ command: String) -> [String] {
-        splitCommandLineTokens(command)
-    }
-    
+    /// 命令行精准切词器：剥除外层字面量引号，避免给底层进程 argv 传递残留引号导致参数解析失败
+    /// - Parameter command: 待切分的完整命令行字符串
+    /// - Returns: 纯净的参数数组 (argv)
     public static func splitCommandLineTokens(_ command: String) -> [String] {
         var tokens: [String] = []
         var currentToken = ""
         var inSingleQuote = false
         var inDoubleQuote = false
         var isEscaped = false
+        var hasQuotedToken = false
         
         for char in command {
             if isEscaped {
@@ -1639,32 +1743,426 @@ public enum SkillCommandBridge {
             }
             if char == "'" && !inDoubleQuote {
                 inSingleQuote.toggle()
-                currentToken.append(char)
-                continue
+                hasQuotedToken = true
+                continue // 仅切换状态，不将单引号自身存入参数内容
             }
             if char == "\"" && !inSingleQuote {
                 inDoubleQuote.toggle()
-                currentToken.append(char)
-                continue
+                hasQuotedToken = true
+                continue // 仅切换状态，不将双引号自身存入参数内容
             }
             if char.isWhitespace && !inSingleQuote && !inDoubleQuote {
-                if !currentToken.isEmpty {
+                if !currentToken.isEmpty || hasQuotedToken {
                     tokens.append(currentToken)
                     currentToken = ""
+                    hasQuotedToken = false
                 }
             } else {
                 currentToken.append(char)
             }
         }
-        if !currentToken.isEmpty {
+        if !currentToken.isEmpty || hasQuotedToken {
             tokens.append(currentToken)
         }
         return tokens
     }
     
-    private static func cleanToken(_ token: String) -> String {
+    public static func splitCommandLine(_ command: String) -> [String] {
+        splitCommandLineTokens(command)
+    }
+    
+    /// 自动识别并清洗命令行参数：在 .cli 模式下仅在确认首词等于执行体时剥离，在 .shell 模式下自动补齐缺失的主命令
+    /// - Parameters:
+    ///   - command: 模型传入的原始指令字符串
+    ///   - skill: 当前挂载的目标技能实体
+    /// - Returns: 经过网关校准对齐后的可执行命令串
+    public static func normalizeCLICommand(command: String, skill: AgentSkill) -> String {
+        var raw = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return "" }
+        
+        // 防篡改：通用终端与脚本执行器 (system_terminal / bash_runner) 接收任意原生命令，
+        // 绝对禁止剥离运行器（如 npm），也绝对禁止追加推导的主程序前缀（如 unzip）
+        let sName = skill.name.lowercased()
+        if sName == "system_terminal" || sName == "bash_runner" || sName.contains("terminal") {
+            return raw
+        }
+        
+        let workingDir = skill.workingDirectory ?? ConfigManager.shared.skillsPath?.path ?? ""
+        let aliases = SkillBinaryResolver.resolveDynamicPhysicalAliases(skill: skill, workingDirectory: workingDir)
+        let primaryBinary = SkillBinaryResolver.resolvePrimaryBinaryName(skill: skill, workingDirectory: workingDir, aliases: aliases)
+        let boundBinaryName = (skill.executionBody as NSString).lastPathComponent.lowercased()
+        
+        let runtimeWrappers: Set<String> = [
+            "node", "nodejs", "npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx",
+            "python", "python3", "py", "bash", "sh", "zsh", "env"
+        ]
+        
+        var hasMutated = true
+        var iterationCount = 0
+        let maxIterations = 4
+        
+        while hasMutated && iterationCount < maxIterations {
+            hasMutated = false
+            iterationCount += 1
+            
+            let tokens = splitCommandLineTokens(raw)
+            guard let firstToken = tokens.first else { break }
+            
+            let normalizedToken = cleanToken(firstToken)
+            let tokenBaseName = (normalizedToken as NSString).lastPathComponent.lowercased()
+            let tokenWithoutExt = (tokenBaseName as NSString).deletingPathExtension.lowercased()
+            
+            // 剥离显式运行时解释器 (仅对专用 CLI 技能生效)
+            if runtimeWrappers.contains(tokenBaseName) || runtimeWrappers.contains(tokenWithoutExt) {
+                if tokens.count > 1 {
+                    raw = tokens.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                    hasMutated = true
+                    continue
+                }
+            }
+            
+            // 一致性校验：只有首个 Token 确认等于底层绑定的可执行文件名或其已知主别名时，才允许在 .cli 模式下剥离
+            let isTargetSelfInvocation = (tokenBaseName == boundBinaryName)
+                || (tokenWithoutExt == boundBinaryName)
+                || (primaryBinary != nil && tokenBaseName == primaryBinary!.lowercased())
+            
+            if isTargetSelfInvocation && skill.type == .cli {
+                if tokens.count > 1 {
+                    raw = tokens.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                    hasMutated = true
+                    LogManager.shared.info(
+                        "🪄 [通用命令净化] 已校准底层可执行体 [\(boundBinaryName)]，剥离前缀 [\(firstToken)]，子参数: [\(raw)]",
+                        parentID: LogManager.shared.activeContextID
+                    )
+                } else {
+                    raw = "--help"
+                    hasMutated = false
+                }
+            }
+        }
+        
+        // 针对专用 Shell 技能补齐缺失的主命令前缀
+        if skill.type == .shell {
+            let tokens = splitCommandLineTokens(raw)
+            if let firstToken = tokens.first {
+                let cleanFirst = cleanToken(firstToken).lowercased()
+                let commonShellBuiltins: Set<String> = [
+                    "which", "echo", "export", "cd", "ls", "pwd", "cat", "grep",
+                    "find", "mkdir", "rm", "cp", "mv", "chmod", "curl", "source", "test"
+                ]
+                
+                let isAlreadyCommand = commonShellBuiltins.contains(cleanFirst)
+                    || aliases.contains(cleanFirst)
+                    || (primaryBinary != nil && cleanFirst == primaryBinary!.lowercased())
+                
+                if !isAlreadyCommand, let bin = primaryBinary, !bin.isEmpty {
+                    raw = "\(bin) \(raw)"
+                    LogManager.shared.info(
+                        "🪄 [通用命令对齐] 检测到 Shell 媒介缺失主程序前缀，已补齐: [\(raw)]",
+                        parentID: LogManager.shared.activeContextID
+                    )
+                }
+            }
+        }
+        
+        return raw
+    }
+    
+    /// 自动将命令行中的内联 JSON 转存为工作区临时文件
+    /// - Parameters:
+    ///   - command: 包含内联 JSON 的命令行
+    ///   - workingDirectory: 目标工作目录
+    /// - Returns: 参数已桥接为临时文件路径的命令行
+    public static func autoBridgeInlineJSONToTempFile(command: String, workingDirectory: String) -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        let firstObj = trimmed.firstIndex(of: "{")
+        let lastObj = trimmed.lastIndex(of: "}")
+        let firstArr = trimmed.firstIndex(of: "[")
+        let lastArr = trimmed.lastIndex(of: "]")
+        
+        var start: String.Index? = nil
+        var end: String.Index? = nil
+        
+        if let fO = firstObj, let lO = lastObj, fO < lO {
+            start = fO; end = lO
+        }
+        if let fA = firstArr, let lA = lastArr, fA < lA {
+            if start == nil || fA < start! { start = fA }
+            if end == nil || lA > end! { end = lA }
+        }
+        
+        guard let jsonStart = start, let jsonEnd = end, jsonStart < jsonEnd else {
+            return command
+        }
+        
+        let jsonCandidate = String(trimmed[jsonStart...jsonEnd])
+        
+        if let data = jsonCandidate.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: data)) != nil {
+            
+            let tempFileName = "auto_payload_\(UUID().uuidString.prefix(8)).json"
+            let tempFileURL = URL(fileURLWithPath: workingDirectory).appendingPathComponent(tempFileName)
+            
+            do {
+                try jsonCandidate.write(to: tempFileURL, atomically: true, encoding: .utf8)
+                let prefix = String(trimmed[..<jsonStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+                let suffix = String(trimmed[trimmed.index(after: jsonEnd)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+                
+                let targetArgPath = tempFileURL.path
+                let spacer = prefix.hasSuffix("@") ? "" : " "
+                let bridgedCommand = "\(prefix)\(spacer)\(targetArgPath) \(suffix)".trimmingCharacters(in: .whitespaces)
+                
+                LogManager.shared.info(
+                    "🪄 [通用参数桥接] 已将内联 JSON 自动转存为临时文件 [\(targetArgPath)]",
+                    parentID: LogManager.shared.activeContextID
+                )
+                return bridgedCommand
+            } catch {
+                return command
+            }
+        }
+        
+        return command
+    }
+    
+    public static func cleanToken(_ token: String) -> String {
         return token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
             .replacingOccurrences(of: "^\\./", with: "", options: .regularExpression)
+    }
+}
+
+// MARK: - 5.3 SkillManualOrchestrator: 技能手册自省、渐进式路由与章节切片中枢
+/// 负责 Markdown 文档物理扫描、通用文档摘要自省、全局基座提取及标题锚点切片
+public enum SkillManualOrchestrator {
+    
+    /// 净化并重构技能手册：针对多文件复合技能自动提供「全局基座 + 主手册与子文档目录」，单文件技能直接透传
+    /// - Parameters:
+    ///   - rawContent: 主文档原始文本 (SKILL.md)
+    ///   - skillName: 目标技能唯一标识
+    ///   - folderURL: 技能在本地的物理存储目录
+    /// - Returns: 经过结构化处理、利于模型二跳路由的手册内容
+    public static func purifyAndStructureManual(rawContent: String, skillName: String, folderURL: URL) -> String {
+        let fileManager = FileManager.default
+        var detectedSubDocs: [(path: String, summary: String)] = []
+        
+        // 1. 物理扫描子文档：递归检索所有 markdown 及文本规范
+        if let enumerator = fileManager.enumerator(at: folderURL, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+            for case let fileURL as URL in enumerator {
+                let ext = fileURL.pathExtension.lowercased()
+                let fileName = fileURL.lastPathComponent.lowercased()
+                
+                // 排除主入口文档与非文本资产
+                if (ext == "md" || ext == "txt") && !fileName.contains("skill.md") && !fileName.contains("readme.md") {
+                    let relative = fileURL.path.replacingOccurrences(of: folderURL.path + "/", with: "")
+                    let docSummary = extractGenericDocSummary(fileURL: fileURL, fallbackName: fileURL.deletingPathExtension().lastPathComponent)
+                    detectedSubDocs.append((path: relative, summary: docSummary))
+                }
+            }
+        }
+        
+        // 2. 单文档简单技能分支：若无任何独立子文档，原样交付完整手册，保障轻量 Agent 顺畅执行
+        guard !detectedSubDocs.isEmpty else {
+            return rawContent
+        }
+        
+        // 3. 复合长任务技能分支：截取主文档全局基座（环境配置、CLI 二进制、主命令等），截断后续细节
+        let baseOverview = extractBaseOverview(from: rawContent)
+        
+        // 4. 通用结构树与语义导读装配 (将 SKILL.md 显式作为全局规范资产透出)
+        var assembledDoc = """
+        【🛠️ 工具全局基座信息】
+        \(baseOverview)
+
+        【📖 可查阅文档与业务模块目录】
+        本技能已解耦为多模块文档，操作时可按需精读：
+        - 📄 `SKILL.md`：全局通用规范（包含环境配置、鉴权登录流程、操作确认要求与通用参数）
+        """
+        
+        for item in detectedSubDocs.sorted(by: { $0.path < $1.path }) {
+            assembledDoc += "\n- 📄 `\(item.path)`：\(item.summary)"
+        }
+        
+        // 5. 正向推演指引 (遵循正向逻辑规约，避免负面词汇)
+        assembledDoc += """
+        
+
+        【下一步行动指引】
+        请根据当前步骤的具体意图，直接调用 read_skill_manual(target_skill_name: "\(skillName)", doc_path: "<目标文档路径>") 精读对应的指令规范与参数契约。若需核验登录鉴权或全局要求，可直接指定 doc_path: "SKILL.md"（支持锚点切片，如 "SKILL.md#安装与鉴权"）。
+        """
+        
+        return assembledDoc
+    }
+    
+    /// 截取 SKILL.md 前段关于环境要求、配置命令、主二进制说明的全局基座内容
+    public static func extractBaseOverview(from markdown: String) -> String {
+        let lines = markdown.components(separatedBy: .newlines)
+        var overviewLines: [String] = []
+        
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // 遇到业务域枚举、路由章节或细分指令大标题时安全截断
+            if trimmed.hasPrefix("## 何时触发") ||
+               trimmed.hasPrefix("## 业务域") ||
+               trimmed.hasPrefix("## 子文档") ||
+               trimmed.hasPrefix("## 详细指令") ||
+               trimmed.hasPrefix("## 业务命令") ||
+               trimmed.hasPrefix("## 命令列表") {
+                break
+            }
+            overviewLines.append(line)
+            
+            // 安全阈值：全局基座最多保留前 60 行
+            if overviewLines.count >= 60 {
+                break
+            }
+        }
+        
+        let result = overviewLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? "本工具需配合宿主命令行执行，操作前请确保执行环境与网络基地址可用。" : result
+    }
+    
+    /// 基于文件物理特征自适应提取子文档摘要 (Frontmatter -> H1/引用块 -> 首段正文 -> 文件名)
+    public static func extractGenericDocSummary(fileURL: URL, fallbackName: String) -> String {
+        guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
+            return fallbackName
+        }
+        
+        let lines = content.components(separatedBy: .newlines)
+        var isInsideFrontmatter = false
+        var frontmatterDesc: String? = nil
+        
+        // Level 1: 优先解析标准 YAML Frontmatter
+        for line in lines.prefix(20) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "---" {
+                if isInsideFrontmatter { break }
+                isInsideFrontmatter = true
+                continue
+            }
+            if isInsideFrontmatter {
+                let parts = trimmed.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+                if parts.count == 2 {
+                    let key = parts[0].lowercased()
+                    let val = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                    if key == "description" || key == "desc" || key == "summary" {
+                        frontmatterDesc = val
+                        break
+                    }
+                }
+            }
+        }
+        if let desc = frontmatterDesc, !desc.isEmpty {
+            return desc
+        }
+        
+        // Level 2: 提取正文首个 H1 标题或 blockquote 引用
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#") {
+                let cleanTitle = trimmed.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces)
+                if !cleanTitle.isEmpty { return cleanTitle }
+            }
+            if trimmed.hasPrefix(">") {
+                let cleanQuote = trimmed.replacingOccurrences(of: ">", with: "").trimmingCharacters(in: .whitespaces)
+                if !cleanQuote.isEmpty { return cleanQuote }
+            }
+        }
+        
+        // Level 3: 提取第一个非空普通文本行
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty && !trimmed.hasPrefix("---") && !trimmed.hasPrefix("```") {
+                return trimmed.count > 60 ? String(trimmed.prefix(60)) + "..." : trimmed
+            }
+        }
+        
+        // Level 4: 最终兜底使用纯文件名
+        return fallbackName
+    }
+    
+    /// 从 Markdown 文本中精准截取指定标题锚点下的正文切片，未指定或未找到时返回全文
+    /// - Parameters:
+    ///   - content: 完整的 Markdown 正文
+    ///   - anchor: 章节标题关键词 (如 "安装与鉴权" 或 "鉴权")
+    /// - Returns: 截取出的对应章节正文
+    public static func extractAnchorSection(content: String, anchor: String) -> String {
+        let cleanAnchor = anchor.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).lowercased()
+        guard !cleanAnchor.isEmpty else { return content }
+        
+        let lines = content.components(separatedBy: .newlines)
+        var matchedStartIndex: Int? = nil
+        var matchedHeaderLevel: Int = 2
+        
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#") {
+                let headerLevel = trimmed.prefix(while: { $0 == "#" }).count
+                let headerText = trimmed.dropFirst(headerLevel).trimmingCharacters(in: .whitespaces).lowercased()
+                
+                if matchedStartIndex == nil {
+                    if headerText.contains(cleanAnchor) {
+                        matchedStartIndex = index
+                        matchedHeaderLevel = headerLevel
+                    }
+                } else {
+                    // 遇到同级或更高级别的标题时，视为当前章节结束
+                    if headerLevel <= matchedHeaderLevel {
+                        let sectionLines = lines[matchedStartIndex!..<index]
+                        return sectionLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+            }
+        }
+        
+        if let start = matchedStartIndex {
+            let sectionLines = lines[start..<lines.count]
+            return sectionLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        return content
+    }
+}
+
+// MARK: - 5.4 SkillCommandBridge: 全局兼容门面代理 (Facade)
+/// 100% 透明向下兼容既有代码调用，内部全部重定向至上述三个专用解耦引擎
+public enum SkillCommandBridge {
+    
+    @inline(__always)
+    public static func normalizeCLICommand(command: String, skill: AgentSkill) -> String {
+        CLICommandNormalizer.normalizeCLICommand(command: command, skill: skill)
+    }
+    
+    @inline(__always)
+    public static func autoBridgeInlineJSONToTempFile(command: String, workingDirectory: String) -> String {
+        CLICommandNormalizer.autoBridgeInlineJSONToTempFile(command: command, workingDirectory: workingDirectory)
+    }
+    
+    @inline(__always)
+    public static func resolveDynamicPhysicalAliases(skill: AgentSkill, workingDirectory: String) -> Set<String> {
+        SkillBinaryResolver.resolveDynamicPhysicalAliases(skill: skill, workingDirectory: workingDirectory)
+    }
+    
+    @inline(__always)
+    public static func resolvePrimaryBinaryName(skill: AgentSkill, workingDirectory: String, aliases: Set<String>) -> String? {
+        SkillBinaryResolver.resolvePrimaryBinaryName(skill: skill, workingDirectory: workingDirectory, aliases: aliases)
+    }
+    
+    @inline(__always)
+    public static func purifyAndStructureManual(rawContent: String, skillName: String, folderURL: URL) -> String {
+        SkillManualOrchestrator.purifyAndStructureManual(rawContent: rawContent, skillName: skillName, folderURL: folderURL)
+    }
+    
+    @inline(__always)
+    public static func splitCommandLine(_ command: String) -> [String] {
+        CLICommandNormalizer.splitCommandLine(command)
+    }
+    
+    @inline(__always)
+    public static func splitCommandLineTokens(_ command: String) -> [String] {
+        CLICommandNormalizer.splitCommandLineTokens(command)
     }
 }
 
@@ -1819,6 +2317,7 @@ public enum SkillExecutors {
         private static func buildCLIArguments(args: [String: Any], skillParameters: [SkillParameter]) -> [String] {
             var arguments: [String] = []
             
+            // 优先检查高阶透传参数
             if let rawArgsList = args["raw_args"] as? [String] {
                 return rawArgsList
             } else if let rawArgsStr = (args["raw_args"] as? String) ?? (args["raw_command"] as? String),
@@ -1826,7 +2325,16 @@ public enum SkillExecutors {
                 return SkillCommandBridge.splitCommandLine(rawArgsStr)
             } else if let actionStr = args["action"] as? String, !actionStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return SkillCommandBridge.splitCommandLine(actionStr)
+            } else if let inputStr = args["input"] as? String, !inputStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return SkillCommandBridge.splitCommandLine(inputStr)
+            } else if let cmdStr = args["command"] as? String, !cmdStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return SkillCommandBridge.splitCommandLine(cmdStr)
             }
+            
+            // 通用纯位置参数白名单：绝不能被追加 '--' 前缀
+            let positionalKeys: Set<String> = [
+                "command", "input", "raw_command", "raw_args", "subcommand", "action", "query"
+            ]
             
             for param in skillParameters {
                 guard let val = args[param.name] else { continue }
@@ -1849,8 +2357,8 @@ public enum SkillExecutors {
                 default:
                     let strVal = String(describing: val).trimmingCharacters(in: .whitespacesAndNewlines)
                     if !strVal.isEmpty {
-                        if param.name.lowercased() == "subcommand" || param.name.lowercased() == "action" {
-                            arguments.append(strVal)
+                        if positionalKeys.contains(param.name.lowercased()) {
+                            arguments.append(contentsOf: SkillCommandBridge.splitCommandLine(strVal))
                         } else {
                             arguments.append("--\(flagKey)")
                             arguments.append(strVal)
@@ -1945,14 +2453,16 @@ public enum SkillExecutors {
                         try? FileManager.default.removeItem(at: payloadFile)
                         
                         let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        // 使用 Swift 原生正则清除控制台颜色字符，彻底避免 Shell 管道碎片泄漏
+                        let cleanOutput = output.replacingOccurrences(of: #"\x1B\[[0-9;]*[a-zA-Z]"#, with: "", options: .regularExpression)
                         
                         if process.terminationReason == .uncaughtSignal {
-                            return "❌ 超时被强行终止 (Code: \(process.terminationStatus)):\n\(output)"
+                            return "❌ 脚本执行超时或被强制终止 (代码 \(process.terminationStatus)):\n\(cleanOutput)"
                         }
                         if process.terminationStatus != 0 {
-                            return "⚠️ 脚本异常退出 (Code: \(process.terminationStatus)):\n\(output)"
+                            return "⚠️ Shell 脚本异常退出 (代码 \(process.terminationStatus)):\n\(cleanOutput)"
                         }
-                        return output.isEmpty ? "执行成功 (无返回值)" : output
+                        return cleanOutput.isEmpty ? "执行成功 (无返回值)" : cleanOutput
                     } catch {
                         try? FileManager.default.removeItem(at: runnerFile)
                         try? FileManager.default.removeItem(at: payloadFile)
@@ -2274,12 +2784,12 @@ public enum SkillExecutors {
                   let skillsPath = ConfigManager.shared.skillsPath else {
                 return "❌ 操作失败：缺少核心参数 skillName 或本地技能路径未初始化"
             }
-
+            
             let typeStr = args["type"] as? String
             let code = args["code"] as? String
             let description = args["description"] as? String
             let manualContent = args["manual"] as? String
-
+            
             let folderURL = skillsPath.appendingPathComponent(skillName)
             let fileManager = FileManager.default
             let isExists = fileManager.fileExists(atPath: folderURL.path)
@@ -2289,10 +2799,10 @@ public enum SkillExecutors {
                     return "❌ 创建新技能失败：作为全新技能，你必须完整提供 type, code 和 description 参数。"
                 }
             }
-
+            
             do {
                 if !isExists { try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true, attributes: nil) }
-
+                
                 let manifestURL = folderURL.appendingPathComponent("manifest.json")
                 var manifestDict: [String: Any] = ["name": skillName, "displayName": skillName, "requiresConfirmation": false, "parameters": []]
                 
@@ -2300,7 +2810,7 @@ public enum SkillExecutors {
                    let oldManifest = try? JSONSerialization.jsonObject(with: oldData) as? [String: Any] {
                     manifestDict = oldManifest
                 }
-
+                
                 let finalType = typeStr?.lowercased() ?? (manifestDict["type"] as? String ?? "shell")
                 let isPython = finalType.contains("python")
                 let scriptName = isPython ? "script.py" : "script.sh"
@@ -2309,7 +2819,7 @@ public enum SkillExecutors {
                 if let newDesc = description, !newDesc.isEmpty { manifestDict["description"] = newDesc }
                 manifestDict["entryPoint"] = scriptName
                 manifestDict["category"] = "进化"
-
+                
                 if let newCode = code, !newCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let scriptURL = folderURL.appendingPathComponent(scriptName)
                     if isExists && fileManager.fileExists(atPath: scriptURL.path) {
@@ -2318,13 +2828,13 @@ public enum SkillExecutors {
                         try? fileManager.copyItem(at: scriptURL, to: backupURL)
                     }
                     try newCode.write(to: scriptURL, atomically: true, encoding: .utf8)
-
+                    
                     if !isPython {
                         let task = Process(); task.executableURL = URL(fileURLWithPath: "/bin/chmod"); task.arguments = ["+x", scriptURL.path]
                         try? task.run(); task.waitUntilExit()
                     }
                 }
-
+                
                 let manualURL = folderURL.appendingPathComponent("SKILL.md")
                 
                 if let rawManual = manualContent, !rawManual.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2340,7 +2850,7 @@ public enum SkillExecutors {
                     """
                     
                     if !finalManual.hasPrefix("# \(skillName)") && !finalManual.hasPrefix("---") {
-                         finalManual = "\(standardHeader)\n\n# \(skillName)\n\n> \(currentDesc)\n\n\(finalManual)"
+                        finalManual = "\(standardHeader)\n\n# \(skillName)\n\n> \(currentDesc)\n\n\(finalManual)"
                     }
                     
                     if isExists && fileManager.fileExists(atPath: manualURL.path) {
@@ -2355,10 +2865,10 @@ public enum SkillExecutors {
                     let defaultManual = "---\nname: \(skillName)\ndescription: \(fallbackDesc)\ncategory: 进化\n---\n\n## 核心逻辑\n本技能未提供详细的参数说明，请直接查阅 `\(scriptName)` 源码。"
                     try defaultManual.write(to: manualURL, atomically: true, encoding: .utf8)
                 }
-
+                
                 let manifestData = try JSONSerialization.data(withJSONObject: manifestDict, options: .prettyPrinted)
                 try manifestData.write(to: manifestURL)
-
+                
                 manager.loadSkills()
                 if !isExists {
                     if let newSkill = manager.skills.first(where: { $0.name == skillName }) {
@@ -2374,19 +2884,26 @@ public enum SkillExecutors {
                 } else {
                     Util.message("🔄 AI 已成功对技能 [\(skillName)] 进行局部热更新")
                 }
-
+                
                 if isExists {
                     return "✅ 技能 [\(skillName)] 已成功进行局部更新并热重载。您可以立即运行测试看是否达到预期。如果需要查看原有代码，可以在其本地目录找到隐藏的 .bak 文件。"
                 } else {
                     return "✅ 技能 [\(skillName)] 已成功编写、保存并动态挂载至当前智能体分身。请立即调用测试该技能。"
                 }
-
+                
             } catch {
                 return "❌ 技能进化/更新失败，文件系统发生错误: \(error.localizedDescription)"
             }
         }
         
-        public static func readManual(rawTarget: String, subDocPath: String, skillsBasePath: String) async -> String {
+        // MARK: - readManual: 区分隐式初探与显式精读，解除 SKILL.md 读取死锁
+        /// 物理读取技能手册：隐式调用提供目录索引，显式指定路径（含 SKILL.md）时完整交付并支持章节锚点切片
+        public static func readManual(
+            rawTarget: String,
+            subDocPath: String,
+            skillsBasePath: String,
+            availableSkills: [AgentSkill] = []
+        ) async -> String {
             guard !rawTarget.isEmpty else {
                 return "❌ 参数错误：请传入有效的 target_skill_name。"
             }
@@ -2406,22 +2923,69 @@ public enum SkillExecutors {
                 }
             }
             
+            // 拆分 doc_path 中的相对路径与可选锚点 (如 "SKILL.md#安装与鉴权" 或 "#鉴权")
+            let rawPathTrimmed = subDocPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let pathAndAnchor = rawPathTrimmed.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let relativeFilePath = pathAndAnchor.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let anchorKeyword = pathAndAnchor.count > 1 ? pathAndAnchor[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            
+            // 当本地磁盘无物理文件夹时，优雅回退至内存技能池检索
             guard let targetFolder = matchedFolderURL else {
+                let normalizedTarget = rawTarget.lowercased()
+                    .replacingOccurrences(of: "-", with: "_")
+                    .replacingOccurrences(of: "skill_", with: "")
+                
+                if let memorySkill = availableSkills.first(where: {
+                    let sName = $0.name.lowercased().replacingOccurrences(of: "-", with: "_")
+                    let sStripped = sName.replacingOccurrences(of: "skill_", with: "")
+                    return sName == normalizedTarget || sStripped == normalizedTarget || $0.displayName.localizedCaseInsensitiveContains(rawTarget)
+                }) {
+                    var manualText = ""
+                    if !memorySkill.detailedInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        manualText = extractAnchorSection(content: memorySkill.detailedInstruction, anchor: anchorKeyword)
+                    } else {
+                        // 无 detailedInstruction 时，根据元数据动态组装正向规范说明
+                        var dynamicDoc = """
+                        # \(memorySkill.displayName) (\(memorySkill.name))
+
+                        > \(memorySkill.description)
+
+                        ## 参数规范说明
+                        """
+                        if memorySkill.parameters.isEmpty {
+                            dynamicDoc += "\n该技能无需传入任何参数。"
+                        } else {
+                            for param in memorySkill.parameters {
+                                let reqStr = param.isRequired ? "必填" : "可选"
+                                dynamicDoc += "\n- `\(param.name)` (\(param.type.rawValue), \(reqStr)): \(param.description)"
+                            }
+                        }
+                        manualText = extractAnchorSection(content: dynamicDoc, anchor: anchorKeyword)
+                    }
+                    
+                    let toolLessons = await MemoryManager.shared.getToolLessons(for: [baseName, rawTarget], topKPerTool: 2)
+                    if !toolLessons.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        manualText += "\n\n---\n### 💡 历史调用避坑与最佳实践参考：\n\(toolLessons)"
+                    }
+                    return manualText
+                }
+                
                 return "💡 未检索到技能 [\(rawTarget)] 的本地手册目录。请对照可用技能名录核对名称。"
             }
             
+            // 以下为既有的物理文件读取与子文档扫描逻辑
             var targetFileURL: URL
-            if subDocPath.isEmpty {
+            if relativeFilePath.isEmpty {
                 let standardDocs = ["SKILL.md", "skill.md", "README.md", "manifest.json"]
                 targetFileURL = standardDocs.map { targetFolder.appending(path: $0).standardized }
                     .first(where: { fileManager.fileExists(atPath: $0.path) }) ?? targetFolder.appending(path: "SKILL.md").standardized
             } else {
-                let directCandidate = URL(fileURLWithPath: subDocPath, relativeTo: targetFolder).standardizedFileURL
+                let directCandidate = URL(fileURLWithPath: relativeFilePath, relativeTo: targetFolder).standardizedFileURL
                 
                 if fileManager.fileExists(atPath: directCandidate.path) {
                     targetFileURL = directCandidate
                 } else {
-                    let targetFileName = (subDocPath as NSString).lastPathComponent.lowercased()
+                    let targetFileName = (relativeFilePath as NSString).lastPathComponent.lowercased()
                     var foundURL: URL? = nil
                     if let enumerator = fileManager.enumerator(at: targetFolder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
                         for case let fileURL as URL in enumerator {
@@ -2443,16 +3007,16 @@ public enum SkillExecutors {
             if fileManager.fileExists(atPath: targetFileURL.path),
                let content = try? String(contentsOf: targetFileURL, encoding: .utf8) {
                 
-                if subDocPath.isEmpty || subDocPath.lowercased().hasSuffix("skill.md") {
+                if relativeFilePath.isEmpty && anchorKeyword.isEmpty {
                     manualText = SkillCommandBridge.purifyAndStructureManual(rawContent: content, skillName: rawTarget, folderURL: targetFolder)
                 } else {
-                    manualText = content
+                    manualText = extractAnchorSection(content: content, anchor: anchorKeyword)
                 }
             } else {
                 manualText = "💡 未在 [\(rawTarget)] 目录下找到指定文档 [\(targetFileURL.lastPathComponent)]。请确认该子文档是否存在。"
             }
             
-            if subDocPath.isEmpty {
+            if relativeFilePath.isEmpty && anchorKeyword.isEmpty {
                 let toolLessons = await MemoryManager.shared.getToolLessons(for: [baseName, rawTarget], topKPerTool: 2)
                 if !toolLessons.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     manualText += "\n\n---\n### 💡 历史调用避坑与最佳实践参考：\n\(toolLessons)"
@@ -2460,6 +3024,50 @@ public enum SkillExecutors {
             }
             
             return manualText
+        }
+        
+        // MARK: - extractAnchorSection: 章节级 Markdown 标题锚点切片引擎
+        /// 从 Markdown 文本中精准截取指定标题锚点下的正文切片，未指定或未找到时优雅返回全文
+        /// - Parameters:
+        ///   - content: 完整的 Markdown 正文
+        ///   - anchor: 章节标题关键词 (如 "安装与鉴权" 或 "鉴权")
+        /// - Returns: 截取出的对应章节正文，未匹配时返回原内容
+        private static func extractAnchorSection(content: String, anchor: String) -> String {
+            let cleanAnchor = anchor.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).lowercased()
+            guard !cleanAnchor.isEmpty else { return content }
+            
+            let lines = content.components(separatedBy: .newlines)
+            var matchedStartIndex: Int? = nil
+            var matchedHeaderLevel: Int = 2
+            
+            for (index, line) in lines.enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("#") {
+                    let headerLevel = trimmed.prefix(while: { $0 == "#" }).count
+                    let headerText = trimmed.dropFirst(headerLevel).trimmingCharacters(in: .whitespaces).lowercased()
+                    
+                    if matchedStartIndex == nil {
+                        if headerText.contains(cleanAnchor) {
+                            matchedStartIndex = index
+                            matchedHeaderLevel = headerLevel
+                        }
+                    } else {
+                        // 遇到同级或更高级别的标题时，视为当前章节结束
+                        if headerLevel <= matchedHeaderLevel {
+                            let sectionLines = lines[matchedStartIndex!..<index]
+                            return sectionLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                    }
+                }
+            }
+            
+            if let start = matchedStartIndex {
+                let sectionLines = lines[start..<lines.count]
+                return sectionLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            
+            // 兜底：未匹配到锚点时安全返回完整文档
+            return content
         }
     }
 }
@@ -2528,6 +3136,9 @@ public enum SkillDataExchange {
 @MainActor
 public final class SkillManager {
     
+    private static let mcpConfigKey = "mcp_servers_config"
+    private static let skillsRegistryKey = "agent_skills_registry"
+    
     public var skills: [AgentSkill] = []
     public var sharedContext: [String: String] = [:]
     
@@ -2559,7 +3170,8 @@ public final class SkillManager {
     
     // MARK: - MCP 底座网络配置
     public func loadMCPServers() {
-        if let data = try? Data(contentsOf: ConfigManager.shared.mcpFileName!),
+        if let jsonStr = LocalDatabaseManager.shared.loadConfig(key: Self.mcpConfigKey),
+           let data = jsonStr.data(using: .utf8),
            let decoded = try? JSONDecoder().decode([MCPServer].self, from: data) {
             self.mcpServers = decoded
         } else {
@@ -2572,9 +3184,11 @@ public final class SkillManager {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(self.mcpServers)
-            try data.write(to: ConfigManager.shared.mcpFileName!, options: .atomic)
+            if let jsonStr = String(data: data, encoding: .utf8) {
+                LocalDatabaseManager.shared.saveConfig(key: Self.mcpConfigKey, jsonString: jsonStr)
+            }
         } catch {
-            print("⚠️ [SkillManager] 保存 mcp.json 失败: \(error)")
+            print("⚠️ [SkillManager] 保存 MCP 配置至 SQLite 失败: \(error)")
         }
     }
     
@@ -2735,6 +3349,23 @@ public final class SkillManager {
             for (k, v) in jsonDict { flatArgs[k] = v }
         }
 
+        // 核心对齐：建立命令行/输入等价键名双向映射，防止参数校验因名称差异被误拦截
+        if flatArgs["command"] == nil {
+            if let val = flatArgs["input"] ?? flatArgs["raw_command"] ?? flatArgs["action"] {
+                flatArgs["command"] = val
+            }
+        }
+        if flatArgs["input"] == nil {
+            if let val = flatArgs["command"] ?? flatArgs["raw_command"] ?? flatArgs["action"] {
+                flatArgs["input"] = val
+            }
+        }
+        if flatArgs["raw_command"] == nil {
+            if let val = flatArgs["command"] ?? flatArgs["input"] ?? flatArgs["action"] {
+                flatArgs["raw_command"] = val
+            }
+        }
+
         var missingParams: [String] = []
         for param in skill.parameters where param.isRequired {
             if flatArgs[param.name] == nil { missingParams.append(param.name) }
@@ -2839,7 +3470,12 @@ public final class SkillManager {
                 let rawTarget = (flatArgs["target_skill_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let subDocPath = (flatArgs["doc_path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let basePath = skill.workingDirectory ?? ConfigManager.shared.skillsPath?.path ?? ""
-                executionResult = await SkillExecutors.Builtin.readManual(rawTarget: rawTarget, subDocPath: subDocPath, skillsBasePath: basePath)
+                executionResult = await SkillExecutors.Builtin.readManual(
+                    rawTarget: rawTarget,
+                    subDocPath: subDocPath,
+                    skillsBasePath: basePath,
+                    availableSkills: self.skills
+                )
             } else if skill.executionBody == "builtin_unified_runner" {
                 let targetSkillName = (flatArgs["skill_name"] as? String) ?? (flatArgs["target_skill_name"] as? String) ?? ""
                 var rawInput = (flatArgs["input"] as? String) ?? (flatArgs["command"] as? String) ?? (flatArgs["action"] as? String) ?? (flatArgs["raw_command"] as? String) ?? ""
@@ -2880,7 +3516,11 @@ public final class SkillManager {
                 var childArgs: [String: Any] = [:]
                 if physicalSkill.type == .cli || physicalSkill.type == .shell {
                     let workingDir = physicalSkill.workingDirectory ?? ConfigManager.shared.skillsPath?.path ?? "/tmp"
-                    var bridgedCommand = SkillCommandBridge.normalizeCLICommand(command: rawInput, skill: physicalSkill)
+                    
+                    // 防篡改：通用终端直接放行，专用业务工具才走自适应对齐
+                    let isUniversalTerminal = physicalSkill.name == "system_terminal" || physicalSkill.name == "bash_runner" || physicalSkill.name.contains("terminal")
+                    
+                    var bridgedCommand = isUniversalTerminal ? rawInput : SkillCommandBridge.normalizeCLICommand(command: rawInput, skill: physicalSkill)
                     bridgedCommand = SkillCommandBridge.autoBridgeInlineJSONToTempFile(command: bridgedCommand, workingDirectory: workingDir)
                     
                     childArgs["command"] = bridgedCommand
@@ -2912,7 +3552,7 @@ public final class SkillManager {
                     if searchCategory.isEmpty {
                         searchCategory = currentAgent?.bindKnowledgeCategory ?? "全部"
                     }
-                    let currentModel = currentAgent?.baseModel ?? "gemini-2.0-flash"
+                    let currentModel = currentAgent?.baseModel ?? ""
                     
                     let knowledgeVM = KnowledgeViewModel()
                     let ragResult = await knowledgeVM.injectedRag(query: searchQuery, category: searchCategory, currentModel: currentModel)
@@ -2970,9 +3610,10 @@ public final class SkillManager {
         var localSkills = LocalSkillScanner.scanAndMount()
         var userSkills: [AgentSkill] = []
         
-        if let url = ConfigManager.shared.skillsFileName, let data = try? Data(contentsOf: url), !data.isEmpty {
-            do { userSkills = try JSONDecoder().decode([AgentSkill].self, from: data) }
-            catch { print("⚠️ [SkillManager] skills.json 解析失败，自动重置: \(error)") }
+        if let jsonStr = LocalDatabaseManager.shared.loadConfig(key: Self.skillsRegistryKey),
+           let data = jsonStr.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([AgentSkill].self, from: data) {
+            userSkills = decoded
         }
         
         for i in 0..<localSkills.count {
@@ -2990,7 +3631,18 @@ public final class SkillManager {
         let localNames = Set(localSkills.map { $0.name })
         var customUserSkills = userSkills.filter { !localNames.contains($0.name) && !$0.isLocal }
         
-        var systemSkills = [Skill_ReadManual(), Skill_ExecuteSkill(), Skill_Evolve(), Skill_MemoryManager(), Skill_CallAgent(), Skill_Finish(), Skill_KnowledgeSearch(), Skill_CallPersona()]
+        var systemSkills = [
+            Skill_ReadManual(),
+            Skill_ExecuteSkill(),
+            Skill_Terminal(),
+            Skill_Evolve(),
+            Skill_MemoryManager(),
+            Skill_CallAgent(),
+            Skill_Finish(),
+            Skill_KnowledgeSearch(),
+            Skill_CallPersona()
+        ]
+        
         for i in 0..<systemSkills.count {
             let stableSystemID = UUID.deterministic(from: "skill_system_\(systemSkills[i].name)")
             if let match = userSkills.first(where: { $0.name == systemSkills[i].name }) {
@@ -3021,13 +3673,16 @@ public final class SkillManager {
     }
     
     public func saveSkills() {
-        guard let url = ConfigManager.shared.skillsFileName else { return }
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(self.skills)
-            try data.write(to: url, options: .atomic)
-        } catch { print("⚠️ [SkillManager] 保存 skills.json 失败: \(error)") }
+            if let jsonStr = String(data: data, encoding: .utf8) {
+                LocalDatabaseManager.shared.saveConfig(key: Self.skillsRegistryKey, jsonString: jsonStr)
+            }
+        } catch {
+            print("⚠️ [SkillManager] 保存技能注册表至 SQLite 失败: \(error)")
+        }
     }
     
     public func syncLocalSkillFiles(skill: inout AgentSkill) -> Bool {
@@ -3233,30 +3888,47 @@ public final class SkillManager {
         }
     }
     
+    // MARK: - 团队与分身静态名录生成器 (严格授权过滤 + 确定性排序 + 100% 保护 Prompt Cache)
+    /// 构造当前智能体已授权的协作专家与数字分身白皮书
+    /// - Parameter mainAgent: 当前执行任务的主控智能体档案
+    /// - Returns: 符合缓存友好规范的纯静态 XML 结构串；若未授权任何协作角色则返回空字符串
     func generateTeamManifest(for mainAgent: AgentProfile) -> String {
         let allProfiles = ConfigManager.shared.app.agentProfiles
-        let allowedSubAgents = allProfiles.filter { mainAgent.allowedSubAgentIDs.contains($0.id) }
         let allPersonas = PersonaManager.shared.personas
         
-        if allowedSubAgents.isEmpty && allPersonas.isEmpty { return "" }
+        // 1. 严格权限剪枝：只允许当前 Agent 显式勾选配备的专家和数字分身
+        let allowedSubAgents = allProfiles
+            .filter { mainAgent.allowedSubAgentIDs.contains($0.id) && $0.id != mainAgent.id }
+            .sorted { $0.id.uuidString < $1.id.uuidString } // 确定性排序，保护 KV Cache 前缀
+            
+        let allowedPersonas = allPersonas
+            .filter { mainAgent.allowedPersonaIDs.contains($0.id) }
+            .sorted { $0.id.uuidString < $1.id.uuidString } // 确定性排序，保护 KV Cache 前缀
+        
+        // 2. 双重判空守卫：若均未配备，彻底返回空，绝不输出外层空标签骨架
+        guard !allowedSubAgents.isEmpty || !allowedPersonas.isEmpty else {
+            return ""
+        }
         
         var manifest = """
         
         <delegation_registry>
-        <!-- 当前系统已注册的外部协作专家与角色列表，仅供调用委派工具时参考参数使用 -->
+        <!-- 当前系统已注册并授权的协作专家与角色名录，仅供调用委派工具时参考参数规范 -->
         
         """
         
+        // 3. 专家智能体名录装配 (保持静态路由说明与挂载技能)
         if !allowedSubAgents.isEmpty {
             manifest += "### 🤖 可委派的专家智能体 (通过 call_sub_agent 唤醒):\n"
             for sub in allowedSubAgents {
                 let lines = sub.systemPrompt.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
-                let safeSummary = lines.first(where: { !$0.isEmpty }) ?? "提供专业的定制化任务处理能力"
+                let safeSummary = lines.first(where: { !$0.isEmpty }) ?? "提供专业的领域定制化任务处理能力"
                 manifest += "- **[\(sub.name)]**: \(safeSummary)\n"
                 
                 let subSkillNames = sub.equippedSkillIDs.compactMap { skillId in
                     self.skills.first(where: { $0.id == skillId })?.name
-                }
+                }.sorted()
+                
                 if !subSkillNames.isEmpty {
                     manifest += "  └ 挂载工具: \(subSkillNames.joined(separator: ", "))\n"
                 }
@@ -3264,13 +3936,17 @@ public final class SkillManager {
             manifest += "\n"
         }
         
-        if !allPersonas.isEmpty {
+        // 4. 数字分身静态档案装配 (彻底剥离 affinityScore 与 currentEmotion 等动态变量)
+        if !allowedPersonas.isEmpty {
             manifest += "### 🎭 可对戏的数字分身 (通过 call_digital_persona 呼叫):\n"
-            for p in allPersonas {
-                let state = PersonaManager.shared.getOrCreateRuntimeState(for: p.id)
-                let worldDesc = p.worldviewContext.isEmpty ? "现代日常" : p.worldviewContext
-                manifest += "- **[\(p.name)]** (\(p.roleTag)): \(p.summary)\n"
-                manifest += "  └ 世界观: \(worldDesc) | 口吻: \(p.toneStyle) | 状态: \(state.bondMilestone.rawValue) (羁绊:\(state.affinityScore), 情绪:\(state.currentEmotion))\n"
+            for p in allowedPersonas {
+                let worldDesc = p.worldviewContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "现代日常" : p.worldviewContext
+                let toneDesc = p.toneStyle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "灵动自然、真诚生动" : p.toneStyle
+                let summaryDesc = p.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "角色专属互动伙伴" : p.summary
+                
+                // 纯静态内容声明：保持字节流恒定不变，最大化命中大模型底座 KV 缓存
+                manifest += "- **[\(p.name)]** (\(p.roleTag)): \(summaryDesc)\n"
+                manifest += "  └ 世界观: \(worldDesc) | 口吻风格: \(toneDesc)\n"
             }
             manifest += "\n"
         }

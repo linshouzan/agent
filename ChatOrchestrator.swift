@@ -79,7 +79,7 @@ protocol PostExecutionHook: Sendable {
 public struct ToolBadgeItem: Sendable, Equatable {
     public let callId: String
     public let name: String
-    public let displayName: String
+    public var displayName: String
     public var status: String // "waiting" | "running" | "success" | "failed"
     
     public init(callId: String, name: String, displayName: String, status: String = "running") {
@@ -137,7 +137,34 @@ struct HistorySlidingWindowEnricher: ChatContextEnricher {
         guard AiChatStore.shared.isContextEnabled else { return }
         
         let safeSliceIndex = min(payload.sliceIndex, payload.messages.count)
-        let historyToConsider = payload.messages.prefix(upTo: safeSliceIndex).reversed()
+        let rawHistory = Array(payload.messages.prefix(upTo: safeSliceIndex))
+        
+        // 过滤由于网络中断、超时未交付的残损轮次或异常空内容节点
+        var cleanHistory: [ChatMessage] = []
+        var i = 0
+        while i < rawHistory.count {
+            let current = rawHistory[i]
+            if current.isUser {
+                // 检查其紧随的 AI 回复是否是有效交付或异常中断
+                if i + 1 < rawHistory.count {
+                    let next = rawHistory[i + 1]
+                    let isFailedAI = !next.isUser && (
+                        next.text.contains("❌ **执行中断**") ||
+                        next.text.contains("❌ **异常**") ||
+                        next.text.contains("⚠️ **无响应**") ||
+                        (next.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && next.skillLogs.isEmpty && next.ragHits.isEmpty)
+                    )
+                    if isFailedAI {
+                        i += 2 // 安全跳过这对失败或挂起的交互轮次，不污染大模型上下文
+                        continue
+                    }
+                }
+            }
+            cleanHistory.append(current)
+            i += 1
+        }
+        
+        let historyToConsider = cleanHistory.reversed()
         var validHistoryMsgs: [ContextMessage] = []
         
         for msg in historyToConsider {
@@ -149,7 +176,10 @@ struct HistorySlidingWindowEnricher: ChatContextEnricher {
                 tempMsgs.append(.user(cleanText))
                 msgTokenCost += Int(Double(cleanText.count) * 1.5)
             } else {
-                let cleanText = msg.text.filterStopTokens().filterTHINK().filterMARKDOWN().trimmingCharacters(in: .whitespacesAndNewlines)
+                var cleanText = msg.text.filterStopTokens().filterTHINK().filterMARKDOWN().trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                cleanText = AgentContextInterceptorPipeline.shared.sanitizeHistory(cleanText)
+                
                 if !msg.skillLogs.isEmpty {
                     for (index, log) in msg.skillLogs.enumerated() {
                         let stableCallId = log.confirmationId ?? "call_\(log.id.uuidString.prefix(8))"
@@ -181,6 +211,18 @@ struct HistorySlidingWindowEnricher: ChatContextEnricher {
             }
             totalTokens += msgTokenCost
             validHistoryMsgs.insert(contentsOf: tempMsgs, at: 0)
+        }
+        
+        // 核心安全门禁：剔除因窗口截断导致开头的孤立 .tool 消息，杜绝 OpenAI/Gemini 报 HTTP 400
+        while let firstMsg = validHistoryMsgs.first, firstMsg.role == .tool {
+            validHistoryMsgs.removeFirst()
+        }
+        
+        // 尾部自愈：若末尾遗留了包含 toolCalls 却无对应 tool 响应的 assistant 消息，清除其 toolCalls
+        if let lastIdx = validHistoryMsgs.indices.last, validHistoryMsgs[lastIdx].role == .assistant {
+            if let calls = validHistoryMsgs[lastIdx].toolCalls, !calls.isEmpty {
+                validHistoryMsgs[lastIdx].toolCalls = nil
+            }
         }
         
         messages.append(contentsOf: validHistoryMsgs)
@@ -264,7 +306,7 @@ struct UnifiedStreamNormalizer: Sendable {
         // 5. 过滤伪任务清单与裸露推演段落
         if cleanStreamText.contains("思考推演") || cleanStreamText.contains("【任务清单】") {
             cleanStreamText = cleanStreamText.replacingOccurrences(
-                of: #"(?s)思考推演[：:]?\s*(?:\d+\.\s*[^：\n]+[：:][^\n]*\n*)+"#,
+                of: #"(?s思考推演[：:]?\s*(?:\d+\.\s*[^：\n]+[：:][^\n]*\n*)+"#,
                 with: "",
                 options: .regularExpression
             )
@@ -277,8 +319,9 @@ struct UnifiedStreamNormalizer: Sendable {
         
         var trimmedText = cleanStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
                 
-        // 生成标准化的通用 Action 徽标链接
-        if !activeRoundToolBadges.isEmpty && !trimmedText.isEmpty {
+        // 生成标准化的 Action 徽标链接
+        // 彻底移除 !trimmedText.isEmpty 限制，并在无文本时直接交付 Action 徽标
+        if !activeRoundToolBadges.isEmpty {
             let badges = activeRoundToolBadges.map { item -> String in
                 let statusIcon: String
                 switch item.status {
@@ -289,11 +332,13 @@ struct UnifiedStreamNormalizer: Sendable {
                 }
                 let encodedName = item.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? item.name
                 let encodedCallId = item.callId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? item.callId
-                return " [\(statusIcon) \(item.displayName)](action://inspect_tool/\(encodedName)?call_id=\(encodedCallId)&status=\(item.status))"
-            }.joined(separator: "")
+                return "[\(statusIcon) \(item.displayName)](action://inspect_tool/\(encodedName)?call_id=\(encodedCallId)&status=\(item.status))"
+            }.joined(separator: " ")
             
-            if !trimmedText.hasSuffix(badges) {
-                trimmedText += "\(badges)"
+            if trimmedText.isEmpty {
+                trimmedText = badges
+            } else if !trimmedText.hasSuffix(badges) {
+                trimmedText += " \(badges)"
             }
         }
         
@@ -310,7 +355,9 @@ struct PersonaMentalDeltaHook: PostExecutionHook {
     func onCompleted(fullText: String, targetMessageID: UUID, personaID: UUID?) async {
         guard let pID = personaID,
               let deltaJSON = fullText.extractPersonaDelta() else { return }
-        PersonaManager.shared.applyMentalDelta(for: pID, deltaJSON: deltaJSON)
+        // 提取触发本次回复的用户真实对白，激活客户端 Grounding 门禁
+        let recentUserQuery = AiChatStore.shared.messages.last(where: { $0.isUser })?.text
+        PersonaManager.shared.applyMentalDelta(for: pID, deltaJSON: deltaJSON, userQuery: recentUserQuery)
     }
 }
 
@@ -392,11 +439,43 @@ final class ChatOrchestrator {
             images.map { $0.resizedAndCompressedForAI(maxDimension: 1024, compressionQuality: 0.7) }
         }.value
         
+        // 检查末尾是否为上一轮因网络波动失败的相同提问
+        // 若最后一次提问完全相同，且紧随的 AI 回复以报错终止，则原地移出该残缺轮次，避免对白重复累加
+        if store.messages.count >= 2 {
+            let lastAI = store.messages[store.messages.count - 1]
+            let lastUser = store.messages[store.messages.count - 2]
+            
+            let isLastUserSame = lastUser.isUser && lastUser.text.trimmingCharacters(in: .whitespaces) == trimmedText
+            let isLastAIFailed = !lastAI.isUser && (lastAI.text.contains("❌ **执行中断**") || lastAI.text.contains("❌ **异常**") || lastAI.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            
+            if isLastUserSame && isLastAIFailed {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    _ = store.messages.popLast()
+                    _ = store.messages.popLast()
+                }
+            }
+        }
+        
         let userMsg = ChatMessage(isUser: true, text: trimmedText, images: compressedImages, fileURLs: files)
         let aiMsg = ChatMessage(isUser: false, text: "")
         let targetId = aiMsg.id
         let historySnapshot = store.messages
         let historyCount = historySnapshot.count
+        
+        // 保证全新任务干干净净冷启动，而在后续轮次（包括 finish_task 之后的追问）则完整保留
+        if historyCount == 0 {
+            agentVM.sharedContext.removeValue(forKey: AgentLongTermMemory.scratchpadKey)
+            agentVM.sharedContext.removeValue(forKey: StructuredTagContextPlugin.structuredSlotsJsonKey)
+            StructuredTagContextPlugin.resetRegistry()
+        } else {
+            // 同步继承全局单例已归集的结构化记忆底账，消除数据孤岛
+            if let pad = StructuredTagContextPlugin.currentScratchpadMarkdown {
+                self.agentVM.sharedContext[AgentLongTermMemory.scratchpadKey] = pad
+            }
+            if let json = StructuredTagContextPlugin.currentSlotsJSON {
+                self.agentVM.sharedContext[StructuredTagContextPlugin.structuredSlotsJsonKey] = json
+            }
+        }
         
         withAnimation(.easeOut(duration: 0.2)) {
             store.messages.append(contentsOf: [userMsg, aiMsg])
@@ -488,10 +567,19 @@ final class ChatOrchestrator {
                         currentRoundPendingText += t
                         
                     case .toolCallConfirmation(let id, let name, let args):
+                        // 静默放行内部元工具 finish_task，不作为 UI 步骤徽标呈现
+                        guard name != "finish_task" else {
+                            updateToolLog(messageID: targetId, name: name, args: args, output: "等待授权...", callID: id)
+                            syncBlackboardToStore()
+                            break
+                        }
+                        
                         let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
-                        let displayName = targetSkill?.displayName ?? name
+                        let displayName = Self.resolveActionLabel(name: name, skill: targetSkill, args: args)
+                        
                         if let idx = currentRoundToolBadges.firstIndex(where: { $0.callId == id }) {
                             currentRoundToolBadges[idx].status = "waiting"
+                            currentRoundToolBadges[idx].displayName = displayName
                         } else {
                             currentRoundToolBadges.append(ToolBadgeItem(callId: id, name: name, displayName: displayName, status: "waiting"))
                         }
@@ -499,10 +587,19 @@ final class ChatOrchestrator {
                         syncBlackboardToStore()
                         
                     case .toolCallInfo(let id, let name, let args, _):
+                        // 静默放行内部元工具 finish_task，不作为 UI 步骤徽标呈现
+                        guard name != "finish_task" else {
+                            updateToolLog(messageID: targetId, name: name, args: args, output: "执行中...", callID: id)
+                            syncBlackboardToStore()
+                            break
+                        }
+                        
                         let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
-                        let displayName = targetSkill?.displayName ?? name
+                        let displayName = Self.resolveActionLabel(name: name, skill: targetSkill, args: args)
+                        
                         if let idx = currentRoundToolBadges.firstIndex(where: { $0.callId == id }) {
                             currentRoundToolBadges[idx].status = "running"
+                            currentRoundToolBadges[idx].displayName = displayName
                         } else {
                             currentRoundToolBadges.append(ToolBadgeItem(callId: id, name: name, displayName: displayName, status: "running"))
                         }
@@ -510,6 +607,13 @@ final class ChatOrchestrator {
                         syncBlackboardToStore()
                         
                     case .toolCallResult(let name, let result):
+                        // 静默放行内部元工具 finish_task，不更新步骤徽标
+                        guard name != "finish_task" else {
+                            updateToolLogResult(messageID: targetId, name: name, output: result)
+                            syncBlackboardToStore()
+                            break
+                        }
+                        
                         let isFailed = PhysicalTruthVerifier.isExecutionFailed(toolName: name, output: result)
                         let finalStatus = isFailed ? "failed" : "success"
                         
@@ -519,7 +623,7 @@ final class ChatOrchestrator {
                             currentRoundToolBadges[idx].status = finalStatus
                         } else {
                             let targetSkill = self.agentVM.skills.first(where: { $0.name == name })
-                            let displayName = targetSkill?.displayName ?? name
+                            let displayName = Self.resolveActionLabel(name: name, skill: targetSkill, args: [:])
                             currentRoundToolBadges.append(ToolBadgeItem(callId: UUID().uuidString, name: name, displayName: displayName, status: finalStatus))
                         }
                         
@@ -676,5 +780,30 @@ final class ChatOrchestrator {
                 msg.skillLogs[idx].resultOutput = output
             }
         }
+    }
+    
+    /// 提炼纯净的人类可读行动标签（优先展示自然语言意图，彻底隐藏机器技能名）
+    static func resolveActionLabel(name: String, skill: AgentSkill?, args: [String: Any]) -> String {
+        // Level 1: 优先提取大模型自回归生成的业务行动意图 (_action_intent)
+        if let intent = (args["_action_intent"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !intent.isEmpty {
+            var clean = intent
+            if clean.hasPrefix("意图：") || clean.hasPrefix("意图:") {
+                clean = String(clean.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return clean
+        }
+        
+        // Level 2: 降级使用工具的中文展示名，并滤除前置装饰性 Emoji (防止与状态符号重叠)
+        if let rawDisplayName = skill?.displayName.trimmingCharacters(in: .whitespacesAndNewlines), !rawDisplayName.isEmpty {
+            let stripped = rawDisplayName.replacingOccurrences(
+                of: #"^[\p{Emoji}\p{Symbol}\p{Punctuation}\s]+"#,
+                with: "",
+                options: .regularExpression
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            return stripped.isEmpty ? rawDisplayName : stripped
+        }
+        
+        // Level 3: 最终兜底使用原始技能名
+        return name
     }
 }

@@ -2,7 +2,7 @@
 // 文件名：AiAgentWindowManager.swift
 // 文件说明：macOS 14+ AI智能体工作台
 // 代码要求：请保证代码的逻辑和完整性，保留代码中的所有注释内容
-// 核心架构及升级功能说明：
+// 核心解构架构拓扑 (Domain-Driven Architecture):
 // 1. 基于 ZStack 几何重映射架构，彻底解决推挤/缩回模式下的换行重排卡顿
 // 2. 适配 Swift 6：添加 @MainActor 隔离，解决 AgentViewModel 初始化并发报错
 // 3. 架构解耦修复：向 SkillManagementPanel 正确传递 agentVM.skillManager，修复类型不匹配错误
@@ -294,12 +294,16 @@ struct SideRailView: View {
     @Binding var activeTab: ConfigTab?
     @Binding var isFloatingMode: Bool
     
+    // 引入对全局配置的显式观测状态，确保菜单勾选状态实时响应
+    @State private var showTimeline: Bool = ConfigManager.shared.app.generalConfig.showSkillTimeline
+    @State private var sortByFrequency: Bool = ConfigManager.shared.app.generalConfig.historySortByFrequency
+    
     var body: some View {
         VStack(spacing: 0) {
             // 顶部间距
             Spacer().frame(height: 8)
             
-            // 中间 Tab 按钮列表：10pt 黄金呼吸间距 + 隐藏式原生手势滚动兜底
+            // 中间 Tab 按钮列表
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
                     ForEach(ConfigTab.allCases) { tab in
@@ -362,6 +366,32 @@ struct SideRailView: View {
                     .pickerStyle(.inline)
                 }
                 
+                Button(action: {
+                    showTimeline.toggle()
+                    ConfigManager.shared.app.generalConfig.showSkillTimeline = showTimeline
+                    ConfigManager.shared.saveConfig()
+                    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
+                }) {
+                    HStack {
+                        Text("AI对话气泡显示技能链时间轴")
+                        if showTimeline {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+                
+                Button(action: {
+                    sortByFrequency.toggle()
+                    ConfigManager.shared.app.generalConfig.historySortByFrequency = sortByFrequency
+                    ConfigManager.shared.saveConfig()
+                    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
+                }) {
+                    HStack {
+                        Text("历史对话记录按使用频率排序")
+                        if sortByFrequency { Image(systemName: "checkmark") }
+                    }
+                }
+                
                 Divider()
                 Button("帮助") { /* 预留 */ }
                 
@@ -385,6 +415,10 @@ struct SideRailView: View {
             VerticalModernDivider(color: Color(NSColor.separatorColor), opacity: 0.8, width: 1),
             alignment: .trailing
         )
+        .onAppear {
+            // 确保每次打开菜单时与最新配置对齐
+            self.showTimeline = ConfigManager.shared.app.generalConfig.showSkillTimeline
+        }
     }
 }
 
@@ -528,7 +562,7 @@ public class AiAgentWindowManager: NSObject, NSWindowDelegate {
         newWindow.minSize = NSSize(width: 960, height: 620)
         
         newWindow.setFrame(visibleFrame, display: true)
-        newWindow.setFrameAutosaveName("CombinedAIWorkspace_FullScreen")
+        newWindow.setFrameAutosaveName("LinTools_CombinedAIWorkspace_Window")
         
         newWindow.isOpaque = false
         newWindow.backgroundColor = .clear

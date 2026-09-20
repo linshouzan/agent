@@ -3,11 +3,11 @@
 // 文件说明：适用于 macOS 14+ 的长效记忆 (LTM) 管理器与神经元反思中枢 (Swift 6 Ready)
 //
 // 核心解构架构拓扑 (Domain-Driven Architecture):
-// ├── 1. MemoryModels              : 记忆分类枚举、持久化实体与反思数据传输对象 (Sendable)
-// ├── 2. MemoryManager (Core)      : LTM 存储、300维向量检索、去重更新与置顶管理 (@Observable @MainActor)
-// ├── 3. MemoryReflectionEngine    : 全景会话反思、RLHF 点赞/点踩双轨提炼与三重自愈解析护盾
+// ├── 1. MemoryModels              : 记忆分类枚举、自描述持久化实体与反思传输对象
+// ├── 2. MemoryManager (Core)      : 基于 DatabaseRecordConvertible 统一网关的 LTM 核心调度
+// ├── 3. MemoryReflectionEngine    : 全景会话反思、RLHF 点赞/点踩双轨提炼与容错自愈护盾
 // ├── 4. MemoryDreamConsolidation  : 梦境反思机制 (工具专属高保真避坑融合与通用画像浓缩)
-// └── 5. MemoryUI Components       : 拟物化毛玻璃记忆大盘 (ManagementPanel)、卡片视图与人工注入抽屉
+// └── 5. MemoryUI Components       : 拟物化毛玻璃记忆大盘 (ManagementPanel) 与注入卡片群
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
@@ -114,6 +114,8 @@ struct ExtractedMemoryHelper: Sendable {
     let categoryString: String
     let importance: Int
     let dimensionString: String
+    let toolName: String?
+    let triggers: [String]
 }
 
 struct ExtractedMemory: Decodable, Sendable {
@@ -121,16 +123,36 @@ struct ExtractedMemory: Decodable, Sendable {
     let categoryString: String
     let importance: Int
     let dimensionString: String
+    let toolName: String?
+    let triggers: [String]
     
     enum CodingKeys: String, CodingKey {
-        case content, category, importance, dimension
+        case content, category, importance, dimension, triggers
+        case toolName = "tool_name"
+        case toolNameCamel = "toolName"
+        case prerequisite
     }
     
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+        var rawContent = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
         self.dimensionString = try container.decodeIfPresent(String.self, forKey: .dimension) ?? "通用"
         
+        // 绑定作用域工具与触发场景词
+        self.toolName = (try? container.decodeIfPresent(String.self, forKey: .toolName))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .toolNameCamel))
+        self.triggers = (try? container.decodeIfPresent([String].self, forKey: .triggers)) ?? []
+        
+        // 生命周期前置依赖锚定：若提取了前置条件且未包含在正文中，自动规范化拼接
+        let prerequisite = try? container.decodeIfPresent(String.self, forKey: .prerequisite)
+        if let prereq = prerequisite?.trimmingCharacters(in: .whitespacesAndNewlines), !prereq.isEmpty {
+            if !rawContent.contains("前置依赖") && !rawContent.contains("前提条件") {
+                rawContent = "【前置依赖】\(prereq)\n【规则契约】\(rawContent)"
+            }
+        }
+        self.content = rawContent
+        
+        // 重要度解析
         if let intValue = try? container.decode(Int.self, forKey: .importance) {
             self.importance = intValue
         } else if let stringValue = try? container.decode(String.self, forKey: .importance) {
@@ -142,12 +164,13 @@ struct ExtractedMemory: Decodable, Sendable {
             self.importance = 5
         }
         
+        // 分类归一化
         let rawCat = (try? container.decode(String.self, forKey: .category))?.lowercased() ?? ""
         if rawCat.contains("用户") || rawCat.contains("persona") || rawCat.contains("profile") || rawCat.contains("偏好") {
             self.categoryString = "用户画像"
-        } else if rawCat.contains("避坑") || rawCat.contains("lesson") || rawCat.contains("error") || rawCat.contains("教训") || rawCat.contains("红线") || rawCat.contains("心法") {
+        } else if rawCat.contains("避坑") || rawCat.contains("lesson") || rawCat.contains("error") || rawCat.contains("教训") || rawCat.contains("契约") {
             self.categoryString = "避坑指南"
-        } else if rawCat.contains("环境") || rawCat.contains("project") || rawCat.contains("path") || rawCat.contains("参数") || rawCat.contains("知识") {
+        } else if rawCat.contains("环境") || rawCat.contains("project") || rawCat.contains("path") {
             self.categoryString = "项目环境"
         } else {
             self.categoryString = "短期备忘"
@@ -166,28 +189,21 @@ final class MemoryManager {
     var searchText: String = ""
     var filterCategory: MemoryCategory? = nil
     
-    private var fileURL: URL {
-        let baseURL = ConfigManager.shared.documentsDirectoryURL ?? FileManager.default.temporaryDirectory
-        return baseURL.appendingPathComponent("agent_memory.json")
-    }
-    
     private init() {
         loadMemories()
     }
     
+    /// MARK: - 从 SQLite 中通过统一网关加载全部已结构化长效记忆
     func loadMemories() {
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([MemoryItem].self, from: data) {
-            self.memories = decoded.sorted { $0.createdAt > $1.createdAt }
-        }
+        self.memories = LocalDatabaseManager.shared.loadAll(orderBy: "is_pinned DESC, created_at DESC")
     }
     
+    /// MARK: - 批量落盘至 SQLite 数据库通用接口
     func saveMemories() {
-        if let encoded = try? JSONEncoder().encode(memories) {
-            try? encoded.write(to: fileURL, options: .atomic)
-        }
+        LocalDatabaseManager.shared.saveAll(self.memories)
     }
     
+    /// 新增单条长效记忆（内置语义去重、向量嵌入与通用原子写入）
     @discardableResult
     func addMemory(
         content: String,
@@ -216,22 +232,31 @@ final class MemoryManager {
         let vector = await MicroVectorDB.shared.generateEmbedding(for: textToEmbed)
         
         var memoriesToKeep: [MemoryItem] = []
+        var removedMemoryIDs: [UUID] = []
         let cleanNewContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
         
+        // 语义与文本精确度查重
         for oldMem in self.memories {
             let isSameScope = oldMem.category == matchedCategory && oldMem.dimension == dimension && oldMem.toolName == toolName
             if isSameScope {
                 if oldMem.content.trimmingCharacters(in: .whitespacesAndNewlines) == cleanNewContent {
+                    removedMemoryIDs.append(oldMem.id)
                     continue
                 }
                 if let oldEmb = oldMem.embedding {
                     let sim = MicroVectorDB.shared.cosineSimilarity(a: vector, b: oldEmb)
                     if sim >= 0.96 {
+                        removedMemoryIDs.append(oldMem.id)
                         continue
                     }
                 }
             }
             memoriesToKeep.append(oldMem)
+        }
+        
+        // MARK: - 使用通用网关接口物理清理失效旧记忆
+        for removeID in removedMemoryIDs {
+            LocalDatabaseManager.shared.delete(MemoryItem.self, id: removeID.uuidString)
         }
         
         self.memories = memoriesToKeep
@@ -246,22 +271,27 @@ final class MemoryManager {
             triggers: triggers
         )
         self.memories.insert(newMemory, at: 0)
-        self.saveMemories()
+        
+        // MARK: - 采用通用持久化网关执行 UPSERT 保存
+        LocalDatabaseManager.shared.save(newMemory)
         return "✅ 长期存储网络落盘成功。"
     }
     
+    /// MARK: - 删除指定长效记忆
     func deleteMemory(_ id: UUID) {
         memories.removeAll { $0.id == id }
-        saveMemories()
+        LocalDatabaseManager.shared.delete(MemoryItem.self, id: id.uuidString)
     }
     
+    /// MARK: - 置顶/取消置顶长效记忆
     func togglePin(_ id: UUID) {
         if let idx = memories.firstIndex(where: { $0.id == id }) {
             memories[idx].isPinned.toggle()
-            saveMemories()
+            LocalDatabaseManager.shared.save(memories[idx])
         }
     }
     
+    /// 混合语义检索上下文
     func searchContext(for query: String, topK: Int = 3, categoryFilter: String? = nil) async -> String {
         let queryVector = await MicroVectorDB.shared.generateEmbedding(for: query)
         let queryLower = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,7 +307,6 @@ final class MemoryManager {
             let memLower = mem.content.lowercased()
             
             if let emb = mem.embedding {
-                // 直接调用 MicroVectorDB 统一余弦算子
                 let sim = MicroVectorDB.shared.cosineSimilarity(a: queryVector, b: emb)
                 if sim > 0.3 { score += sim * 2.0 }
                 if isAskingIdentity && mem.category == .persona && sim > 0.15 { score += 1.2 }
@@ -318,7 +347,19 @@ extension MemoryManager {
             var logsSummary = ""
             if !msg.skillLogs.isEmpty {
                 for log in msg.skillLogs {
-                    logsSummary += "\n  - [物理工具 \(log.skillName)] 执行返回: \(log.resultOutput)"
+                    // 1. 手册内容硬截断：防止 read_skill_manual 数万字正文倒灌污染记忆模型
+                    if log.skillName == "read_skill_manual" {
+                        logsSummary += "\n  - [物理工具 \(log.skillName)] 执行返回: [已查阅相关技术文档与操作规范]"
+                        continue
+                    }
+                    
+                    // 2. 敏感凭据脱敏与超长输出压缩
+                    let sanitizedResult = log.resultOutput
+                        .replacingOccurrences(of: #"PCACCOUNT_[A-Za-z0-9_-]+"#, with: "<REDACTED_SESSION_ID>", options: .regularExpression)
+                        .replacingOccurrences(of: #"(?i)cookie:\s*['"][^'"]+['"]"#, with: "cookie: <REDACTED>", options: .regularExpression)
+                        .cutContent(maxChars: 800)
+                    
+                    logsSummary += "\n  - [物理工具 \(log.skillName)] 执行返回: \(sanitizedResult)"
                 }
             }
             return DialogueTurn(isUser: msg.isUser, text: msg.text, toolLogsText: logsSummary)
@@ -332,8 +373,22 @@ extension MemoryManager {
             var logsSummary = ""
             if !msg.skillLogs.isEmpty {
                 for log in msg.skillLogs {
+                    // 1. 手册内容硬截断
+                    if log.skillName == "read_skill_manual" {
+                        let docPath = (log.args["doc_path"] as? String) ?? "主手册"
+                        logsSummary += "\n  - [物理工具 \(log.skillName)] 参数: doc_path=\(docPath)\n    执行返回: [已查阅 \(docPath) 规范文档]"
+                        continue
+                    }
+                    
                     let argStr = (try? JSONSerialization.data(withJSONObject: log.args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                    logsSummary += "\n  - [物理工具 \(log.skillName)] 参数: \(argStr)\n    执行返回: \(log.resultOutput)"
+                    let sanitizedArgs = argStr
+                        .replacingOccurrences(of: #"PCACCOUNT_[A-Za-z0-9_-]+"#, with: "<REDACTED_SESSION_ID>", options: .regularExpression)
+                    
+                    let sanitizedResult = log.resultOutput
+                        .replacingOccurrences(of: #"PCACCOUNT_[A-Za-z0-9_-]+"#, with: "<REDACTED_SESSION_ID>", options: .regularExpression)
+                        .cutContent(maxChars: 800)
+                    
+                    logsSummary += "\n  - [物理工具 \(log.skillName)] 参数: \(sanitizedArgs)\n    执行返回: \(sanitizedResult)"
                 }
             }
             return DialogueTurn(isUser: msg.isUser, text: msg.text, toolLogsText: logsSummary)
@@ -476,7 +531,10 @@ extension MemoryManager {
         var chatScript = ""
         for turn in turns {
             let roleLabel = turn.isUser ? "用户" : "AI智能体"
-            let cleanMsgBody = turn.text.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanMsgBody = turn.text
+                .replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"PCACCOUNT_[A-Za-z0-9_-]+"#, with: "<REDACTED_SESSION_ID>", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             
             chatScript += "[\(roleLabel)]:\n"
             if !cleanMsgBody.isEmpty {
@@ -489,39 +547,42 @@ extension MemoryManager {
         
         guard !chatScript.isEmpty else { return }
         
+        // 正向规约设计提示词：消除负面词汇，确立生命周期前置依赖，剥离实例级动态实体
         let batchReflectPrompt = """
-        # 任务
-        深度复盘以下会话与工具执行日志，提取具备长期沉淀价值的高精度事实与硬核技术经验规则。
+        # 任务目标
+        分析执行日志中的真实交互与调用闭环，提炼可在后续任务中复用的【高确定性技术避坑指南】。若本轮会话仅为常规正常操作或未产生未知限制的突破，输出 `[]`。
 
-        <classification_and_extraction_rules>
-        1. 【避坑指南 (lesson)】（核心重点）：
-           - 关注点：重点分析日志中「工具调用报错、命令异常退出、参数错误、顺序颠倒、缺失必填项」以及后续「修正成功的真实命令」。
-           - 提炼标准：输出必须包含具体技术要素：【工具名/子命令】+【导致报错的写法】+【实测验证有效的正确格式/参数顺序/文件语法】。
-           - 质量要求：直接陈述经过验证的技术语法与参数契约。
+        <extraction_protocols>
+        1. 【避坑指南 (lesson)】准入准则：
+           - 提取条件：仅基于「前期物理调用遭遇明确报错」且「后续排查调整后成功执行通过」的完整对比事实进行提炼。平铺直叙的常规正确执行不予提取。
+           - 结构规范：
+             ● tool_name：明确标明具体工具名称（如 e10-cli 或 weaver-e9-assistant）。
+             ● prerequisite：明确该操作适用的前置生命周期依赖（例如：须在环境探活与鉴权完成后执行；或：须在表单创建完成后执行）。
+             ● content：客观陈述导致报错的参数写法与实测验证有效的正确契约（包含前置依赖与参数规范）。
+             ● triggers：提炼 2~4 个触发子命令或动作场景词。
+           - 范围边界：仅收录工具手册未充分阐述的隐形限制、参数转义特征与特殊边界；排除通用网络波动与临时打字失误。
 
-        2. 【用户画像 (persona)】：
-           - 提取现实人类用户本人的技术栈背景、工作习惯与称呼。
+        2. 【持久资产与实体过滤】：
+           - 具有租户、项目、会话属性的瞬态实体标识（如应用ID、表单objId、临时Token、SessionId、Cookie、本地环境临时路径），归属于会话级瞬态资产，不纳入长效记忆库。
 
-        3. 【项目环境 (project)】：
-           - 提取本次会话中出现的客观项目ID、应用ID、租户Key、服务器地址、本地环境路径等。
-
-        4. 【短期备忘 (tickler)】：
-           - 临时任务与尚未验证成功的待办事项。
-        </classification_and_extraction_rules>
+        3. 【用户习惯 (persona)】：
+           - 仅在用户以第一人称明确表达个人长期技术偏好与交互要求（如“我习惯使用...”）时记录。用户下达的业务任务指令不作为画像推断依据。
+        </extraction_protocols>
 
         # 细分维度 (dimension) 规范
         - 避坑指南：'CLI命令规范' | '参数顺序契约' | 'API调用避坑' | '环境配置'
-        - 项目环境：'应用ID' | '环境地址' | '沙盒路径' | '架构版本'
         - 用户画像：'技术偏好' | '职业称呼'
-        - 短期备忘：'临时事项'
 
         [待复盘会话与执行记录]
         \(chatScript)
 
-        # 输出格式要求 (严格输出标准 JSON 数组，无高价值信息时输出 [])
+        # 输出格式要求 (严格输出标准 JSON 数组，无高价值技术增量时返回 [])
         [
           {
-            "content": "具体的规则陈述（如：`e10-cli form layout read` 必须严格按 `<objId> <appId>` 顺序传入位置参数，不可包含 --app-id 选项）",
+            "tool_name": "目标工具名称",
+            "triggers": ["触发子命令1", "场景词2"],
+            "prerequisite": "前置生命周期依赖说明",
+            "content": "【前置依赖】... 【有效契约】...",
             "category": "避坑指南",
             "dimension": "CLI命令规范",
             "importance": 9
@@ -529,7 +590,7 @@ extension MemoryManager {
         ]
         """
         
-        LogManager.shared.info("🌌 [潜意识反思器] 启动全景多维记忆收割流...")
+        LogManager.shared.info("🌌 [潜意识反思器] 启动高纯度避坑经验提炼流...")
         let rawJsonReport = await LLMService.shared.askSimple(prompt: batchReflectPrompt, model: model)
         let reportWithoutThink = rawJsonReport.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
         
@@ -545,23 +606,43 @@ extension MemoryManager {
             
             do {
                 let decoded = try JSONDecoder().decode([ExtractedMemory].self, from: data)
-                finalExtractedItems = decoded.map { ExtractedMemoryHelper(content: $0.content, categoryString: $0.categoryString, importance: $0.importance, dimensionString: $0.dimensionString) }
+                finalExtractedItems = decoded.map {
+                    ExtractedMemoryHelper(
+                        content: $0.content,
+                        categoryString: $0.categoryString,
+                        importance: $0.importance,
+                        dimensionString: $0.dimensionString,
+                        toolName: $0.toolName,
+                        triggers: $0.triggers
+                    )
+                }
             } catch {
                 if let looseArray = try? JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] {
                     for dict in looseArray {
-                        let content = dict["content"] as? String ?? ""
-                        let category = dict["category"] as? String ?? ""
-                        let dimension = dict["dimension"] as? String ?? "通用"
-                        let importanceRaw = dict["importance"]
+                        var content = dict["content"] as? String ?? ""
+                        let category = dict["category"] as? String ?? "避坑指南"
+                        let dimension = dict["dimension"] as? String ?? "CLI命令规范"
+                        let toolName = (dict["tool_name"] as? String) ?? (dict["toolName"] as? String)
+                        let triggers = (dict["triggers"] as? [String]) ?? []
                         
-                        var importanceInt = 5
-                        if let rawInt = importanceRaw as? Int { importanceInt = rawInt }
-                        else if let rawStr = importanceRaw as? String {
-                            let lower = rawStr.lowercased()
-                            if lower.contains("high") || lower.contains("高") { importanceInt = 9 }
-                            else if lower.contains("low") || lower.contains("低") { importanceInt = 2 }
+                        let prerequisite = dict["prerequisite"] as? String
+                        if let prereq = prerequisite?.trimmingCharacters(in: .whitespacesAndNewlines), !prereq.isEmpty {
+                            if !content.contains("前置依赖") {
+                                content = "【前置依赖】\(prereq)\n【规则契约】\(content)"
+                            }
                         }
-                        finalExtractedItems.append(ExtractedMemoryHelper(content: content, categoryString: category, importance: importanceInt, dimensionString: dimension))
+                        
+                        var importanceInt = 9
+                        if let rawInt = dict["importance"] as? Int { importanceInt = rawInt }
+                        
+                        finalExtractedItems.append(ExtractedMemoryHelper(
+                            content: content,
+                            categoryString: category,
+                            importance: importanceInt,
+                            dimensionString: dimension,
+                            toolName: toolName,
+                            triggers: triggers
+                        ))
                     }
                 } else {
                     finalExtractedItems = regexParseFallback(jsonStr: cleanJSON)
@@ -573,12 +654,15 @@ extension MemoryManager {
                     let sanitizedContent = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
                     if sanitizedContent.isEmpty || sanitizedContent == "[]" || sanitizedContent == "null" { continue }
                     
+                    // 正式将 toolName 与 triggers 持久化传入 addMemory，实现数据库物理字段对齐
                     _ = await self.addMemory(
                         content: item.content,
                         category: item.categoryString,
                         importance: item.importance,
                         embeddingText: item.content,
-                        dimension: item.dimensionString
+                        dimension: item.dimensionString,
+                        toolName: item.toolName,
+                        triggers: item.triggers
                     )
                 }
             }
@@ -600,32 +684,48 @@ extension MemoryManager {
             let contentRegex = try? NSRegularExpression(pattern: "\"content\"\\s*:\\s*\"(.*?)\"\\s*(?:,|\n|\\})", options: [.dotMatchesLineSeparators])
             let categoryRegex = try? NSRegularExpression(pattern: "\"category\"\\s*:\\s*\"(.*?)\"\\s*(?:,|\n|\\})", options: [.dotMatchesLineSeparators])
             let dimensionRegex = try? NSRegularExpression(pattern: "\"dimension\"\\s*:\\s*\"(.*?)\"\\s*(?:,|\n|\\})", options: [.dotMatchesLineSeparators])
-            let importanceRegex = try? NSRegularExpression(pattern: "\"importance\"\\s*:\\s*(?:\"(.*?)\"|(\\d+))", options: [.dotMatchesLineSeparators])
+            let toolNameRegex = try? NSRegularExpression(pattern: "\"(?:tool_name|toolName)\"\\s*:\\s*\"(.*?)\"\\s*(?:,|\n|\\})", options: [.dotMatchesLineSeparators])
+            let prereqRegex = try? NSRegularExpression(pattern: "\"prerequisite\"\\s*:\\s*\"(.*?)\"\\s*(?:,|\n|\\})", options: [.dotMatchesLineSeparators])
             
             let objRange = NSRange(objStr.startIndex..<objStr.endIndex, in: objStr)
+            
             var content = ""
-            if let cMatch = contentRegex?.firstMatch(in: objStr, options: [], range: objRange), let cRange = Range(cMatch.range(at: 1), in: objStr) { content = String(objStr[cRange]) }
-            
-            var category = ""
-            if let catMatch = categoryRegex?.firstMatch(in: objStr, options: [], range: objRange), let catRange = Range(catMatch.range(at: 1), in: objStr) { category = String(objStr[catRange]) }
-            
-            var dimension = "通用"
-            if let dMatch = dimensionRegex?.firstMatch(in: objStr, options: [], range: objRange), let dRange = Range(dMatch.range(at: 1), in: objStr) { dimension = String(objStr[dRange]) }
-            
-            var importanceStr = ""
-            var importanceInt = 5
-            if let iMatch = importanceRegex?.firstMatch(in: objStr, options: [], range: objRange) {
-                if let r1 = Range(iMatch.range(at: 1), in: objStr) { importanceStr = String(objStr[r1]) }
-                else if let r2 = Range(iMatch.range(at: 2), in: objStr) { importanceStr = String(objStr[r2]) }
+            if let cMatch = contentRegex?.firstMatch(in: objStr, options: [], range: objRange), let cRange = Range(cMatch.range(at: 1), in: objStr) {
+                content = String(objStr[cRange])
             }
             
-            if let parsedInt = Int(importanceStr) { importanceInt = parsedInt }
-            else {
-                let lower = importanceStr.lowercased()
-                if lower.contains("high") || lower.contains("高") { importanceInt = 9 }
-                else if lower.contains("low") || lower.contains("低") { importanceInt = 2 }
+            if let pMatch = prereqRegex?.firstMatch(in: objStr, options: [], range: objRange), let pRange = Range(pMatch.range(at: 1), in: objStr) {
+                let prereq = String(objStr[pRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prereq.isEmpty && !content.contains("前置依赖") {
+                    content = "【前置依赖】\(prereq)\n【规则契约】\(content)"
+                }
             }
-            results.append(ExtractedMemoryHelper(content: content, categoryString: category, importance: importanceInt, dimensionString: dimension))
+            
+            var category = "避坑指南"
+            if let catMatch = categoryRegex?.firstMatch(in: objStr, options: [], range: objRange), let catRange = Range(catMatch.range(at: 1), in: objStr) {
+                category = String(objStr[catRange])
+            }
+            
+            var dimension = "CLI命令规范"
+            if let dMatch = dimensionRegex?.firstMatch(in: objStr, options: [], range: objRange), let dRange = Range(dMatch.range(at: 1), in: objStr) {
+                dimension = String(objStr[dRange])
+            }
+            
+            var toolName: String? = nil
+            if let tMatch = toolNameRegex?.firstMatch(in: objStr, options: [], range: objRange), let tRange = Range(tMatch.range(at: 1), in: objStr) {
+                let parsed = String(objStr[tRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !parsed.isEmpty { toolName = parsed }
+            }
+            
+            guard !content.isEmpty else { continue }
+            results.append(ExtractedMemoryHelper(
+                content: content,
+                categoryString: category,
+                importance: 9,
+                dimensionString: dimension,
+                toolName: toolName,
+                triggers: []
+            ))
         }
         return results
     }

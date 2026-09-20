@@ -268,12 +268,12 @@ struct LogPayloadFormatter: Sendable {
         // 1. 系统指令解构 (System Instruction)
         if let sysInst = dict["systemInstruction"] as? [String: Any],
            let parts = sysInst["parts"] as? [[String: Any]] {
-            var sysText = ""
-            for p in parts {
-                if let t = p["text"] as? String { sysText += t }
-            }
+            let partTexts = parts.compactMap { $0["text"] as? String }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let sysText = partTexts.joined(separator: "\n\n")
             if !sysText.isEmpty {
-                sections.append("╔════════════════════════════════════════════════════════════════╗\n║ 👑 SYSTEM INSTRUCTION (系统提示词指令)                          ║\n╚════════════════════════════════════════════════════════════════╝\n\(sysText.trimmingCharacters(in: .whitespacesAndNewlines))")
+                sections.append("╔════════════════════════════════════════════════════════════════╗\n║ 👑 SYSTEM INSTRUCTION (系统提示词指令)                          ║\n╚════════════════════════════════════════════════════════════════╝\n\(sysText)")
             }
         } else if let sys = dict["system"] as? String, !sys.isEmpty {
             sections.append("╔════════════════════════════════════════════════════════════════╗\n║ 👑 SYSTEM INSTRUCTION (系统提示词指令)                          ║\n╚════════════════════════════════════════════════════════════════╝\n\(sys.trimmingCharacters(in: .whitespacesAndNewlines))")

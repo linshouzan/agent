@@ -2,7 +2,7 @@
 // 文件名：LLMService.swift
 // 文件说明：适用于 macOS 14+ 的大模型多协议通信引擎与流式事件分流中心 (Swift 6 Ready)
 //
-// 核心架构与协议调度说明：
+// 核心解构架构拓扑 (Domain-Driven Architecture):
 // 1. 协议解耦与策略工厂架构 (Protocol-Oriented Adapter Pattern):
 //    - 统一抽象 LLMProtocolAdapter 协议，隔离 OpenAI、Gemini (GenerateContent)、Gemini Interactions 与 Ollama 底层协议差异。
 //    - LLMAdapterFactory 单例工厂动态注册与路由适配器，保持无侵入式通道扩充能力。
@@ -98,33 +98,51 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         request.addValue("keep-alive", forHTTPHeaderField: "Connection")
         
+        // 1. 统一收集并去重所有系统指引 (优先使用 instruction，并吸收 messages 中的 .system)
+        var systemPromptParts: [String] = []
+        let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanInstruction.isEmpty {
+            systemPromptParts.append(cleanInstruction)
+        }
+        
+        for msg in messages where msg.role == .system {
+            if let sysText = msg.content?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sysText.isEmpty,
+               !systemPromptParts.contains(sysText) {
+                systemPromptParts.append(sysText)
+            }
+        }
+        
+        // 2. 纯净装配 contents 列表 (仅接纳 user、model 与 tool，彻底杜绝 .system 误混入 user)
         var contents: [[String: Any]] = []
-        let userMessagesCount = messages.filter { $0.role == .user }.count
+        let nonSystemMessages = messages.filter { $0.role != .system }
+        let userMessagesCount = nonSystemMessages.filter { $0.role == .user }.count
         var currentUserIndex = 0
         
-        for msg in messages {
+        for msg in nonSystemMessages {
             var currentParts: [[String: Any]] = []
             var targetRole = "user"
             
             switch msg.role {
-            case .user, .system:
+            case .system:
+                break // 前置阶段已拦截提取，此处绝不作为普通消息混入
+                
+            case .user:
                 targetRole = "user"
                 if let text = msg.content, !text.isEmpty {
                     currentParts.append(["text": text])
                 }
                 
-                if msg.role == .user {
-                    currentUserIndex += 1
-                    if currentUserIndex == userMessagesCount {
-                        for img in images {
-                            if let base64 = img.toBase64JPEG() {
-                                currentParts.append(["inlineData": ["mimeType": "image/jpeg", "data": base64]])
-                            }
+                currentUserIndex += 1
+                if currentUserIndex == userMessagesCount {
+                    for img in images {
+                        if let base64 = img.toBase64JPEG() {
+                            currentParts.append(["inlineData": ["mimeType": "image/jpeg", "data": base64]])
                         }
-                        for fileURL in fileURLs where fileURL.pathExtension.lowercased() == "pdf" {
-                            if let fileData = try? Data(contentsOf: fileURL) {
-                                currentParts.append(["inlineData": ["mimeType": "application/pdf", "data": fileData.base64EncodedString()]])
-                            }
+                    }
+                    for fileURL in fileURLs where fileURL.pathExtension.lowercased() == "pdf" {
+                        if let fileData = try? Data(contentsOf: fileURL) {
+                            currentParts.append(["inlineData": ["mimeType": "application/pdf", "data": fileData.base64EncodedString()]])
                         }
                     }
                 }
@@ -174,8 +192,12 @@ struct GeminiProtocolAdapter: LLMProtocolAdapter {
         }
         
         var requestBody: [String: Any] = ["contents": contents]
-        if !instruction.isEmpty {
-            requestBody["systemInstruction"] = ["parts": [["text": instruction]]]
+        
+        // 3. 规范写入官方 systemInstruction (字节级稳定，最大化命中 KV 前缀缓存)
+        if !systemPromptParts.isEmpty {
+            requestBody["systemInstruction"] = [
+                "parts": systemPromptParts.map { ["text": $0] }
+            ]
         }
         
         if !activeSkills.isEmpty {
@@ -546,12 +568,23 @@ struct OpenAIProtocolAdapter: LLMProtocolAdapter {
         request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         
         var apiMessages: [[String: Any]] = []
-        if !instruction.isEmpty { apiMessages.append(["role": "system", "content": instruction]) }
+        let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanInstruction.isEmpty {
+            apiMessages.append(["role": "system", "content": cleanInstruction])
+        }
         
-        let userMessagesCount = messages.filter { $0.role == .user }.count
+        let nonDuplicateMessages = messages.filter { msg in
+            // 如果已挂载全局 instruction，则过滤掉与其完全同文的 .system 消息
+            if msg.role == .system, let text = msg.content?.trimmingCharacters(in: .whitespacesAndNewlines), text == cleanInstruction {
+                return false
+            }
+            return true
+        }
+        
+        let userMessagesCount = nonDuplicateMessages.filter { $0.role == .user }.count
         var currentUserIndex = 0
         
-        for msg in messages {
+        for msg in nonDuplicateMessages {
             switch msg.role {
             case .system:
                 if let text = msg.content, !text.isEmpty {
@@ -733,6 +766,13 @@ private extension AgentSkill {
     func toFunctionDeclaration(isGemini: Bool = false) -> [String: Any] {
         var properties: [String: Any] = [:]
         var required: [String] = []
+        
+        // 注入虚拟行动意图参数，引导模型在调用工具时自回归输出行动意图
+        // 保持非 required，防止轻量端侧模型因漏填触发格式崩塌
+        properties["_action_intent"] = [
+            "type": "string",
+            "description": "执行此操作前的极简意图说明（一句话，例如：因为之前的报错原因为xxx，我需要调用xx工具进一步分析。）"
+        ]
         
         let sortedParams = self.parameters.sorted { $0.name.lowercased() < $1.name.lowercased() }
         
@@ -1066,17 +1106,28 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
                 let parentContextID = LogManager.shared.activeContextID
                 var finalMessages = messages
                 var injectedContext = ""
-                
-                let isDirectGeminiMedia = (protocolType == "gemini" || protocolType == "interactions")
-                for fileURL in fileURLs {
-                    if isDirectGeminiMedia && fileURL.pathExtension.lowercased() == "pdf" { continue }
-                    if let documentText = await self.extractTextContent(from: fileURL) {
-                        injectedContext += "\n\n--- [附带文件: \(fileURL.lastPathComponent)] ---\n\(documentText)\n"
+                                
+                if !fileURLs.isEmpty {
+                    // 轨 1：所有文件 100% 注入物理元数据与绝对路径，防止非文本文件（如 zip、tar、dmg）被静默丢弃
+                    let attachmentDescriptor = FileUtil.formatAttachmentDescriptor(for: fileURLs)
+                    injectedContext += "\n\n" + attachmentDescriptor
+                    
+                    // 轨 2：针对可读文档类型自适应抽取正文内容
+                    let isDirectGeminiMedia = (protocolType == "gemini" || protocolType == "interactions")
+                    for fileURL in fileURLs {
+                        if isDirectGeminiMedia && fileURL.pathExtension.lowercased() == "pdf" { continue }
+                        if let documentText = await self.extractTextContent(from: fileURL) {
+                            injectedContext += "\n\n--- [文档正文解析: \(fileURL.lastPathComponent)] ---\n\(documentText)\n"
+                        }
                     }
                 }
                 
                 if !injectedContext.isEmpty, let lastIdx = finalMessages.lastIndex(where: { $0.role == .user }) {
-                    finalMessages[lastIdx].content = (finalMessages[lastIdx].content ?? "") + injectedContext
+                    let existingContent = finalMessages[lastIdx].content ?? ""
+                    // 防重复注入保护：避免上下文已有文件清单时再次叠加
+                    if !existingContent.contains("【📎 用户上传附带文件清单】") {
+                        finalMessages[lastIdx].content = existingContent + injectedContext
+                    }
                 }
                 
                 var accumulatedResponse = ""
@@ -1152,7 +1203,7 @@ final class LLMService: NSObject, @unchecked Sendable, URLSessionDelegate {
                     if !(error is CancellationError) {
                         let readableErrMsg = error.localizedDescription
                         errorSummary = readableErrMsg
-                        LogManager.shared.error("❌ 模型响应中断", detail: readableErrMsg, parentID: parentContextID)
+                        // LogManager.shared.error("❌ 模型响应中断", detail: readableErrMsg, parentID: parentContextID)
                         continuation.yield(.error(readableErrMsg))
                         continuation.finish(throwing: error)
                     }

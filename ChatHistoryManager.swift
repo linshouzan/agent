@@ -3,8 +3,8 @@
 // 文件说明：适用于 macOS 14+ 的对话历史记录综合管理与多维资产归档中心 (Swift 6 Ready)
 //
 // 核心解构架构拓扑 (Domain-Driven Architecture):
-// ├── 1. HistoryModels            : 归档库分类枚举 (LibraryFilter) 与资产象限定义
-// ├── 2. HistoryStorageEngine     : 后台异步磁盘安全原子化读写引擎 (JSON 落盘)
+// ├── 1. HistoryModels            : 归档库分类枚举 (LibraryFilter) 与 ChatSession 实体自描述契约
+// ├── 2. HistoryStorageEngine     : 基于 DatabaseRecordConvertible 统一网关的后台异步读写引擎
 // ├── 3. HistoryReflectionPipeline: 潜意识全景认知反思与资产分类智能路由核
 // ├── 4. HistoryExportBridge      : 标准化全量开发档案导出与访达交互桥接器
 // ├── 5. ChatHistoryManager       : 核心状态管理器与反向流转门面 (@Observable @MainActor)
@@ -31,22 +31,22 @@ enum LibraryFilter: String, CaseIterable, Identifiable, Sendable {
 
 struct HistoryStorageEngine: Sendable {
     
+    // MARK: - 通过通用数据网关全量载入历史会话
     static func loadFromDisk() -> [ChatSession] {
-        guard let url = ConfigManager.shared.chatHistoryFileName,
-              let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([ChatSession].self, from: data) else {
-            return []
-        }
-        return decoded.sorted { $0.updatedAt > $1.updatedAt }
+        return LocalDatabaseManager.shared.loadAll(orderBy: "updated_at DESC")
     }
     
-    static func persistAsync(sessions: [ChatSession]) {
-        guard let url = ConfigManager.shared.chatHistoryFileName else { return }
-        let snapshot = sessions
+    // MARK: - 通过通用数据网关异步保存单条会话
+    static func persistSingleSessionAsync(_ session: ChatSession) {
         Task.detached(priority: .background) {
-            if let data = try? JSONEncoder().encode(snapshot) {
-                try? data.write(to: url, options: .atomic)
-            }
+            LocalDatabaseManager.shared.save(session)
+        }
+    }
+    
+    // MARK: - 通过通用数据网关异步删除单条会话
+    static func deleteSessionAsync(id: UUID) {
+        Task.detached(priority: .background) {
+            LocalDatabaseManager.shared.delete(ChatSession.self, id: id.uuidString)
         }
     }
 }
@@ -149,14 +149,16 @@ struct HistoryExportBridge: Sendable {
 
 // MARK: - ==================== 5. ChatHistoryManager (核心状态管理与资产流转门面) ====================
 
+// MARK: - 升级为现代 @Observable @MainActor 响应式状态机
+@Observable
 @MainActor
-class ChatHistoryManager: ObservableObject {
+final class ChatHistoryManager: Sendable {
     static let shared = ChatHistoryManager()
     
-    @Published var sessions: [ChatSession] = []
+    var sessions: [ChatSession] = []
     
     /// 后台潜意识全景反思的会话 ID 并发追踪锁
-    @Published var archivingSessionIDs: Set<UUID> = []
+    var archivingSessionIDs: Set<UUID> = []
     
     private init() {
         loadSessions()
@@ -166,14 +168,29 @@ class ChatHistoryManager: ObservableObject {
         self.sessions = HistoryStorageEngine.loadFromDisk()
     }
     
-    func saveSession(id: UUID, title: String, agentID: UUID, messages: [ChatMessage], personaID: UUID? = nil) {
+    func saveSession(
+        id: UUID,
+        title: String,
+        agentID: UUID,
+        messages: [ChatMessage],
+        personaID: UUID? = nil,
+        blackboardPlan: String? = nil,
+        scratchpad: String? = nil
+    ) {
         let savedMsgs = messages.map { $0.toSaved() }
+        let sessionToPersist: ChatSession
+        
         if let idx = sessions.firstIndex(where: { $0.id == id }) {
             sessions[idx].messages = savedMsgs
             sessions[idx].updatedAt = Date()
             sessions[idx].agentID = agentID
             sessions[idx].personaID = personaID
             if !title.isEmpty { sessions[idx].title = title }
+            
+            if let plan = blackboardPlan { sessions[idx].blackboardPlan = plan }
+            if let pad = scratchpad { sessions[idx].scratchpad = pad }
+            
+            sessionToPersist = sessions[idx]
         } else {
             let newSession = ChatSession(
                 id: id,
@@ -181,31 +198,42 @@ class ChatHistoryManager: ObservableObject {
                 updatedAt: Date(),
                 agentID: agentID,
                 messages: savedMsgs,
+                activatedPrivateQAIDs: [],
                 isArchived: false,
                 archiveCategory: "常规会话",
-                personaID: personaID
+                personaID: personaID,
+                blackboardPlan: blackboardPlan,
+                scratchpad: scratchpad
             )
             sessions.insert(newSession, at: 0)
+            sessionToPersist = newSession
         }
-        HistoryStorageEngine.persistAsync(sessions: self.sessions)
+        
+        // 单会话毫秒级落盘至 SQLite
+        HistoryStorageEngine.persistSingleSessionAsync(sessionToPersist)
     }
     
     func updateSessionTitle(id: UUID, newTitle: String) {
         if let idx = sessions.firstIndex(where: { $0.id == id }) {
             sessions[idx].title = newTitle
-            HistoryStorageEngine.persistAsync(sessions: self.sessions)
+            HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
         }
     }
     
     func deleteSession(id: UUID) {
-        sessions.removeAll { $0.id == id }
-        HistoryStorageEngine.persistAsync(sessions: self.sessions)
+        guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+        if sessions[idx].isLocked == true {
+            ___updateIslandNotice(text: "此会话已锁定，禁止删除", icon: "lock.fill")
+            return
+        }
+        sessions.remove(at: idx)
+        HistoryStorageEngine.deleteSessionAsync(id: id)
     }
     
     func deleteMessage(sessionID: UUID, messageID: UUID) {
         if let idx = sessions.firstIndex(where: { $0.id == sessionID }) {
             sessions[idx].messages.removeAll { $0.id == messageID }
-            HistoryStorageEngine.persistAsync(sessions: self.sessions)
+            HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
         }
     }
     
@@ -214,25 +242,23 @@ class ChatHistoryManager: ObservableObject {
            let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageID }) {
             sessions[sIdx].messages[mIdx].text = newText
             sessions[sIdx].updatedAt = Date()
-            HistoryStorageEngine.persistAsync(sessions: self.sessions)
+            HistoryStorageEngine.persistSingleSessionAsync(sessions[sIdx])
         }
     }
     
-    /// 将已归档会话无损释放并归还活跃库池中
     func unarchiveSession(id: UUID) {
         if let idx = sessions.firstIndex(where: { $0.id == id }) {
             sessions[idx].isArchived = false
             sessions[idx].archiveCategory = "常规会话"
             sessions[idx].updatedAt = Date()
             
-            HistoryStorageEngine.persistAsync(sessions: self.sessions)
+            HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
             
             NotificationCenter.default.post(name: NSNotification.Name("AgentProfilesExternallyUpdated"), object: nil)
             ___updateIslandNotice(text: "会话资产已成功恢复至活跃库", icon: "tray.and.arrow.up.fill")
         }
     }
     
-    /// 触发会话终结结算，调用底层潜意识神经元反思核收割认知，并物理封锁该对话划归资产库
     func archiveAndReflectSession(id: UUID, model: String) async {
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         
@@ -255,10 +281,47 @@ class ChatHistoryManager: ObservableObject {
         sessions[idx].archiveCategory = derivedCategory
         sessions[idx].updatedAt = Date()
         
-        HistoryStorageEngine.persistAsync(sessions: self.sessions)
+        HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
         
         NotificationCenter.default.post(name: NSNotification.Name("AgentProfilesExternallyUpdated"), object: nil)
         ___updateIslandNotice(text: "该会话核心经验已提炼归档", icon: "brain.head.profile")
+    }
+    
+    func toggleSessionLock(id: UUID) {
+        guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let currentlyLocked = sessions[idx].isLocked ?? false
+        sessions[idx].isLocked = !currentlyLocked
+        HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
+        
+        let statusText = !currentlyLocked ? "会话已锁定（防误删保护已开启）" : "会话已解除锁定"
+        let icon = !currentlyLocked ? "lock.fill" : "lock.open.fill"
+        ___updateIslandNotice(text: statusText, icon: icon)
+    }
+    
+    // 纯净的原地提炼经验：沉淀长效记忆，不改变会话归档属性，不移出当前会话列表
+    func extractExperienceOnly(id: UUID, model: String) async {
+        guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+        
+        archivingSessionIDs.insert(id)
+        defer {
+            withAnimation(.easeOut(duration: 0.2)) {
+                self.archivingSessionIDs.remove(id)
+            }
+        }
+        
+        let session = sessions[idx]
+        _ = await HistoryReflectionPipeline.reflectAndDeriveCategory(
+            messages: session.messages,
+            title: session.title,
+            model: model
+        )
+        
+        // 保持可见性：不设 isArchived = true，仅更新时间
+        sessions[idx].updatedAt = Date()
+        HistoryStorageEngine.persistSingleSessionAsync(sessions[idx])
+        
+        NotificationCenter.default.post(name: NSNotification.Name("AgentProfilesExternallyUpdated"), object: nil)
+        ___updateIslandNotice(text: "该会话核心经验已成功提炼入库", icon: "brain.head.profile")
     }
 }
 
@@ -266,225 +329,348 @@ class ChatHistoryManager: ObservableObject {
 
 @MainActor
 struct ChatHistoryManagementPanel: View {
-    @StateObject private var historyManager = ChatHistoryManager.shared
+    @State private var historyManager = ChatHistoryManager.shared
     @State private var selectedSessionID: UUID?
     @State private var editingSessionID: UUID?
     @State private var editTitleText: String = ""
     
     @State private var editingMessageID: UUID? = nil
     @State private var editingMessageText: String = ""
-    @State private var selectedLibraryFilter: LibraryFilter = .active
     
-    var segmentedSessions: [ChatSession] {
-        switch selectedLibraryFilter {
-        case .active:
-            return historyManager.sessions.filter { !($0.isArchived ?? false) }
-        case .persona:
-            return historyManager.sessions.filter { ($0.isArchived ?? false) && $0.archiveCategory == "偏好画像" }
-        case .lesson:
-            return historyManager.sessions.filter { ($0.isArchived ?? false) && $0.archiveCategory == "避坑心法" }
-        case .asset:
-            return historyManager.sessions.filter { ($0.isArchived ?? false) && $0.archiveCategory == "经验资产" }
+    // 智能体过滤：nil 表示“全部智能体”
+    @State private var selectedAgentFilterID: UUID? = nil
+    
+    // 删除二次确认状态
+    @State private var sessionToDelete: ChatSession? = nil
+    @State private var showDeleteConfirmAlert: Bool = false
+    
+    // 全部配置的智能体档案
+    private var allAgentProfiles: [AgentProfile] {
+        ConfigManager.shared.app.agentProfiles
+    }
+    
+    // 根据当前选中的智能体过滤会话列表
+    private var filteredSessions: [ChatSession] {
+        if let agentID = selectedAgentFilterID {
+            return historyManager.sessions.filter { $0.agentID == agentID }
         }
+        return historyManager.sessions
     }
     
     var body: some View {
         VStack(spacing: 0) {
-            // 1. 顶栏
+            // 1. 顶部控制栏
             HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("全局历史会话与反思网络资产库").font(.system(size: 15, weight: .bold))
-                    Text("安全持久化管理您的所有会话。已归档项已被大模型潜意识层归纳提炼，跨对话固化为永久常识。").font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("智能体对话资产库").font(.system(size: 15, weight: .bold))
+                    Text("按智能体归拢管理历史对话。支持会话锁定防误删，可随时原地提炼长效经验。").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
-            .padding(.horizontal, 20).padding(.vertical, 14)
+            .padding(.horizontal, 20).padding(.vertical, 12)
             .background(Color.clear)
             
             ModernDivider(style: .fade(0.18))
             
-            // 2. 分类切换滑道
-            VStack(spacing: 0) {
-                Picker("", selection: $selectedLibraryFilter) {
-                    ForEach(LibraryFilter.allCases) { filter in
-                        Text(filter.rawValue).tag(filter)
+            // 2. 智能体分类选择滑道 (支持“全部”与各个智能体专属标签)
+            agentFilterBarView
+            
+            Divider().opacity(0.4)
+            
+            // 3. 主分割视窗
+            HSplitView {
+                // 左侧栏：会话列表
+                sessionListView
+                    .frame(minWidth: 230, idealWidth: 270, maxWidth: 330)
+                
+                // 右侧栏：详情与对话流预览
+                sessionDetailPreviewView
+                    .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        // 物理删除二次确认安全弹窗
+        .alert("确认删除会话？", isPresented: $showDeleteConfirmAlert, presenting: sessionToDelete) { session in
+            Button("确认删除", role: .destructive) {
+                withAnimation {
+                    historyManager.deleteSession(id: session.id)
+                    if selectedSessionID == session.id {
+                        selectedSessionID = nil
                     }
                 }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Color.primary.opacity(0.01))
+            }
+            Button("取消", role: .cancel) {}
+        } message: { session in
+            Text("将彻底删除会话「\(session.title)」及其全部交互记录。此操作不可撤销。")
+        }
+        .onChange(of: selectedAgentFilterID) { _, _ in
+            selectedSessionID = nil
+            editingSessionID = nil
+        }
+    }
+    
+    // MARK: - 智能体横向分类导轨
+    private var agentFilterBarView: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                agentFilterPill(title: "全部智能体", icon: "square.grid.2x2.fill", targetID: nil, count: historyManager.sessions.count)
                 
-                Divider().opacity(0.6)
+                ForEach(allAgentProfiles) { profile in
+                    let count = historyManager.sessions.filter { $0.agentID == profile.id }.count
+                    agentFilterPill(title: profile.name, icon: profile.icon, targetID: profile.id, count: count)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+        }
+        .background(Color.primary.opacity(0.015))
+    }
+    
+    private func agentFilterPill(title: String, icon: String, targetID: UUID?, count: Int) -> some View {
+        let isSelected = (selectedAgentFilterID == targetID)
+        return Button(action: {
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                selectedAgentFilterID = targetID
+            }
+        }) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 11))
+                    .foregroundColor(isSelected ? .blue : .secondary)
+                
+                Text(title)
+                    .font(.system(size: 11.5, weight: isSelected ? .bold : .medium))
+                    .foregroundColor(isSelected ? .blue : .primary.opacity(0.85))
+                
+                Text("\(count)")
+                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                    .foregroundColor(isSelected ? .blue : .secondary.opacity(0.7))
+                    .padding(.horizontal, 4.5)
+                    .padding(.vertical, 1)
+                    .background(isSelected ? Color.blue.opacity(0.15) : Color.primary.opacity(0.05))
+                    .clipShape(Capsule())
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4.5)
+            .background(isSelected ? Color.blue.opacity(0.10) : Color.primary.opacity(0.03))
+            .cornerRadius(7)
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(isSelected ? Color.blue.opacity(0.35) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+    
+    // MARK: - 会话侧边列表
+    private var sessionListView: some View {
+        List(selection: $selectedSessionID) {
+            if filteredSessions.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "tray.fill").font(.system(size: 24)).foregroundColor(.secondary.opacity(0.3))
+                    Text("当前智能体暂无历史记录").font(.system(size: 11.5)).foregroundColor(.secondary.opacity(0.6))
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, minHeight: 160)
+                .listRowBackground(Color.clear)
             }
             
-            HSplitView {
-                // 左侧栏：历史列表
-                List(selection: $selectedSessionID) {
-                    if segmentedSessions.isEmpty {
-                        VStack(spacing: 8) {
-                            Spacer()
-                            Image(systemName: "tray.fill").font(.system(size: 22)).foregroundColor(.secondary.opacity(0.3))
-                            Text("该资产象限暂无物理记录").font(.system(size: 11)).foregroundColor(.secondary.opacity(0.5))
-                            Spacer()
+            ForEach(filteredSessions) { session in
+                let isLocked = session.isLocked ?? false
+                let matchedAgent = allAgentProfiles.first(where: { $0.id == session.agentID })
+                
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            if isLocked {
+                                Image(systemName: "lock.fill")
+                                    .font(.system(size: 9.5))
+                                    .foregroundColor(.orange)
+                                    .help("此会话已锁定，防止误删")
+                            }
+                            
+                            if editingSessionID == session.id {
+                                TextField("输入标题", text: $editTitleText)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onSubmit { saveTitleEdit(for: session.id) }
+                            } else {
+                                Text(session.title)
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .lineLimit(1)
+                            }
                         }
-                        .frame(maxWidth: .infinity, minHeight: 140)
-                        .listRowBackground(Color.clear)
+                        
+                        HStack(spacing: 6) {
+                            Text(formatDate(session.updatedAt))
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                            
+                            if selectedAgentFilterID == nil, let agent = matchedAgent {
+                                Text(agent.name)
+                                    .font(.system(size: 9.5, weight: .medium))
+                                    .foregroundColor(.blue.opacity(0.8))
+                                    .padding(.horizontal, 4).padding(.vertical, 0.5)
+                                    .background(Color.blue.opacity(0.08))
+                                    .cornerRadius(3)
+                            }
+                        }
                     }
                     
-                    ForEach(segmentedSessions) { session in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 6) {
-                                if editingSessionID == session.id {
-                                    TextField("输入标题", text: $editTitleText)
-                                        .textFieldStyle(.roundedBorder)
-                                        .onSubmit { saveTitleEdit(for: session.id) }
-                                } else {
-                                    Text(session.title)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .lineLimit(1)
-                                }
-                                Text(formatDate(session.updatedAt))
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            
-                            VStack(alignment: .trailing, spacing: 4) {
-                                Text("\(session.messages.count) 条记录")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                
-                                HStack(spacing: 2) {
-                                    Image(systemName: "memorychip")
-                                    Text("\(formatTokens(HistoryExportBridge.estimateSessionTokens(session))) T")
-                                }
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(selectedLibraryFilter == .active ? .orange : .purple)
-                            }
-                        }
-                        .padding(.vertical, 6)
-                        .tag(session.id)
-                        .contextMenu {
-                            Button("在主窗口加载此对话") { AiChatStore.shared.loadSession(session) }
-                            Button("重命名") { startEditing(session) }
-                            Divider()
-                            Button("删除此记录", role: .destructive) { withAnimation { historyManager.deleteSession(id: session.id) } }
-                        }
+                    Spacer(minLength: 4)
+                    
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text("\(session.messages.count) 条")
+                            .font(.system(size: 9.5))
+                            .foregroundColor(.secondary)
+                        
+                        Text("\(formatTokens(HistoryExportBridge.estimateSessionTokens(session))) T")
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                            .foregroundColor(.orange.opacity(0.85))
                     }
                 }
-                .listStyle(.sidebar)
-                .frame(minWidth: 220, idealWidth: 260, maxWidth: 320)
-                .scrollContentBackground(.hidden)
-                .forceHideScrollbars()
-                
-                // 右侧栏：详情预览
-                ZStack {
-                    VisualEffectView(material: .sidebar, blendingMode: .behindWindow).ignoresSafeArea()
-                    
-                    if let selectedID = selectedSessionID,
-                       let session = historyManager.sessions.first(where: { $0.id == selectedID }) {
-                        
-                        VStack(spacing: 0) {
-                            HStack {
-                                Image(systemName: "message.fill").foregroundColor(.blue)
-                                Text(session.title).font(.system(size: 14, weight: .bold))
-                                
-                                Text("累计负荷: \(formatTokens(HistoryExportBridge.estimateSessionTokens(session))) Tokens")
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.orange)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 4)
-                                    .background(Color.orange.opacity(0.12))
-                                    .cornerRadius(6)
-                                    .padding(.leading, 8)
-                                
-                                Spacer()
-                                
-                                if !(session.isArchived ?? false) {
-                                    let isArchiving = historyManager.archivingSessionIDs.contains(session.id)
-                                    
-                                    Button {
-                                        Task {
-                                            let activeModel = AiChatStore.shared.currentAgent.baseModel
-                                            await historyManager.archiveAndReflectSession(id: session.id, model: activeModel)
-                                            withAnimation { selectedSessionID = nil }
-                                        }
-                                    } label: {
-                                        HStack(spacing: 6) {
-                                            if isArchiving {
-                                                ProgressView()
-                                                    .controlSize(.small)
-                                                    .scaleEffect(0.7)
-                                            } else {
-                                                Image(systemName: "brain.head.profile.fill")
-                                            }
-                                            Text(isArchiving ? "正在提炼经验..." : "归档并提炼经验")
-                                        }
-                                        .font(.system(size: 12, weight: .bold))
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(isArchiving ? .secondary : .purple)
-                                    .disabled(isArchiving)
-                                    .help(isArchiving ? "大模型正在深层神经网络中复盘、推演此剧本，请稍候..." : "激活大模型神经元复盘机制，深度提炼全局开发习惯或避坑指南并归入资产库")
-                                } else {
-                                    Button {
-                                        historyManager.unarchiveSession(id: session.id)
-                                        withAnimation { selectedSessionID = nil }
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "tray.and.arrow.up.fill")
-                                            Text("移出到活跃库").font(.system(size: 11, weight: .bold))
-                                        }
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .tint(.green)
-                                    .help("【核心资产流转】：重置此会话的归档常识烙印，将其释放回「📱 活跃对话」列表池中。")
-                                }
-                                
-                                Button {
-                                    HistoryExportBridge.exportSessionToFile(session: session)
-                                } label: {
-                                    Label("导出文本", systemImage: "square.and.arrow.up").font(.system(size: 11))
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.regular)
-                                .disabled(historyManager.archivingSessionIDs.contains(session.id))
-                                
-                                Button("继续这段对话") {
-                                    AiChatStore.shared.loadSession(session)
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(historyManager.archivingSessionIDs.contains(session.id))
-                            }
-                            .padding(16).background(.ultraThinMaterial)
-                            
-                            Divider()
-                            
-                            ScrollView {
-                                LazyVStack(spacing: 16) {
-                                    ForEach(session.messages) { msg in
-                                        messageBubbleView(msg: msg, sessionID: session.id)
-                                    }
-                                }
-                                .padding(20)
-                            }
-                            .scrollContentBackground(.hidden)
-                            .forceOverlayScrollbars()
-                        }
-                    } else {
-                        VStack(spacing: 12) {
-                            Image(systemName: "bubble.left.and.bubble.right.fill").font(.system(size: 44)).foregroundStyle(.tertiary)
-                            Text("选择左侧特定资产块以预览、更正或下发全景归档指令").foregroundColor(.secondary).font(.system(size: 13))
-                        }
+                .padding(.vertical, 4)
+                .tag(session.id)
+                .contextMenu {
+                    Button("在主窗口加载此对话") { AiChatStore.shared.loadSession(session) }
+                    Button(isLocked ? "解除锁定" : "锁定此会话 (防误删)") {
+                        historyManager.toggleSessionLock(id: session.id)
                     }
+                    Button("重命名") { startEditing(session) }
+                    Divider()
+                    Button("删除此会话", role: .destructive) {
+                        sessionToDelete = session
+                        showDeleteConfirmAlert = true
+                    }
+                    .disabled(isLocked)
                 }
             }
         }
-        .onChange(of: selectedLibraryFilter) { _, _ in
-            selectedSessionID = nil
-            editingMessageID = nil
-            editingMessageText = ""
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .forceHideScrollbars()
+    }
+    
+    // MARK: - 右侧详情预览区
+    private var sessionDetailPreviewView: some View {
+        ZStack {
+            VisualEffectView(material: .sidebar, blendingMode: .behindWindow).ignoresSafeArea()
+            
+            if let selectedID = selectedSessionID,
+               let session = historyManager.sessions.first(where: { $0.id == selectedID }) {
+                
+                let isLocked = session.isLocked ?? false
+                let isArchiving = historyManager.archivingSessionIDs.contains(session.id)
+                
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "message.fill").foregroundColor(.blue)
+                        
+                        Text(session.title)
+                            .font(.system(size: 13.5, weight: .bold))
+                            .lineLimit(1)
+                        
+                        if isLocked {
+                            HStack(spacing: 3) {
+                                Image(systemName: "lock.fill").font(.system(size: 9))
+                                Text("已锁定").font(.system(size: 9.5, weight: .bold))
+                            }
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.12))
+                            .cornerRadius(4)
+                        }
+                        
+                        Spacer()
+                        
+                        // 原地“提炼经验”按钮（不归档移出会话）
+                        Button {
+                            Task {
+                                let activeModel = AiChatStore.shared.currentAgent.baseModel
+                                await historyManager.extractExperienceOnly(id: session.id, model: activeModel)
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                if isArchiving {
+                                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                                    Text("正在提炼...")
+                                } else {
+                                    Image(systemName: "brain.head.profile.fill")
+                                    Text("提炼经验")
+                                }
+                            }
+                            .font(.system(size: 11, weight: .bold))
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.purple)
+                        .disabled(isArchiving)
+                        .help("提取对话中的关键开发经验与避坑心法并沉淀入记忆库，会话仍保留在当前列表")
+                        
+                        // 锁定 / 解锁切换按钮
+                        Button {
+                            historyManager.toggleSessionLock(id: session.id)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                                Text(isLocked ? "解锁" : "锁定")
+                            }
+                            .font(.system(size: 11))
+                        }
+                        .buttonStyle(.bordered)
+                        .help(isLocked ? "解除锁定状态" : "锁定此会话以防止误删")
+                        
+                        Button {
+                            HistoryExportBridge.exportSessionToFile(session: session)
+                        } label: {
+                            Label("导出", systemImage: "square.and.arrow.up").font(.system(size: 11))
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        // 物理删除（已锁定状态禁用）
+                        Button {
+                            sessionToDelete = session
+                            showDeleteConfirmAlert = true
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11))
+                                .foregroundColor(isLocked ? .secondary.opacity(0.3) : .red.opacity(0.85))
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isLocked)
+                        .help(isLocked ? "会话已锁定，请先解锁后再删除" : "删除此会话")
+                        
+                        Button("继续对话") {
+                            AiChatStore.shared.loadSession(session)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.ultraThinMaterial)
+                    
+                    Divider()
+                    
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(session.messages) { msg in
+                                messageBubbleView(msg: msg, sessionID: session.id)
+                            }
+                        }
+                        .padding(16)
+                    }
+                    .scrollContentBackground(.hidden)
+                    .forceOverlayScrollbars()
+                }
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.system(size: 38))
+                        .foregroundStyle(.tertiary)
+                    Text("请在左侧选择会话以预览详情、提炼经验或锁定记录")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 12.5))
+                }
+            }
         }
     }
     
@@ -495,47 +681,40 @@ struct ChatHistoryManagementPanel: View {
             
             VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 6) {
                 HStack(spacing: 8) {
-                    if !msg.isUser {
-                        Text("AI")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.secondary)
-                        
-                        if !msg.skillLogs.isEmpty {
-                            Text("调用了 \(msg.skillLogs.count) 个底层工具")
-                                .font(.system(size: 10))
-                                .foregroundColor(.purple)
-                        }
-                    } else {
-                        Text("你")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.secondary)
+                    Text(msg.isUser ? "你" : "AI")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.secondary)
+                    
+                    if !msg.isUser && !msg.skillLogs.isEmpty {
+                        Text("调用了 \(msg.skillLogs.count) 个底层工具")
+                            .font(.system(size: 10))
+                            .foregroundColor(.purple)
                     }
                     
-                    if editingMessageID != msg.id && !historyManager.archivingSessionIDs.contains(sessionID) {
+                    if editingMessageID != msg.id {
                         HStack(spacing: 6) {
                             Button {
                                 editingMessageText = msg.text
                                 withAnimation(.spring()) { editingMessageID = msg.id }
                             } label: {
-                                Image(systemName: "pencil.circle.fill").foregroundColor(.blue.opacity(0.7)).font(.system(size: 13))
-                            }.buttonStyle(.plain).help("修正历史语境")
+                                Image(systemName: "pencil.circle.fill").foregroundColor(.blue.opacity(0.7)).font(.system(size: 12))
+                            }.buttonStyle(.plain).help("修正文本")
                             
                             Button {
-                                let pasteboard = NSPasteboard.general
-                                pasteboard.clearContents()
-                                pasteboard.setString(msg.text, forType: .string)
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(msg.text, forType: .string)
                                 ___updateIslandNotice(text: "已复制到剪贴板", icon: "doc.on.clipboard")
                             } label: {
-                                Image(systemName: "doc.on.clipboard.fill").foregroundColor(.secondary.opacity(0.8)).font(.system(size: 11))
-                            }.buttonStyle(.plain).help("拷贝正文")
+                                Image(systemName: "doc.on.clipboard.fill").foregroundColor(.secondary.opacity(0.8)).font(.system(size: 10.5))
+                            }.buttonStyle(.plain).help("拷贝")
                             
                             Button {
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                                     historyManager.deleteMessage(sessionID: sessionID, messageID: msg.id)
                                 }
                             } label: {
-                                Image(systemName: "trash.circle.fill").foregroundColor(.red.opacity(0.7)).font(.system(size: 13))
-                            }.buttonStyle(.plain).help("永久抹除此行")
+                                Image(systemName: "trash.circle.fill").foregroundColor(.red.opacity(0.7)).font(.system(size: 12))
+                            }.buttonStyle(.plain).help("删除该行")
                         }
                     }
                 }
@@ -544,12 +723,12 @@ struct ChatHistoryManagementPanel: View {
                 if editingMessageID == msg.id {
                     VStack(alignment: .trailing, spacing: 8) {
                         MacCodeEditor(text: $editingMessageText, language: .builtin)
-                            .frame(minHeight: 80, maxHeight: 300)
+                            .frame(minHeight: 80, maxHeight: 260)
                             .background(Color(NSColor.textBackgroundColor))
                             .cornerRadius(8)
                             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.blue.opacity(0.4), lineWidth: 1))
                         
-                        HStack(spacing: 12) {
+                        HStack(spacing: 10) {
                             Button("取消") { withAnimation(.spring()) { editingMessageID = nil } }
                                 .buttonStyle(.plain).foregroundColor(.secondary)
                             Button("确认修改") {
@@ -561,75 +740,21 @@ struct ChatHistoryManagementPanel: View {
                             }.buttonStyle(.borderedProminent).tint(.blue).controlSize(.small)
                         }
                     }
-                    .padding(12)
+                    .padding(10)
                     .background(Color(NSColor.windowBackgroundColor))
-                    .cornerRadius(12)
-                    .shadow(color: Color.black.opacity(0.08), radius: 5, y: 2)
-                    
+                    .cornerRadius(10)
                 } else {
-                    VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 10) {
-                        if let b64Images = msg.imageB64Strings, !b64Images.isEmpty {
-                            HStack(spacing: 6) {
-                                if msg.isUser { Spacer(minLength: 0) }
-                                ForEach(b64Images, id: \.self) { b64String in
-                                    if let data = Data(base64Encoded: b64String), let nsImg = NSImage(data: data) {
-                                        Image(nsImage: nsImg)
-                                            .resizable()
-                                            .scaledToFill()
-                                            .frame(width: 72, height: 72)
-                                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(msg.isUser ? Color.white.opacity(0.25) : Color.primary.opacity(0.12), lineWidth: 1))
-                                            .onTapGesture {
-                                                let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).png")
-                                                if let tiff = nsImg.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff), let pngData = bitmap.representation(using: .png, properties: [:]) {
-                                                    try? pngData.write(to: tempURL, options: .atomic)
-                                                    NSWorkspace.shared.open(tempURL)
-                                                }
-                                            }
-                                    }
-                                }
-                                if !msg.isUser { Spacer(minLength: 0) }
-                            }
-                        }
-                        
-                        if let urlStrings = msg.fileURLStrings, !urlStrings.isEmpty {
-                            VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 4) {
-                                ForEach(urlStrings, id: \.self) { urlStr in
-                                    if let url = URL(string: urlStr) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "doc.fill")
-                                                .foregroundColor(msg.isUser ? .white.opacity(0.85) : .blue)
-                                                .font(.system(size: 11))
-                                            Text(url.lastPathComponent)
-                                                .font(.system(size: 11, weight: .medium))
-                                                .foregroundColor(msg.isUser ? .white : .primary)
-                                                .lineLimit(1)
-                                        }
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 5)
-                                        .background(msg.isUser ? Color.white.opacity(0.12) : Color(NSColor.controlBackgroundColor))
-                                        .cornerRadius(6)
-                                        .onTapGesture { NSWorkspace.shared.open(url) }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if !msg.text.isEmpty {
-                            Text(msg.text)
-                                .font(.system(size: 13))
-                                .foregroundColor(msg.isUser ? .white : .primary)
-                                .lineSpacing(4)
-                                .multilineTextAlignment(.leading)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                    .background(msg.isUser ? Color.blue.opacity(0.85) : Color.primary.opacity(0.04))
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .shadow(color: Color.black.opacity(0.02), radius: 1, y: 1)
-                    .textSelection(.enabled)
+                    Text(msg.text)
+                        .font(.system(size: 12.5))
+                        .foregroundColor(msg.isUser ? .white : .primary)
+                        .lineSpacing(3.5)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 10)
+                        .background(msg.isUser ? Color.blue.opacity(0.85) : Color.primary.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                        .textSelection(.enabled)
                 }
             }
             if !msg.isUser { Spacer(minLength: 40) }

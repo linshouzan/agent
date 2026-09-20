@@ -46,23 +46,23 @@ struct ChunkMetadata: Codable, Equatable, Sendable {
 }
 
 /// 知识库单文档索引项模型
-struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var title: String
-    var summary: String
-    var chunkCount: Int
-    var status: String
-    var isEnabled: Bool = true
-    var category: String = "默认"
-    var filePath: String?
-    var metaEmbedding: [Float]?
-    var relativePath: String?
+public struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable, Sendable {
+    public var id: UUID = UUID()
+    public var title: String
+    public var summary: String
+    public var chunkCount: Int
+    public var status: String
+    public var isEnabled: Bool = true
+    public var category: String = "默认"
+    public var filePath: String?
+    public var metaEmbedding: [Float]?
+    public var relativePath: String?
     
     enum CodingKeys: String, CodingKey {
         case id, title, summary, chunkCount, status, isEnabled, category, filePath, metaEmbedding, relativePath
     }
     
-    init(
+    public init(
         title: String,
         summary: String,
         chunkCount: Int,
@@ -84,7 +84,7 @@ struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable, Sendable {
         self.relativePath = relativePath
     }
     
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         title = try container.decode(String.self, forKey: .title)
@@ -97,6 +97,34 @@ struct KnowledgeItem: Identifiable, Hashable, Codable, Equatable, Sendable {
         metaEmbedding = try container.decodeIfPresent([Float].self, forKey: .metaEmbedding)
         relativePath = try container.decodeIfPresent(String.self, forKey: .relativePath)
     }
+    
+    /// 动态推导当前知识文档的结构类型
+    public var docType: KnowledgeDocType {
+        let ext = (filePath as NSString?)?.pathExtension.lowercased() ?? (title as NSString).pathExtension.lowercased()
+        
+        // 1. 源码与结构化数据
+        let codeExtensions: Set<String> = ["swift", "py", "java", "c", "cpp", "h", "cs", "js", "ts", "go", "rs", "php", "sh", "json", "sql"]
+        if codeExtensions.contains(ext) {
+            return .code
+        }
+        
+        // 2. 问答型特征嗅探 (通过文件名或 AI 摘要特征判定)
+        let lowerTitle = title.lowercased()
+        let lowerSummary = summary.lowercased()
+        if lowerTitle.contains("qa") || lowerTitle.contains("faq") || lowerTitle.contains("问答") ||
+           lowerSummary.contains("【问答主题域】") || lowerSummary.contains("问答型") {
+            return .qa
+        }
+        
+        // 3. 标签规约型特征嗅探 (摘要含有标签池或正负向规范)
+        if summary.contains("【核心标签】") || summary.contains("【核心质感与表现准则】") ||
+           summary.contains("【适用业务范围】") || summary.contains("规约手册") ||
+           lowerSummary.contains("tags:") {
+            return .taggedRule
+        }
+        
+        return .general
+    }
 }
 
 /// 知识库左侧无限极树状目录节点
@@ -106,6 +134,31 @@ struct KnowledgeNode: Identifiable, Sendable {
     let isFolder: Bool
     var item: KnowledgeItem?
     var children: [KnowledgeNode]?
+}
+
+public enum KnowledgeDocType: String, CaseIterable, Sendable {
+    case taggedRule = "标签规约"
+    case qa = "问答对"
+    case code = "源码AST"
+    case general = "通用文档"
+    
+    public var iconName: String {
+        switch self {
+        case .taggedRule: return "tag.fill"
+        case .qa: return "bubble.left.and.text.bubble.right.fill"
+        case .code: return "curlybraces"
+        case .general: return "doc.text.fill"
+        }
+    }
+    
+    public var themeColor: Color {
+        switch self {
+        case .taggedRule: return .cyan
+        case .qa: return .purple
+        case .code: return .indigo
+        case .general: return .blue
+        }
+    }
 }
 
 // MARK: - ==================== 2. KnowledgeExtractors (数据清洗与代码切片提取器) ====================
@@ -251,7 +304,7 @@ struct QueryAnalysis: Sendable {
 /// 多尺度滑动 N-Gram 智能分词器 (轻量低内存分配设计)
 struct SmartTokenizer: Sendable {
     
-    // MARK: - [Modified] 轻量词元提取器（杜绝大文本字符级 N-Gram 造成的堆内存爆炸）
+    // MARK: - 轻量词元提取器（杜绝大文本字符级 N-Gram 造成的堆内存爆炸）
     static func tokenize(_ text: String) -> [String] {
         let cleanText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return [] }
@@ -308,7 +361,8 @@ struct SmartTokenizer: Sendable {
 struct RAGXMLParser: Sendable {
     struct HitItem: Hashable, Identifiable, Sendable {
         let id: UUID = UUID()
-        let title: String
+        let title: String          // 文档库名 (source_title)
+        let sectionTitle: String   // 章节小标题 (section_title)
         let score: Float
         let tags: [String]
         let prohibited: [String]
@@ -318,45 +372,95 @@ struct RAGXMLParser: Sendable {
     
     static func extractHits(from xmlString: String) -> [HitItem] {
         var results: [HitItem] = []
-        let pattern = "(?s)<knowledge_chunk([^>]*)>\\s*<!\\[CDATA\\[(.*?)\\]\\]>"
+        guard !xmlString.isEmpty, xmlString.contains("<knowledge_chunk") else { return [] }
         
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
-        let matches = regex.matches(in: xmlString, range: NSRange(xmlString.startIndex..., in: xmlString))
+        // 按照 </knowledge_chunk> 安全切分各切片区块，避免跨块正则混乱
+        let rawBlocks = xmlString.components(separatedBy: "</knowledge_chunk>")
         
-        for match in matches {
-            if let attrRange = Range(match.range(at: 1), in: xmlString),
-               let contentRange = Range(match.range(at: 2), in: xmlString) {
+        for block in rawBlocks {
+            guard let chunkStartRange = block.range(of: "<knowledge_chunk") else { continue }
+            
+            // 1. 定位正文 CDATA 或内容起始点
+            let chunkHeaderAndBody = String(block[chunkStartRange.lowerBound...])
+            
+            var rawContent = ""
+            let rawAttrs: String
+            
+            if let cdataStart = chunkHeaderAndBody.range(of: "<![CDATA[") {
+                // 属性部分位于 <knowledge_chunk 和 <![CDATA[ 之间
+                rawAttrs = String(chunkHeaderAndBody[..<cdataStart.lowerBound])
                 
-                let attrString = String(xmlString[attrRange])
-                let rawContent = String(xmlString[contentRange])
-                
-                let title = extractAttr(named: "source_title", from: attrString) ?? "未知文档"
-                let scoreStr = extractAttr(named: "rrf_score", from: attrString) ?? "0.0"
-                let score = Float(scoreStr) ?? 0.0
-                
-                let tagsStr = extractAttr(named: "tags", from: attrString) ?? ""
-                let tags = tagsStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                
-                let prohStr = extractAttr(named: "prohibited", from: attrString) ?? ""
-                let prohibited = prohStr.components(separatedBy: CharacterSet(charactersIn: ",，")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                
-                let validLines = rawContent.components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty && !$0.hasPrefix("```") }
-                
-                let firstLine = validLines.first ?? "无可用文本摘要"
-                results.append(HitItem(title: title, score: score, tags: tags, prohibited: prohibited, snippet: firstLine, rawContent: rawContent))
+                if let cdataEnd = chunkHeaderAndBody.range(of: "]]>", range: cdataStart.upperBound..<chunkHeaderAndBody.endIndex) {
+                    rawContent = String(chunkHeaderAndBody[cdataStart.upperBound..<cdataEnd.lowerBound])
+                } else {
+                    rawContent = String(chunkHeaderAndBody[cdataStart.upperBound...])
+                }
+            } else {
+                // 无 CDATA 模式：寻找第一个闭合当前起始标签的位置
+                if let tagEnd = chunkHeaderAndBody.range(of: ">") {
+                    rawAttrs = String(chunkHeaderAndBody[..<tagEnd.lowerBound])
+                    rawContent = String(chunkHeaderAndBody[tagEnd.upperBound...])
+                } else {
+                    rawAttrs = chunkHeaderAndBody
+                    rawContent = ""
+                }
             }
+            
+            let cleanContent = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanContent.isEmpty else { continue }
+            
+            // 2. 健壮提取属性值（直接基于属性名扫描，彻底免疫 section_title 中包含 > 的情况）
+            let title = scanAttrValue(named: "source_title", in: rawAttrs) ?? "未知文档"
+            let sectionTitle = scanAttrValue(named: "section_title", in: rawAttrs) ?? ""
+            let scoreStr = scanAttrValue(named: "rrf_score", in: rawAttrs) ?? "0.0"
+            let score = Float(scoreStr.trimmingCharacters(in: .whitespaces)) ?? 0.0
+            
+            let tagsStr = scanAttrValue(named: "tags", in: rawAttrs) ?? ""
+            let tags = tagsStr.components(separatedBy: CharacterSet(charactersIn: ",，;；"))
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            
+            let prohStr = scanAttrValue(named: "prohibited", in: rawAttrs) ?? ""
+            let prohibited = prohStr.components(separatedBy: CharacterSet(charactersIn: ",，;；"))
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            
+            // 提取首行作为自然语言摘要
+            let validLines = cleanContent.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("```") }
+            let firstLine = validLines.first ?? "无可用文本摘要"
+            
+            results.append(HitItem(
+                title: title,
+                sectionTitle: sectionTitle,
+                score: score,
+                tags: tags,
+                prohibited: prohibited,
+                snippet: firstLine,
+                rawContent: cleanContent
+            ))
         }
         return results
     }
     
-    private static func extractAttr(named: String, from text: String) -> String? {
-        let pattern = "\(named)=\"([^\"]+)\""
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-              let range = Range(match.range(at: 1), in: text) else { return nil }
-        return String(text[range])
+    /// 零依赖原生扫描器：准确定位 name="..." 或 name='...'，绝不因字符串内含有 > 或空格而截断
+    private static func scanAttrValue(named attrName: String, in text: String) -> String? {
+        guard let nameRange = text.range(of: "\(attrName)=", options: .caseInsensitive) else {
+            return nil
+        }
+        
+        let rest = text[nameRange.upperBound...]
+        guard let quoteChar = rest.first, (quoteChar == "\"" || quoteChar == "'") else {
+            return nil
+        }
+        
+        let valueSlice = rest.dropFirst()
+        guard let endQuoteIndex = valueSlice.firstIndex(of: quoteChar) else {
+            return nil
+        }
+        
+        return String(valueSlice[..<endQuoteIndex]).trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -380,18 +484,13 @@ final class MicroVectorDB: @unchecked Sendable {
     
     private var chunks: [VectorChunk] = []
     private let dbQueue = DispatchQueue(label: "com.lintools.vectordb", qos: .userInitiated)
-    private var dbFileURL: URL { ConfigManager.shared.ragVectordbFileName! }
     
     func load() {
-        if let data = try? Data(contentsOf: dbFileURL), let decoded = try? JSONDecoder().decode([VectorChunk].self, from: data) {
-            self.chunks = decoded
-        }
+        self.chunks = LocalDatabaseManager.shared.loadAll()
     }
     
     private func save() {
-        if let encoded = try? JSONEncoder().encode(chunks) {
-            try? encoded.write(to: dbFileURL, options: .atomic)
-        }
+        
     }
     
     // MARK: - 纯净切片提取与正文物理隔离
@@ -430,18 +529,15 @@ final class MicroVectorDB: @unchecked Sendable {
             let trimmed = chunkStr.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             
-            let bodyWithoutHeader = trimmed.replacingOccurrences(of: #"^\[.*?\]\n?"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            if !bodyWithoutHeader.isEmpty || !posTags.isEmpty || !negTags.isEmpty {
-                result.append((trimmed, ChunkMetadata(headingPath: headers, positiveTags: posTags, negativeTags: negTags)))
-            }
+            let validHeaders = headers.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            result.append((trimmed, ChunkMetadata(headingPath: validHeaders, positiveTags: posTags, negativeTags: negTags)))
         }
         
         for line in lines {
             let trimmedLine = line.trimmingCharacters(in: .whitespaces)
             if trimmedLine.isEmpty { continue }
             
-            // a) 解析 Markdown Headers
+            // a) 解析 Markdown Headers（仅提炼为结构化元数据，绝不作为文本拼进正文）
             if trimmedLine.hasPrefix("#") {
                 let headerLevel = trimmedLine.prefix(while: { $0 == "#" }).count
                 if headerLevel > 0 && headerLevel <= 6 {
@@ -454,7 +550,6 @@ final class MicroVectorDB: @unchecked Sendable {
                     currentHeaderContext = newHeader
                     currentPositiveTags = []
                     currentNegativeTags = []
-                    currentChunk = "[\(currentHeaderContext)]\n"
                     continue
                 }
             }
@@ -471,21 +566,20 @@ final class MicroVectorDB: @unchecked Sendable {
                 continue
             }
             
-            // d) 过滤非正文元数据标记行
-            if trimmedLine.hasPrefix("* **") && trimmedLine.contains("**:") && !trimmedLine.contains("核心特征") && !trimmedLine.contains("描述") {
+            // d) 过滤非正文模板标记行（如 * **核心特征与物理表现**: 等引导废话，直接丢弃）
+            if (trimmedLine.hasPrefix("* **") || trimmedLine.hasPrefix("**")) && trimmedLine.contains("**:") {
                 continue
             }
             
             // e) QA 结构问答独立切片
             if isQADocument && isQuestionLine(trimmedLine) {
-                let strippedChunk = currentChunk.replacingOccurrences(of: "[\(currentHeaderContext)]\n", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !strippedChunk.isEmpty {
-                    appendChunkIfValid(chunkStr: currentChunk, headers: currentHeaderContext.isEmpty ? [] : [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n" : ""
+                if !currentChunk.isEmpty {
+                    appendChunkIfValid(chunkStr: currentChunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
+                    currentChunk = ""
                 }
             }
             
-            // f) 常规正文滑动窗口切片
+            // f) 常规纯净正文滑动窗口切片（正文内无任何 [Header] 拼接污染）
             let projectedSize = currentChunk.count + trimmedLine.count + 1
             if projectedSize > maxTokens {
                 if !currentChunk.isEmpty {
@@ -493,19 +587,12 @@ final class MicroVectorDB: @unchecked Sendable {
                 }
                 if trimmedLine.count > maxTokens {
                     let forcedChunks = breakDownHugeSentence(trimmedLine, maxTokens: maxTokens, overlap: overlap)
-                    if let first = forcedChunks.first, !currentHeaderContext.isEmpty {
-                        appendChunkIfValid(chunkStr: "[\(currentHeaderContext)] \(first)", headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        for chunk in forcedChunks.dropFirst() {
-                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        }
-                    } else {
-                        for chunk in forcedChunks {
-                            appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
-                        }
+                    for chunk in forcedChunks {
+                        appendChunkIfValid(chunkStr: chunk, headers: [currentHeaderContext], posTags: currentPositiveTags, negTags: currentNegativeTags)
                     }
                     currentChunk = ""
                 } else {
-                    currentChunk = !currentHeaderContext.isEmpty ? "[\(currentHeaderContext)]\n\(trimmedLine)" : trimmedLine
+                    currentChunk = trimmedLine
                 }
             } else {
                 currentChunk += (currentChunk.isEmpty ? "" : "\n") + trimmedLine
@@ -611,16 +698,29 @@ final class MicroVectorDB: @unchecked Sendable {
                 metadata: chunk.meta
             ))
         }
+        
         dbQueue.sync {
+            self.chunks.removeAll { $0.kbId == kbId }
             self.chunks.append(contentsOf: newVectorChunks)
-            self.save()
+            
+            // 使用通用网关清理旧切片并批量写入新切片
+            LocalDatabaseManager.shared.deleteWhere(
+                tableName: VectorChunk.databaseTableName,
+                conditionSQL: "kb_id = ?",
+                arguments: [kbId.uuidString]
+            )
+            LocalDatabaseManager.shared.saveAll(newVectorChunks)
         }
     }
     
     func deleteDocument(kbId: UUID) {
         dbQueue.sync {
             self.chunks.removeAll { $0.kbId == kbId }
-            self.save()
+            LocalDatabaseManager.shared.deleteWhere(
+                tableName: VectorChunk.databaseTableName,
+                conditionSQL: "kb_id = ?",
+                arguments: [kbId.uuidString]
+            )
         }
     }
     
@@ -760,7 +860,7 @@ final class MicroVectorDB: @unchecked Sendable {
         }
     }
     
-    // MARK: - [Modified] 零堆分配 BM25 词频计算（消灭 components(separatedBy:) 内存黑洞）
+    // MARK: - 零堆分配 BM25 词频计算（消灭 components(separatedBy:) 内存黑洞）
     private func computeBM25(queryTokens: [String], chunks: [VectorChunk], totalDocs: Float) async -> (scored: [(id: UUID, score: Float)], idfMap: [String: Float]) {
         guard !queryTokens.isEmpty else { return ([], [:]) }
         
@@ -1151,6 +1251,13 @@ actor NativeReranker: Sendable {
 @MainActor
 class KnowledgeViewModel {
     
+    enum DocumentStructureType {
+        case taggedRuleDoc(positiveTags: [String], negativeTags: [String])
+        case qaDocument
+        case sourceCode
+        case generalText
+    }
+    
     var knowledgeBases: [KnowledgeItem] = []
     var categories: [String] = ["默认"]
     var dedicatedCategories: [String] = []
@@ -1168,17 +1275,13 @@ class KnowledgeViewModel {
         "doc", "docx", "rtf", "rtfd", "xlsx"
     ]
     
-    private var knowledgeFileURL: URL = ConfigManager.shared.ragMetaFileName!
-    
     init() {
         loadKnowledge()
     }
     
+    // MARK: - 直接从 SQLite 物理表 rag_knowledge_bases 读取
     func loadKnowledge() {
-        if let data = try? Data(contentsOf: knowledgeFileURL),
-           let decoded = try? JSONDecoder().decode([KnowledgeItem].self, from: data) {
-            self.knowledgeBases = decoded
-        }
+        self.knowledgeBases = LocalDatabaseManager.shared.loadAll(orderBy: "created_at DESC")
         
         self.categories = ConfigManager.shared.app.generalConfig.kCategories
         self.dedicatedCategories = ConfigManager.shared.app.generalConfig.dedicatedKCategories
@@ -1187,10 +1290,9 @@ class KnowledgeViewModel {
         MicroVectorDB.shared.load()
     }
     
+    // MARK: - 批量同步全量数据到 rag_knowledge_bases 物理表
     func saveKnowledgeMeta() {
-        if let encoded = try? JSONEncoder().encode(knowledgeBases) {
-            try? encoded.write(to: knowledgeFileURL, options: .atomic)
-        }
+        LocalDatabaseManager.shared.saveAll(knowledgeBases, purgeMissing: true)
     }
     
     func saveCategories() {
@@ -1220,9 +1322,11 @@ class KnowledgeViewModel {
         
         saveCategories()
         for i in 0..<knowledgeBases.count {
-            if knowledgeBases[i].category == oldName { knowledgeBases[i].category = trimmed }
+            if knowledgeBases[i].category == oldName {
+                knowledgeBases[i].category = trimmed
+                LocalDatabaseManager.shared.save(knowledgeBases[i])
+            }
         }
-        saveKnowledgeMeta()
     }
     
     func deleteCategory(_ name: String, isDedicated: Bool) {
@@ -1232,27 +1336,34 @@ class KnowledgeViewModel {
         
         saveCategories()
         for i in 0..<knowledgeBases.count {
-            if knowledgeBases[i].category == name { knowledgeBases[i].category = "默认" }
+            if knowledgeBases[i].category == name {
+                knowledgeBases[i].category = "默认"
+                LocalDatabaseManager.shared.save(knowledgeBases[i])
+            }
         }
-        saveKnowledgeMeta()
     }
     
+    // MARK: - 单行状态更新直通物理表
     func toggleKnowledgeStatus(id: UUID, isEnabled: Bool) {
         if let index = knowledgeBases.firstIndex(where: { $0.id == id }) {
             knowledgeBases[index].isEnabled = isEnabled
-            saveKnowledgeMeta()
+            LocalDatabaseManager.shared.save(knowledgeBases[index])
         }
     }
     
+    // MARK: - 物理表批量删除与切片联动清理
     func deleteMultipleKnowledge(ids: Set<UUID>) {
         knowledgeBases.removeAll { ids.contains($0.id) }
-        saveKnowledgeMeta()
-        for id in ids { MicroVectorDB.shared.deleteDocument(kbId: id) }
+        for id in ids {
+            LocalDatabaseManager.shared.delete(KnowledgeItem.self, id: id)
+            MicroVectorDB.shared.deleteDocument(kbId: id)
+        }
     }
     
+    // MARK: - 物理表单文档删除与向量库联动清理
     func deleteKnowledge(_ kb: KnowledgeItem) {
         knowledgeBases.removeAll { $0.id == kb.id }
-        saveKnowledgeMeta()
+        LocalDatabaseManager.shared.delete(KnowledgeItem.self, id: kb.id)
         MicroVectorDB.shared.deleteDocument(kbId: kb.id)
     }
     
@@ -1383,13 +1494,14 @@ class KnowledgeViewModel {
             let metaText = "\(fileName) \(categoryName) \(aiSummary)".lowercased()
             let metaVector = await MicroVectorDB.shared.generateEmbedding(for: metaText)
             
+            // MARK: - 索引完成后直接写库并更新内存状态
             await MainActor.run {
                 if let index = self.knowledgeBases.firstIndex(where: { $0.id == kbId }) {
                     self.knowledgeBases[index].status = "索引完成"
                     self.knowledgeBases[index].chunkCount = validChunks.count
                     self.knowledgeBases[index].summary = aiSummary
                     self.knowledgeBases[index].metaEmbedding = metaVector
-                    self.saveKnowledgeMeta()
+                    LocalDatabaseManager.shared.save(self.knowledgeBases[index])
                 }
             }
             
@@ -1400,7 +1512,60 @@ class KnowledgeViewModel {
         }
     }
     
-    nonisolated private func generateDocumentSummary(text: String, isCodeFile: Bool = false, fileName: String = "") async -> String {
+    /// 识别文档的物理结构类型
+    nonisolated private func detectStructureType(text: String, isCodeFile: Bool) -> DocumentStructureType {
+        if isCodeFile { return .sourceCode }
+        
+        let lines = text.components(separatedBy: .newlines)
+        
+        // 1. 嗅探标签型文档特征
+        var posTags: Set<String> = []
+        var negTags: Set<String> = []
+        let tagsRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:tags|category|标签)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
+        let prohRegex = try? NSRegularExpression(pattern: #"(?i)\*\s*\*\*(?:prohibited|exclude|forbidden|禁用)\*\*\s*:\s*(?:\[(.*?)\]|(.*))"#)
+        
+        for line in lines.prefix(200) { // 扫描前 200 行即可覆盖绝大部分规则文件的头部标签
+            if let regex = tagsRegex, let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+                let r = (match.range(at: 1).location != NSNotFound) ? match.range(at: 1) : match.range(at: 2)
+                if let swiftRange = Range(r, in: line) {
+                    let tags = String(line[swiftRange]).components(separatedBy: CharacterSet(charactersIn: ",，;；、"))
+                        .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'[]*"))) }
+                        .filter { !$0.isEmpty }
+                    posTags.formUnion(tags)
+                }
+            }
+            if let regex = prohRegex, let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+                let r = (match.range(at: 1).location != NSNotFound) ? match.range(at: 1) : match.range(at: 2)
+                if let swiftRange = Range(r, in: line) {
+                    let prohs = String(line[swiftRange]).components(separatedBy: CharacterSet(charactersIn: ",，;；、"))
+                        .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'[]*"))) }
+                        .filter { !$0.isEmpty }
+                    negTags.formUnion(prohs)
+                }
+            }
+        }
+        
+        if !posTags.isEmpty || !negTags.isEmpty {
+            return .taggedRuleDoc(positiveTags: Array(posTags), negativeTags: Array(negTags))
+        }
+        
+        // 2. 嗅探 QA 问答型特征
+        var qCount = 0
+        for line in lines.prefix(150) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.range(of: #"^(?i)(?:Q|问|【问】|Question)[:：]"#, options: .regularExpression) != nil {
+                qCount += 1
+            }
+        }
+        if qCount >= 2 {
+            return .qaDocument
+        }
+        
+        return .generalText
+    }
+    
+    nonisolated func generateDocumentSummary(text: String, isCodeFile: Bool = false, fileName: String = "") async -> String {
+        let structure = detectStructureType(text: text, isCodeFile: isCodeFile)
         let maxLength = 6000
         var extraction = ""
         
@@ -1413,17 +1578,57 @@ class KnowledgeViewModel {
         }
         
         let promptText: String
-        if isCodeFile {
-            promptText = await CodeKnowledgeExtractor.buildCodeSummaryPrompt(extraction: extraction, fileName: fileName)
-        } else {
-            promptText = """
-            请对以下文档内容进行精准、客观的结构化摘要：
-            1. 核心主题：用一句话（100字内）概括文档的核心讨论对象与主旨。
-            2. 关键要点：提取 3-5 个核心观点或关键数据，使用列表项呈现。
-            3. 适用场景：简述文档适用的业务场景或受众群体。
-            4. 结论与行动：文档得出的核心结论或下一步建议（无明确说明则填写“无”）。
+        
+        switch structure {
+        case .taggedRuleDoc(let posTags, _):
+            // 仅提炼前 10 个代表性正向标签作为业务范畴线索，避免提示词膨胀
+            let samplePos = Array(posTags.prefix(10)).joined(separator: ", ")
+            let tagsHint = samplePos.isEmpty ? "" : "（参考核心标签：\(samplePos)）"
             
-            文档内容：
+            promptText = """
+            # 角色
+            业务知识手册索引编制专家
+
+            # 任务
+            文档【\(fileName)】属于带规范标签的规约手册\(tagsHint)。请提炼一份用于大模型全局路由的高密度手册条目：
+            1. 【核心主题】：用一句话精确概括本手册的核心管辖对象与主要内容（40字内）。
+            2. 【适用业务范围】：列出本规范适用的核心场景与业务维度（40字内）。
+            3. 【核心质感与表现准则】：提炼本文件倡导的物理特性、工艺特征或交付标准（40字内）。
+            
+            输出必须完全采用正向陈述，保持紧凑高密度，总字数严格控制在 120 字以内。
+
+            [文档上下文]
+            \(extraction)
+            """
+            
+        case .qaDocument:
+            promptText = """
+            # 角色
+            FAQ 与业务问答知识库梳理专家
+
+            # 任务
+            文档【\(fileName)】是一份问答型（QA）知识库。请输出紧凑的全局手册概览：
+            1. 【业务领域】：一句话概括解答的核心业务范畴（30字内）。
+            2. 【核心覆盖场景】：列举 3-4 个最具代表性的高频问题场景（50字内）。
+
+            输出必须条理清晰，总字数严格控制在 100 字以内。
+
+            [文档上下文]
+            \(extraction)
+            """
+            
+        case .sourceCode:
+            promptText = CodeKnowledgeExtractor.buildCodeSummaryPrompt(extraction: extraction, fileName: fileName)
+            
+        case .generalText:
+            promptText = """
+            请对文档【\(fileName)】提炼客观精炼的全局结构化概览：
+            1. 【核心主题】：一句话（40字内）概括文档的核心讨论对象与主旨。
+            2. 【关键要点】：提取 2-3 个核心业务事实、关键参数或标准。
+            
+            输出总字数严格控制在 80 字以内。
+
+            [文档正文]
             \(extraction)
             """
         }
@@ -1443,16 +1648,16 @@ class KnowledgeViewModel {
             cleanSummary = String(cleanSummary[..<startRange.lowerBound])
         }
         
-        cleanSummary = cleanSummary.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleanSummary.isEmpty ? "" : cleanSummary
+        return cleanSummary.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
+    // MARK: - 状态单点更新即时落盘
     private func updateKnowledgeStatus(id: UUID, status: String, count: Int, summary: String? = nil) {
         if let index = knowledgeBases.firstIndex(where: { $0.id == id }) {
             knowledgeBases[index].status = status
             knowledgeBases[index].chunkCount = count
             if let sum = summary { knowledgeBases[index].summary = sum }
-            saveKnowledgeMeta()
+            LocalDatabaseManager.shared.save(knowledgeBases[index])
         }
     }
     
@@ -1545,26 +1750,83 @@ class KnowledgeViewModel {
                 topK: currentTopK
             )
             
-            let effectiveThreshold: Float = userMinScore < 0.1 ? 0.35 : userMinScore
+            // 提高有效阈值，严格过滤与查询完全偏离的低质切片
+            let effectiveThreshold: Float = userMinScore < 0.1 ? 0.38 : userMinScore
             let validSearchResults = rawSearchResults.filter { ($0.score ?? 0) >= effectiveThreshold }
             
             if !validSearchResults.isEmpty {
+                let queryTokens = SmartTokenizer.tokenize(cleanQuery)
+                
                 var xmlBuilder = "\n<knowledge>\n"
                 xmlBuilder += "  <context_policy>\n"
-                xmlBuilder += "    1. 事实依据：优先依据下方 <knowledge_chunk> 标签内 CDATA 区域提供的参考信息回答。\n"
-                xmlBuilder += "    2. 边界声明：若参考信息不足以完整解答问题，请在答复中客观说明已知事实与信息缺失部分。\n"
+                xmlBuilder += "    1. 事实依据：优先依据下方参考信息回答。\n"
+                xmlBuilder += "    2. 宏观指引：结合关联的文档全局概览把握规则与业务边界。\n"
+                xmlBuilder += "    3. 边界声明：若参考信息不足以完整解答，请如实声明。\n"
                 xmlBuilder += "  </context_policy>\n"
                 
+                // 1. 注入相关文档的手册概览 (严格绑定标题，并动态提取 Top-5 命中标签)
+                let hitKbIDs = Array(Set(validSearchResults.map { $0.kbId }))
+                xmlBuilder += "  <document_catalogs>\n"
+                
+                for kbId in hitKbIDs {
+                    if let matchedKB = activeKBs.first(where: { $0.id == kbId }) {
+                        // 保证文档标题绝不为空（若 title 为空，则取物理文件名兜底）
+                        let docTitle = !matchedKB.title.isEmpty ? matchedKB.title : (matchedKB.filePath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "未命名手册")
+                        
+                        var summaryText = matchedKB.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                        
+                        // 彻底清除历史存量中可能存在的大段【核心标签】和【排他禁忌】硬编码头部
+                        if summaryText.contains("【核心标签】:") {
+                            summaryText = summaryText.replacingOccurrences(of: #"(?s)【核心标签】:[^\n]+\n"#, with: "", options: .regularExpression)
+                        }
+                        if summaryText.contains("【排他禁忌】:") {
+                            summaryText = summaryText.replacingOccurrences(of: #"(?s)【排他禁忌】:[^\n]+\n"#, with: "", options: .regularExpression)
+                        }
+                        
+                        // 动态提取该文档在本次检索中与 Query 相关的正向标签（最多 5 个）
+                        let relatedChunks = validSearchResults.filter { $0.kbId == kbId }
+                        var hitTags: Set<String> = []
+                        for chunk in relatedChunks {
+                            if let tags = chunk.metadata?.positiveTags {
+                                for tag in tags {
+                                    if queryTokens.contains(where: { tag.lowercased().contains($0) || $0.contains(tag.lowercased()) }) {
+                                        hitTags.insert(tag)
+                                    }
+                                }
+                            }
+                        }
+                        
+                        xmlBuilder += "    <doc_overview source_title=\"\(docTitle)\" category=\"\(matchedKB.category)\">\n"
+                        xmlBuilder += "      <![CDATA[\n"
+                        if !hitTags.isEmpty {
+                            xmlBuilder += "【命中焦点标签】: \(Array(hitTags.prefix(5)).joined(separator: ", "))\n"
+                        }
+                        xmlBuilder += "\(summaryText.isEmpty ? "暂无详细概览" : summaryText)\n"
+                        xmlBuilder += "      ]]>\n"
+                        xmlBuilder += "    </doc_overview>\n"
+                    }
+                }
+                xmlBuilder += "  </document_catalogs>\n\n"
+                
+                // 2. 注入具体切片（瘦身属性，切除过长标签字符串）
                 for (index, result) in validSearchResults.enumerated() {
                     let matchedKB = activeKBs.first(where: { $0.id == result.kbId })
-                    let documentTitle = matchedKB?.title ?? "未知文档"
-                    let sourceFilePath = matchedKB?.filePath ?? "未知源物理路径"
+                    let documentTitle = (matchedKB?.title.isEmpty == false) ? matchedKB!.title : (matchedKB?.filePath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "未命名手册")
+                    let sourceFilePath = matchedKB?.filePath ?? "未知物理路径"
                     let chunkScore = String(format: "%.4f", result.score ?? 0.0)
                     
-                    let tagsStr = (result.metadata?.positiveTags.isEmpty == false) ? " tags=\"\(result.metadata!.positiveTags.joined(separator: ", "))\"" : ""
-                    let prohStr = (result.metadata?.negativeTags.isEmpty == false) ? " prohibited=\"\(result.metadata!.negativeTags.joined(separator: ", "))\"" : ""
+                    // 属性标签轻量化：最多只在属性中带 3 个最相关的标签
+                    let posTags = result.metadata?.positiveTags.prefix(3).joined(separator: ", ") ?? ""
+                    let tagsAttr = !posTags.isEmpty ? " tags=\"\(posTags)\"" : ""
                     
-                    xmlBuilder += "  <knowledge_chunk id=\"\(index + 1)\" source_title=\"\(documentTitle)\" rrf_score=\"\(chunkScore)\"\(tagsStr)\(prohStr)>\n"
+                    // 提取切片层级标题（headingPath）
+                    var sectionAttr = ""
+                    if let heading = result.metadata?.headingPath.last, !heading.isEmpty {
+                        let cleanHeading = heading.replacingOccurrences(of: "\"", with: "'")
+                        sectionAttr = " section_title=\"\(cleanHeading)\""
+                    }
+                    
+                    xmlBuilder += "  <knowledge_chunk id=\"\(index + 1)\" source_title=\"\(documentTitle)\"\(sectionAttr) rrf_score=\"\(chunkScore)\"\(tagsAttr)>\n"
                     xmlBuilder += "    <![CDATA[\n"
                     xmlBuilder += "\(result.text)\n"
                     xmlBuilder += "    ]]>\n"
@@ -1603,10 +1865,9 @@ class KnowledgeViewModel {
         return cleanResult.isEmpty ? originalQuery : cleanResult
     }
     
+    // MARK: - 零反序列化开销，直接复用已加载的最新内存态，瞬时响应对话检索
     private func getActiveKnowledgeItems() -> [KnowledgeItem] {
-        guard let data = try? Data(contentsOf: knowledgeFileURL),
-              let kbs = try? JSONDecoder().decode([KnowledgeItem].self, from: data) else { return [] }
-        return kbs.filter { $0.isEnabled && $0.status == "索引完成" }
+        return self.knowledgeBases.filter { $0.isEnabled && $0.status == "索引完成" }
     }
     
     nonisolated private func extractNativeFallback(url: URL, ext: String) -> String {
@@ -2148,12 +2409,54 @@ struct KnowledgeRowView: View {
                 }
                 
                 HStack(spacing: 8) {
-                    Text("切片: \(kb.chunkCount)").font(.caption).foregroundStyle(.gray)
-                    Text(kb.status).font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(kb.status == "索引完成" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
+                    // 1. 知识文档类型高质感徽章
+                    HStack(spacing: 3.5) {
+                        Image(systemName: kb.docType.iconName)
+                            .font(.system(size: 8.5, weight: .bold))
+                        Text(kb.docType.rawValue)
+                            .font(.system(size: 9.5, weight: .semibold))
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(kb.docType.themeColor.opacity(0.12))
+                    .foregroundColor(kb.docType.themeColor)
+                    .cornerRadius(5)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(kb.docType.themeColor.opacity(0.25), lineWidth: 0.6)
+                    )
+                    
+                    // 2. 切片体量指标胶囊 (醒目直观，不再被夹在中间模糊不清)
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.stack.3d.down.right.fill")
+                            .font(.system(size: 8.5))
+                            .foregroundColor(.secondary)
+                        
+                        Text("\(kb.chunkCount)")
+                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            .foregroundColor(.primary.opacity(0.85))
+                        
+                        Text("切片")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(Color.primary.opacity(0.04))
+                    .cornerRadius(5)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+                    )
+                    
+                    // 3. 索引状态徽章
+                    Text(kb.status)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2.5)
+                        .background(kb.status == "索引完成" ? Color.green.opacity(0.15) : Color.blue.opacity(0.15))
                         .foregroundStyle(kb.status == "索引完成" ? .green : .blue)
-                        .cornerRadius(4)
+                        .cornerRadius(5)
                 }
             }
             
@@ -2620,34 +2923,34 @@ struct KnowledgeChunksPreviewView: View {
                         
                         if let meta = chunk.metadata {
                             if !meta.positiveTags.isEmpty || !meta.negativeTags.isEmpty {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 6) {
-                                        ForEach(meta.positiveTags, id: \.self) { tag in
-                                            HStack(spacing: 3) {
-                                                Image(systemName: "tag.fill").font(.system(size: 8))
-                                                Text(tag).font(.system(size: 10, weight: .medium))
-                                            }
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.cyan.opacity(0.15))
-                                            .foregroundColor(.cyan)
-                                            .cornerRadius(4)
+                                HStack(spacing: 6) {
+                                    ForEach(meta.positiveTags, id: \.self) { tag in
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "tag.fill").font(.system(size: 8))
+                                            Text(tag).font(.system(size: 10, weight: .medium))
                                         }
-                                        
-                                        ForEach(meta.negativeTags, id: \.self) { proh in
-                                            HStack(spacing: 3) {
-                                                Image(systemName: "nosign").font(.system(size: 8))
-                                                Text(proh).font(.system(size: 10, weight: .medium))
-                                            }
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.red.opacity(0.12))
-                                            .foregroundColor(.red)
-                                            .cornerRadius(4)
-                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.cyan.opacity(0.15))
+                                        .foregroundColor(.cyan)
+                                        .cornerRadius(4)
                                     }
+                                    
+                                    ForEach(meta.negativeTags, id: \.self) { proh in
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "nosign").font(.system(size: 8))
+                                            Text(proh).font(.system(size: 10, weight: .medium))
+                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.red.opacity(0.12))
+                                        .foregroundColor(.red)
+                                        .cornerRadius(4)
+                                    }
+                                    
+                                    Spacer(minLength: 0)
                                 }
-                                .padding(.vertical, 2)
+                                .padding(.vertical, 1)
                             }
                         }
                         
